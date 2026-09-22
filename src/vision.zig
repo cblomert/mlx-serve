@@ -4,6 +4,7 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const mimo_vision = @import("mimo_vision.zig");
+const mimo_audio = @import("mimo_audio.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 
@@ -125,6 +126,8 @@ pub const VisionEncoder = struct {
     muse: ?muse_vision.MuseVision = null,
     lfm2: ?lfm2_vision.Lfm2Vision = null,
     mimo: ?mimo_vision.MimoVision = null,
+    /// MiMo-V2.6 audio tokenizer + LLM-side audio encoder (optional).
+    mimo_audio: ?mimo_audio.MimoAudio = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
@@ -255,6 +258,7 @@ pub const VisionEncoder = struct {
         if (self.muse) |*m| m.deinit();
         if (self.lfm2) |*l| l.deinit();
         if (self.mimo) |*mv| mv.deinit();
+        if (self.mimo_audio) |*ma| ma.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -263,6 +267,7 @@ pub const VisionEncoder = struct {
     /// checkpoint shipped `embed_audio.*` weights. Drives the `audio` capability
     /// reported by /v1/models so the app only offers the mic on audio models.
     pub fn supportsAudio(self: *const VisionEncoder) bool {
+        if (self.mimo_audio != null) return true;
         return if (self.unified) |u| u.ea_w != null else false;
     }
 
@@ -375,6 +380,11 @@ pub const VisionEncoder = struct {
     pub fn initMimo(allocator: std.mem.Allocator, config: ModelConfig, model_dir: []const u8) !VisionEncoder {
         const s = mlx.mlx_default_gpu_stream_new();
         const mv = try mimo_vision.MimoVision.initFromDir(allocator, model_dir);
+        // Audio is optional: a checkpoint without audio_tokenizer/ still serves images/video.
+        const ma: ?mimo_audio.MimoAudio = mimo_audio.MimoAudio.initFromDir(allocator, model_dir) catch |err| blk: {
+            log.warn("[audio] mimo audio encoder unavailable ({s}); input_audio disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
         return .{
             .config = config,
             .s = s,
@@ -393,6 +403,7 @@ pub const VisionEncoder = struct {
             .half = bf16Scalar(0.5, s),
             .one = bf16Scalar(1.0, s),
             .mimo = mv,
+            .mimo_audio = ma,
         };
     }
 
@@ -634,6 +645,16 @@ pub const VisionEncoder = struct {
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&out, sl, &flat, 2, self.s));
         return out;
+    }
+
+    /// MiMo-V2.6 audio: 24 kHz mono samples → [1, S, hidden] soft tokens.
+    pub fn forwardMimoAudio(self: *VisionEncoder, pcm24k: []const f32) !mlx.mlx_array {
+        const ma = if (self.mimo_audio) |*m| m else return error.AudioNotSupported;
+        return ma.forward(pcm24k);
+    }
+
+    pub fn isMimoAudio(self: *const VisionEncoder) bool {
+        return self.mimo_audio != null;
     }
 
     /// Gemma 4 12B unified audio forward: frames [1, N, 640] (raw 16 kHz samples,

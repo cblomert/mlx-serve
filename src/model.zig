@@ -2736,7 +2736,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.qv_min_pixels = 3136;
         config.qv_max_pixels = 12845056; // clamped to ENGINE_MAX_PIXELS by the server
         config.qv_out_hidden = config.hidden_size;
-        inline for (.{ .{ "image_token_id", "image_token_id" }, .{ "video_token_id", "video_token_id" }, .{ "vision_start_token_id", "vision_start_token_id" }, .{ "vision_end_token_id", "vision_end_token_id" }, .{ "audio_token_id", "audio_token_id" } }) |kv| {
+        inline for (.{ .{ "image_token_id", "image_token_id" }, .{ "video_token_id", "video_token_id" }, .{ "vision_start_token_id", "vision_start_token_id" }, .{ "vision_end_token_id", "vision_end_token_id" }, .{ "audio_token_id", "audio_token_id" }, .{ "audio_start_token_id", "boa_token_id" }, .{ "audio_end_token_id", "eoa_token_id" } }) |kv| {
             if (cfg_obj.get(kv[0])) |v| {
                 if (v == .integer) @field(config, kv[1]) = @intCast(v.integer);
             }

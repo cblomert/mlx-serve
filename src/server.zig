@@ -7886,10 +7886,20 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
 ///
 /// The two knobs stay OR'd when both are present, as they always were.
 fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
-    const et: ?bool = if (root.get("enable_thinking")) |v|
+    var et: ?bool = if (root.get("enable_thinking")) |v|
         (if (v == .bool) v.bool else null)
     else
         null;
+    // vLLM / SGLang clients send it nested: {"chat_template_kwargs": {"enable_thinking": false}}.
+    if (et == null) {
+        if (root.get("chat_template_kwargs")) |k| {
+            if (k == .object) {
+                if (k.object.get("enable_thinking")) |v| {
+                    if (v == .bool) et = v.bool;
+                }
+            }
+        }
+    }
     if (et == null and effort_cfg == null) return arch_default;
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
@@ -14064,12 +14074,19 @@ fn insertMultimodalTokens(
 fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.AudioData {
     const b64 = if (std.mem.indexOf(u8, data, ";base64,")) |sep| data[sep + 8 ..] else data;
     const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
-    if (decoded_size == 0 or decoded_size % 4 != 0) return null;
+    if (decoded_size == 0) return null;
     const raw_buf = allocator.alloc(u8, decoded_size) catch return null;
     std.base64.standard.Decoder.decode(raw_buf, b64) catch {
         allocator.free(raw_buf);
         return null;
     };
+    // A RIFF/WAVE file (MiMo decodes + resamples it on the inference thread)
+    // may have any length; headerless PCM must be whole float32 samples.
+    const is_wav = raw_buf.len >= 12 and std.mem.eql(u8, raw_buf[0..4], "RIFF");
+    if (!is_wav and raw_buf.len % 4 != 0) {
+        allocator.free(raw_buf);
+        return null;
+    }
     return .{ .samples = raw_buf };
 }
 
@@ -21512,6 +21529,11 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         // A non-bool `enable_thinking` is not a signal; with nothing else in
         // the body the arch default still applies.
         .{ .body = "{\"enable_thinking\":\"yes\"}", .arch = true, .want = true },
+        // The vLLM-style nested form is the same explicit signal.
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = true, .want = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .arch = false, .want = true },
+        // Top-level wins over nested.
+        .{ .body = "{\"enable_thinking\":true,\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = false, .want = true },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});

@@ -45,6 +45,7 @@ const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
+const mimo_audio_mod = @import("mimo_audio.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const restore_dump = @import("restore_dump.zig");
@@ -4879,6 +4880,24 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     // unified audio embedder → [1, n_frames, hidden].
     var n_audio: usize = 0;
     for (req.audio) |clip| {
+        if (vision_enc.isMimoAudio()) {
+            const pcm = mimo_audio_mod.pcmFromPayload(req.allocator, clip) catch |err| {
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+            defer req.allocator.free(pcm);
+            const emb = vision_enc.forwardMimoAudio(pcm) catch |err| {
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+            n_audio += @intCast(mlx.getShape(emb)[1]);
+            emb_parts.append(req.allocator, emb) catch |err| {
+                _ = mlx.mlx_array_free(emb);
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+            continue;
+        }
         const n_samples = clip.len / 4;
         if (n_samples == 0) continue;
         const cfg = req.model.config orelse {
