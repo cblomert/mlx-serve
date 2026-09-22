@@ -23520,6 +23520,7 @@ pub const Transformer = struct {
         const is_inkling = cfg.isInkling();
         const is_mla = cfg.isMla();
         const is_gpt_oss = std.mem.eql(u8, cfg.model_type, "gpt_oss");
+        const is_mimo = std.mem.eql(u8, cfg.model_type, "mimo_v2_flash");
 
         // PLD spec-decode: thread the per-position SSM capture flag down to the
         // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
@@ -23580,7 +23581,7 @@ pub const Transformer = struct {
         var local_decode_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_decode_mask);
 
-        if ((is_gemma4 or is_laguna or is_gpt_oss) and cfg.has_sliding_window) {
+        if ((is_gemma4 or is_laguna or is_gpt_oss or is_mimo) and cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
             const sliding = slidingViewFor(cfg, total_kv, seq_len);
@@ -23655,6 +23656,8 @@ pub const Transformer = struct {
                     try self.mlaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill)
                 else if (is_gpt_oss)
                     try self.gptOssAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
+                else if (is_mimo)
+                    try self.mimoAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
                 else if (is_laguna)
                     try self.lagunaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
                 else if (is_gemma4)
@@ -26246,6 +26249,145 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(attn_flat);
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
         return self.attnProjBias(attn_flat, fa.o_w, fa.o_s, fa.o_b, fa.o_bias, decode_shape, layer);
+    }
+
+    /// MiMo-V2.6-Flash attention. Same skeleton as `gptOssAttnWith` — hybrid
+    /// sliding/full with learned sinks — with four deltas, each of which is
+    /// silent wrongness rather than a crash if it is dropped:
+    ///
+    ///   1. PER-LAYER-TYPE KV WIDTH. Sliding layers carry 8 kv heads, full
+    ///      layers 4 (`layerKVHeads`). Every other sink-bearing arch is
+    ///      uniform, so the constant `cfg.num_key_value_heads` that gpt_oss
+    ///      reads would reshape 9 of 48 layers wrong.
+    ///   2. NARROW V. K is 192 wide, V is 128. The dense KV cache already
+    ///      sizes each buffer from its own operand (the MLA generalization),
+    ///      so this costs nothing here — but the o_proj input and the final
+    ///      reshape are `n_heads * v_head_dim`, NOT `n_heads * head_dim`.
+    ///   3. TWO ROPE BASES. 1e7 on full layers, 1e4 on sliding — a 1000x gap,
+    ///      unlike gpt_oss which deliberately folds one theta onto both. And
+    ///      the rotary width is PARTIAL: int(0.334 * 192) = 64 of 192 dims.
+    ///   4. SINKS ON SLIDING LAYERS ONLY (`add_full_attention_sink_bias` is
+    ///      false). Passing the sink tensor to a full layer would add a phantom
+    ///      logit to every row.
+    ///
+    /// No YaRN arm: the checkpoint ships `rope_type: default` at a native 1M
+    /// window, so there is nothing to interpolate.
+    fn mimoAttnWith(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        x: mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer: u32,
+        offset: c_int,
+        batch: c_int,
+        seq_len: c_int,
+        is_prefill: bool,
+        local_prefill_mask: *mlx.mlx_array,
+        local_decode_mask: mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        const is_full = cfg.isGlobalLayer(layer);
+        const h_count: c_int = @intCast(cfg.num_attention_heads);
+        const kv_h: c_int = @intCast(cfg.layerKVHeads(layer)); // (1)
+        const hd: c_int = @intCast(cfg.head_dim);
+        const vd: c_int = @intCast(cfg.valueHeadDim()); // (2)
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+        const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
+        const k_shape = [_]c_int{ batch, seq_len, kv_h, hd };
+        const v_shape = [_]c_int{ batch, seq_len, kv_h, vd };
+        const flat_shape = [_]c_int{ batch, seq_len, h_count * vd };
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const decode_shape = batch == 1 and !is_prefill;
+
+        // (3) Rotary covers int(partial_rotary_factor * head_dim) dims; the
+        // tail passes through unrotated. mlx_fast_rope takes that width as its
+        // `dims` argument, so the truncation is the reference's, not ours.
+        const rope_dims: c_int = @intFromFloat(cfg.partial_rotary_factor * @as(f32, @floatFromInt(cfg.head_dim)));
+        const rope_base = mlx.mlx_optional_float.some(if (is_full) cfg.rope_theta else cfg.rope_local_base_freq);
+
+        // (4) The full layers ship no sink weight at all.
+        const sinks: mlx.mlx_array = if (is_full) .{ .ctx = null } else fa.sinks;
+
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+
+        // Bias-free projections (`attention_bias: false`), so attnProj, not
+        // attnProjBias — the `*_b` fields here are QUANT biases, not additive.
+        const q_proj = try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, decode_shape, layer);
+        defer _ = mlx.mlx_array_free(q_proj);
+        const k_proj = try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, decode_shape, layer);
+        defer _ = mlx.mlx_array_free(k_proj);
+        const v_proj = try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, decode_shape, layer);
+        defer _ = mlx.mlx_array_free(v_proj);
+
+        var q_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_r);
+        try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
+        var q_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_t);
+        try mlx.check(mlx.mlx_transpose_axes(&q_t, q_r, &perm, 4, self.s));
+
+        var k_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_r);
+        try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &k_shape, 4, self.s));
+        var k_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_t);
+        try mlx.check(mlx.mlx_transpose_axes(&k_t, k_r, &perm, 4, self.s));
+
+        var q_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_rope);
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+
+        var v_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_r);
+        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &v_shape, 4, self.s));
+        var v_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_t);
+        try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+
+        // Same trimmed-view discipline as gpt_oss: the view width and every
+        // mask built below must come from ONE slidingViewFor call, or SDPA
+        // fails to broadcast them and MLX aborts the process.
+        const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
+        const max_kv: u32 = if (is_full) 0 else sliding.span;
+        var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        defer kv_view.deinit();
+        const full_k = kv_view.k;
+        const full_v = kv_view.v;
+
+        var attn_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_out);
+        if (is_full) {
+            const mode: [*:0]const u8 = if (is_prefill) "causal" else "";
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, mode, none_mask, sinks, false, self.s));
+        } else {
+            const sw: c_int = @intCast(cfg.sliding_window);
+            const total_kv: c_int = offset + seq_len;
+            if (is_prefill and total_kv <= sw) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, sinks, false, self.s));
+            } else if (is_prefill) {
+                if (local_prefill_mask.ctx == null) {
+                    local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
+                }
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, sinks, false, self.s));
+            } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, sinks, false, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, sinks, false, self.s));
+            }
+        }
+
+        // [B,H,S,Dv] -> [B,S,H*Dv]. The flat width is the VALUE dim (2).
+        var attn_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_t);
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+        return self.attnProj(attn_flat, fa.o_w, fa.o_s, fa.o_b, decode_shape, layer);
     }
 
     fn lagunaAttnWith(
@@ -30154,6 +30296,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
     const is_gpt_oss = std.mem.eql(u8, config.model_type, "gpt_oss");
+    const is_mimo = std.mem.eql(u8, config.model_type, "mimo_v2_flash");
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -30626,6 +30769,14 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     fa.v_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.bias") orelse .{ .ctx = null };
                     fa.o_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.bias") orelse .{ .ctx = null };
                     fa.sinks = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.sinks") orelse .{ .ctx = null };
+                } else if (is_mimo) {
+                    // MiMo spells the sink tensor `attention_sink_bias`, not
+                    // gpt_oss's `sinks`, and ships one ONLY on the 39 sliding
+                    // layers (add_full_attention_sink_bias is false). Opt, not
+                    // required: the 9 full layers legitimately have none, and
+                    // mimoAttnWith gates on the layer type anyway, so a stray
+                    // tensor could never reach a full layer's SDPA.
+                    fa.sinks = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.attention_sink_bias") orelse .{ .ctx = null };
                 }
             }
         }
@@ -31005,6 +31156,67 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
             }
+        } else if (layer_is_moe and is_mimo) {
+            // MiMo's MoE bank: 256 experts, top-8, sigmoid router with a
+            // selection-only score correction. Three naming deltas from the
+            // gpt_oss arm this mirrors:
+            //   router   `mlp.gate.*`        (not mlp.router.*)
+            //   experts  `mlp.switch_mlp.*`  (not mlp.experts.*)
+            //   bias     `mlp.gate.e_score_correction_bias` — the DeepSeek
+            //            spelling of hy_v3's `mlp.gate.expert_bias`. Binding
+            //            it is what routes moeMLP2 through hy3RoutingChain
+            //            (sigmoid scores, top-k on score+bias, weights from
+            //            the UNBIASED score); leaving it null would silently
+            //            demote this to plain softmax top-k.
+            // The experts are mxfp4, so they carry scales but NO `biases`
+            // (fp modes store no zero-points) and no additive `bias` either.
+            // There is no shared expert (n_shared_experts is null).
+            lw.mlp = .{
+                .moe = .{
+                    // MiMo ships the router as [E, D] = [256, 4096]. Every
+                    // other arch pre-transposes it, and the f32 router matmul
+                    // reads [D, E] — so binding it verbatim fails with
+                    // "Last dimension of first input with shape (1,S,4096)
+                    // must match second to last dimension of second input with
+                    // shape (256,4096)". Transpose once at bind time rather
+                    // than per token. Unquantized (no .scales ship for it), so
+                    // this is a plain 2-D transpose.
+                    .router_w = blk_rw: {
+                        const rw = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight");
+                        var rwt = mlx.mlx_array_new();
+                        const rperm = [_]c_int{ 1, 0 };
+                        try mlx.check(mlx.mlx_transpose_axes(&rwt, rw, &rperm, 2, s));
+                        try owned_bf16.append(allocator, rwt);
+                        break :blk_rw rwt;
+                    },
+                    .router_s = mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_gate_w = mlx.mlx_array_new(),
+                    .shared_gate_s = mlx.mlx_array_new(),
+                    .shared_gate_b = mlx.mlx_array_new(),
+                    .shared_up_w = mlx.mlx_array_new(),
+                    .shared_up_s = mlx.mlx_array_new(),
+                    .shared_up_b = mlx.mlx_array_new(),
+                    .shared_down_w = mlx.mlx_array_new(),
+                    .shared_down_s = mlx.mlx_array_new(),
+                    .shared_down_b = mlx.mlx_array_new(),
+                    .shared_expert_gate_w = null,
+                    .shared_expert_gate_s = null,
+                    .shared_expert_gate_b = null,
+                    .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.e_score_correction_bias"),
+                    .route_norm = config.moe_route_norm,
+                    .route_scale = config.router_scaling_factor,
+                },
+            };
         } else if (layer_is_moe and is_gpt_oss) {
             // gpt_oss MoE. Same stacked [E, out, in] expert banks as qwen3.5,
             // under a different container name (`mlp.experts.*` rather than

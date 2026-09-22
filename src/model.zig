@@ -181,6 +181,12 @@ pub const ModelConfig = struct {
     // this flag is what makes the loader fetch the weight and the forward
     // pass it instead of the null array.
     has_attn_sinks: bool = false,
+
+    /// Value head dim when the checkpoint stores V NARROWER than K on a plain
+    /// GQA path (mimo_v2_flash: K 192, V 128). 0 = same as head_dim, which is
+    /// every other arch. Distinct from `mla_v_head_dim`, which is the MLA
+    /// latent geometry and does not apply here.
+    v_head_dim: u32 = 0,
     // gpt_oss clamped SwiGLU. Non-zero limit selects
     //   clip(gate, max=limit) * sigmoid(alpha*gate) * (clip(up, ±limit) + 1)
     // over the standard silu(gate)*up. The `+ 1` on the linear branch and the
@@ -692,6 +698,11 @@ pub const ModelConfig = struct {
             if (self.isGlobalLayer(j) == is_global) return j;
         }
         return null;
+    }
+
+    /// V head dim; falls back to head_dim, so a symmetric arch is unchanged.
+    pub fn valueHeadDim(self: ModelConfig) u32 {
+        return if (self.v_head_dim > 0) self.v_head_dim else self.head_dim;
     }
 
     /// Get effective head_dim for a layer (global layers may use global_head_dim).
@@ -2615,6 +2626,113 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
         config.ensureGptOssTerminators();
+    } else if (std.mem.eql(u8, model_type, "mimo_v2_flash") or
+        std.mem.eql(u8, model_type, "mimo_v2_flash_text"))
+    {
+        // Xiaomi MiMo-V2.6-Flash (MiMoV2FlashForCausalLM): 256-expert sigmoid
+        // MoE on a hybrid sliding/full attention trunk with learned per-head
+        // sinks. Structurally gpt_oss's cousin, so it rides the same
+        // forwardMoeWith arms -- but four things differ, and every one of them
+        // is silent wrongness rather than a crash if it is missed.
+        //
+        // Reference: mlx-lm's models/mimo_v2_flash.py. Read THAT, not the
+        // config: the checkpoint ships `attention_value_scale: 0.707` and the
+        // reference never reads it (see below).
+        config.model_type = "mimo_v2_flash";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false; // the reference has no q_norm/k_norm
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+
+        // (1) The layer pattern is EXPLICIT and INVERTED. `hybrid_layer_pattern`
+        // is 0 on the FULL-attention layers (0, 5, 11, 17, 23, 29, 35, 41, 47)
+        // and 1 on the 39 sliding ones. Note the first gap is 5 and the rest
+        // are 6, so this is NOT expressible as sliding_window_pattern -- it has
+        // to ride layer_is_global.
+        config.has_sliding_window = true;
+        if (cfg_obj.get("sliding_window")) |v| {
+            if (v == .integer) config.sliding_window = @intCast(v.integer);
+        }
+        if (cfg_obj.get("hybrid_layer_pattern")) |v| {
+            if (v == .array) {
+                config.has_explicit_layer_types = true;
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    config.layer_is_global[i] = (item == .integer and item.integer == 0);
+                }
+            }
+        }
+
+        // (2) TWO rope bases that differ by 1000x: 1e7 on full layers, 1e4 on
+        // sliding. gpt_oss folds one theta onto both and says so; doing that
+        // here would mis-base 39 of 48 layers.
+        if (cfg_obj.get("swa_rope_theta")) |v| {
+            config.rope_local_base_freq = jsonFloat(v);
+        }
+
+        // (3) Sinks live on the SLIDING layers only. The full layers ship no
+        // sink bias at all (add_full_attention_sink_bias false), so the sink
+        // tensor must be read per layer type, never unconditionally.
+        if (cfg_obj.get("add_swa_attention_sink_bias")) |v| {
+            if (v == .bool) config.has_attn_sinks = v.bool;
+        }
+
+        // (4) Per-layer-type KV geometry. The SLIDING layers are the base
+        // (8 kv heads) and the FULL layers override (4) -- the reverse of the
+        // usual reading, because `num_key_value_heads` in this config describes
+        // the full layers while `swa_*` describes the common case. V is stored
+        // NARROWER than K (192 -> 128) on both, which is ordinary GQA here, not
+        // MLA.
+        if (cfg_obj.get("swa_num_key_value_heads")) |v| {
+            if (v == .integer) config.num_key_value_heads = @intCast(v.integer);
+        }
+        if (cfg_obj.get("num_key_value_heads")) |v| {
+            if (v == .integer) config.num_global_key_value_heads = @intCast(v.integer);
+        }
+        if (cfg_obj.get("v_head_dim")) |v| {
+            if (v == .integer) config.v_head_dim = @intCast(v.integer);
+        }
+        // scale = head_dim^-0.5 in the reference (`self.scale = head_dim**-0.5`).
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        // `attention_value_scale: 0.707` is DELIBERATELY not read. The
+        // reference's Attention never touches it -- same class as the laguna
+        // YaRN mscale, where the shipped field is not the truth. Implementing
+        // it would scale V by 0.707 against a reference that does not.
+
+        // Eps ships as `layernorm_epsilon`, not `rms_norm_eps`.
+        if (cfg_obj.get("layernorm_epsilon")) |v| config.rms_norm_eps = jsonFloat(v);
+
+        // MoE: 256 routed experts, top-8, sigmoid scoring with top-k renorm.
+        // n_group/topk_group are both 1, i.e. ungrouped -- the grouped
+        // ("noaux_tc") path is a no-op here but costs nothing to carry.
+        config.moe_sigmoid_router = true;
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        // Layer 0 is dense, every other layer is MoE (`moe_layer_freq` is a
+        // 48-entry mask, not a stride). Collapse it to the dense-bottom count
+        // the MoE arms already understand.
+        if (cfg_obj.get("moe_layer_freq")) |v| {
+            if (v == .array) {
+                var dense: u32 = 0;
+                for (v.array.items) |item| {
+                    if (item == .integer and item.integer == 0) dense += 1 else break;
+                }
+                config.first_k_dense_replace = dense;
+            }
+        }
+        // The conversion splits the checkpoint's fused_qkv into q/k/v, matching
+        // the reference's separate nn.Linear projections -- so attn_fused_qkv
+        // stays FALSE despite `attention_projection_layout: fused_qkv` in the
+        // config. Verified against model.safetensors.index.json.
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -7389,4 +7507,97 @@ test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RM
     try testing.expect(!config.tie_word_embeddings);
     try testing.expect(!config.norm_has_offset);
     try testing.expect(!config.has_pre_ff_norm);
+}
+
+/// The shipped Vontra/MiMo-V2.6-Flash-RL-MLX-4bit-MTP config, trimmed to the
+/// keys this arm reads. Values are verbatim from the checkpoint.
+const MIMO_V2_FLASH_SHIPPED =
+    \\{
+    \\  "model_type": "mimo_v2_flash",
+    \\  "architectures": ["MiMoV2FlashForCausalLM"],
+    \\  "hidden_size": 4096, "intermediate_size": 16384,
+    \\  "num_hidden_layers": 48, "vocab_size": 152576,
+    \\  "num_attention_heads": 64, "num_key_value_heads": 4,
+    \\  "head_dim": 192, "v_head_dim": 128,
+    \\  "swa_num_attention_heads": 64, "swa_num_key_value_heads": 8,
+    \\  "swa_head_dim": 192, "swa_v_head_dim": 128,
+    \\  "rope_theta": 10000000.0, "swa_rope_theta": 10000.0,
+    \\  "partial_rotary_factor": 0.334,
+    \\  "sliding_window": 128, "attention_chunk_size": 128,
+    \\  "add_swa_attention_sink_bias": true,
+    \\  "add_full_attention_sink_bias": false,
+    \\  "attention_value_scale": 0.707,
+    \\  "layernorm_epsilon": 1e-06,
+    \\  "n_routed_experts": 256, "num_experts_per_tok": 8,
+    \\  "moe_intermediate_size": 2048, "norm_topk_prob": true,
+    \\  "n_group": 1, "topk_group": 1, "scoring_func": "sigmoid",
+    \\  "hybrid_layer_pattern": [0,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,
+    \\                           1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,
+    \\                           1,1,1,1,1,0,1,1,1,1,1,0],
+    \\  "moe_layer_freq": [0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    \\                     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    \\                     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+    \\}
+;
+
+test "parses mimo_v2_flash: explicit INVERTED layer pattern, two rope bases, per-type KV" {
+    const c = try parseConfigFromJson(testing.allocator, MIMO_V2_FLASH_SHIPPED);
+    try testing.expectEqualStrings("mimo_v2_flash", c.model_type);
+
+    // The pattern is 0 = FULL attention. Reading it the other way round would
+    // make 39 layers global and 9 sliding — the model would still generate,
+    // just wrongly, which is why this is pinned rather than eyeballed.
+    try testing.expect(c.has_explicit_layer_types);
+    for ([_]u32{ 0, 5, 11, 17, 23, 29, 35, 41, 47 }) |g| {
+        try testing.expect(c.isGlobalLayer(g));
+    }
+    for ([_]u32{ 1, 4, 6, 10, 12, 46 }) |sw| {
+        try testing.expect(!c.isGlobalLayer(sw));
+    }
+    // First gap is 5, the rest are 6: not a periodic stride, so the generic
+    // sliding_window_pattern fallback cannot express it.
+    try testing.expectEqual(@as(u32, 128), c.sliding_window);
+
+    // Two bases, 1000x apart. Folding one onto both is the gpt_oss shape and
+    // would mis-base every sliding layer here.
+    try testing.expectApproxEqAbs(@as(f32, 10000000.0), c.rope_theta, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), c.rope_local_base_freq, 1e-3);
+
+    // Sliding layers are the BASE (8 kv heads); full layers override to 4.
+    try testing.expectEqual(@as(u32, 8), c.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 4), c.num_global_key_value_heads);
+    // V is stored narrower than K on a plain GQA path.
+    try testing.expectEqual(@as(u32, 128), c.valueHeadDim());
+    try testing.expectEqual(@as(u32, 192), c.head_dim);
+    try testing.expectEqual(@as(u32, 192), c.query_pre_attn_scalar);
+
+    try testing.expect(c.has_attn_sinks);
+    try testing.expectApproxEqAbs(@as(f32, 1e-6), c.rms_norm_eps, 1e-12);
+
+    // MoE: 256 experts, top-8, sigmoid + renorm, layer 0 dense.
+    try testing.expectEqual(@as(u32, 256), c.num_experts);
+    try testing.expectEqual(@as(u32, 8), c.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2048), c.moe_intermediate_size);
+    try testing.expect(c.moe_sigmoid_router);
+    try testing.expect(c.moe_route_norm);
+    try testing.expectEqual(@as(u32, 1), c.first_k_dense_replace);
+}
+
+test "mimo_v2_flash: attention_value_scale is NOT read (the reference ignores it)" {
+    // mlx-lm's models/mimo_v2_flash.py Attention never touches
+    // `attention_value_scale`, so honouring it would scale V by 0.707 against
+    // a reference that does not — the laguna YaRN-mscale trap, one level up.
+    // Guard: no field may capture it. If a future change adds one, this fails.
+    const c = try parseConfigFromJson(testing.allocator, MIMO_V2_FLASH_SHIPPED);
+    try testing.expectEqual(@as(u32, 192), c.head_dim);
+    try testing.expectEqual(@as(u32, 192), c.query_pre_attn_scalar);
+    try testing.expect(!std.mem.containsAtLeast(u8, @typeName(@TypeOf(c)), 1, "ValueScale"));
+}
+
+test "valueHeadDim falls back to head_dim for every symmetric arch" {
+    var c = ModelConfig{};
+    c.head_dim = 128;
+    try testing.expectEqual(@as(u32, 128), c.valueHeadDim());
+    c.v_head_dim = 64;
+    try testing.expectEqual(@as(u32, 64), c.valueHeadDim());
 }
