@@ -3,6 +3,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const mimo_vision = @import("mimo_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 
@@ -123,6 +124,7 @@ pub const VisionEncoder = struct {
     qwen: ?qwen_vision.QwenVision = null,
     muse: ?muse_vision.MuseVision = null,
     lfm2: ?lfm2_vision.Lfm2Vision = null,
+    mimo: ?mimo_vision.MimoVision = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
@@ -222,9 +224,8 @@ pub const VisionEncoder = struct {
         }
 
         log.info("Vision encoder: {d} layers, hidden={d}, heads={d}, pool→{d} tokens{s}{s}\n", .{
-            num_layers, config.vision_hidden_size, config.vision_num_heads, config.vision_soft_tokens,
-            if (clipped) ", clipped" else "",
-            if (std_scale_opt != null) ", std" else "",
+            num_layers,                       config.vision_hidden_size,                  config.vision_num_heads, config.vision_soft_tokens,
+            if (clipped) ", clipped" else "", if (std_scale_opt != null) ", std" else "",
         });
 
         return .{
@@ -253,6 +254,7 @@ pub const VisionEncoder = struct {
         if (self.qwen) |*q| q.deinit();
         if (self.muse) |*m| m.deinit();
         if (self.lfm2) |*l| l.deinit();
+        if (self.mimo) |*mv| mv.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -314,7 +316,7 @@ pub const VisionEncoder = struct {
         };
 
         log.info("Vision encoder: Gemma 4 12B unified (encoder-free), patch={d}px, mm_embed_dim={d}, posemb={d}{s}\n", .{
-            unified.model_patch_size, config.vision_mm_embed_dim, config.vision_mm_posemb_size,
+            unified.model_patch_size,             config.vision_mm_embed_dim, config.vision_mm_posemb_size,
             if (ea_w != null) ", +audio" else "",
         });
 
@@ -365,6 +367,32 @@ pub const VisionEncoder = struct {
             .half = bf16Scalar(0.5, s),
             .one = bf16Scalar(1.0, s),
             .qwen = qv,
+        };
+    }
+
+    /// MiMo-V2.6: the tower lives in its own file under the model dir, so it
+    /// is built from the directory rather than the trunk's weight map.
+    pub fn initMimo(allocator: std.mem.Allocator, config: ModelConfig, model_dir: []const u8) !VisionEncoder {
+        const s = mlx.mlx_default_gpu_stream_new();
+        const mv = try mimo_vision.MimoVision.initFromDir(allocator, model_dir);
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = config.quant_group_size,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6,
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+            .mimo = mv,
         };
     }
 
@@ -424,6 +452,7 @@ pub const VisionEncoder = struct {
     /// pixel_values [N, feat]; `grid_h/grid_w` is the full patch grid.
     /// Returns [1, N/merge², out_hidden].
     pub fn forwardPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        if (self.mimo) |*mm| return mm.forward(patches, grid_h, grid_w);
         if (self.muse) |*mv| return mv.forward(patches, grid_h, grid_w);
         if (self.qwen) |*qv| return qv.forward(patches, grid_h, grid_w);
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
@@ -436,6 +465,7 @@ pub const VisionEncoder = struct {
     /// lfm2 have no video path.
     pub fn forwardVideoPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         if (self.qwen) |*qv| return qv.forwardVideo(patches, grid_t, grid_h, grid_w);
+        if (self.mimo) |*mm| return mm.forwardVideo(patches, grid_t, grid_h, grid_w);
         return error.NoVideoEncoder;
     }
 
@@ -448,9 +478,16 @@ pub const VisionEncoder = struct {
         // mlx_array_ndim throws on a null handle.
         if (sc.ctx != null) {
             try mlx.check(mlx.mlx_quantized_matmul(
-                &out, x, w, sc, qb, true,
+                &out,
+                x,
+                w,
+                sc,
+                qb,
+                true,
                 mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
-                mlx.mlx_optional_int.some(@intCast(bits)), self.config.quant_mode.cstr(), self.s,
+                mlx.mlx_optional_int.some(@intCast(bits)),
+                self.config.quant_mode.cstr(),
+                self.s,
             ));
         } else {
             var wt = mlx.mlx_array_new();
@@ -782,9 +819,16 @@ pub const VisionEncoder = struct {
         if (self.proj_s.ctx != null) {
             post_normed = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_quantized_matmul(
-                &post_normed, pre_proj_normed, self.proj_w, self.proj_s, self.proj_b,
-                true, mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
-                mlx.mlx_optional_int.some(@intCast(self.proj_quant_bits)), self.config.quant_mode.cstr(), self.s,
+                &post_normed,
+                pre_proj_normed,
+                self.proj_w,
+                self.proj_s,
+                self.proj_b,
+                true,
+                mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
+                mlx.mlx_optional_int.some(@intCast(self.proj_quant_bits)),
+                self.config.quant_mode.cstr(),
+                self.s,
             ));
         } else {
             var proj_wt = mlx.mlx_array_new();

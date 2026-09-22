@@ -13785,8 +13785,8 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
     // Insert: BOI + n_tokens × image_token + EOI. Qwen3-VL wraps the image-pad run
     // with <|vision_start|> / <|vision_end|> instead (get_rope_index keys on a
     // vision_start immediately followed by image tokens).
-    const boi: u32 = if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id;
-    const eoi: u32 = if (config.qwen_vision) config.vision_end_token_id else config.eoi_token_id;
+    const boi: u32 = if (config.qwen_vision or config.mimo_vision) config.vision_start_token_id else config.boi_token_id;
+    const eoi: u32 = if (config.qwen_vision or config.mimo_vision) config.vision_end_token_id else config.eoi_token_id;
     const has_boi = boi > 0;
     const has_eoi = eoi > 0;
     const extra = n_tokens + (if (has_boi) @as(usize, 1) else 0) + (if (has_eoi) @as(usize, 1) else 0);
@@ -13961,8 +13961,8 @@ fn insertMultimodalTokens(
     // Qwen3-VL wraps the image-pad run (and, identically, the video-pad run)
     // with <|vision_start|>/<|vision_end|> (get_rope_index keys on vision_start
     // immediately followed by an image OR video token); Gemma uses BOI/EOI.
-    const boi = if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id;
-    const eoi = if (config.qwen_vision) config.vision_end_token_id else config.eoi_token_id;
+    const boi = if (config.qwen_vision or config.mimo_vision) config.vision_start_token_id else config.boi_token_id;
+    const eoi = if (config.qwen_vision or config.mimo_vision) config.vision_end_token_id else config.eoi_token_id;
     const boa = config.boa_token_id;
     const eoa = config.eoa_token_id;
 
@@ -14044,6 +14044,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
             .pixels_tolerance = config.lv_pixels_tolerance,
         };
     }
+    if (config.mimo_vision) return .{
+        .mode = .mimo,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_pixels = config.qv_min_pixels,
+        .max_pixels = config.qv_max_pixels,
+    };
     if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
         .mode = if (config.muse_vision) .muse else .qwen,
@@ -14414,6 +14422,18 @@ fn appendLfm2Tiles(
 /// filter is silent: the geometry and token counts still match, the pixels do
 /// not (measured 2026-08-14: bicubic loses 3 of 144 ScreenSpot-v2 items on
 /// LFM2.5-VL and never wins one).
+/// The shared Pillow-exact resize emits (x/255 - 0.5)/0.5. MiMo's processor
+/// (Qwen2VLImageProcessor) normalizes with CLIP mean/std instead; since both
+/// are affine in the same uint8-quantized pixel, the conversion is exact:
+/// x/255 = v*0.5 + 0.5, then (x/255 - mean_c)/std_c.
+fn clipRenormalizeChw(chw: []f32, plane: usize) void {
+    const mean = [3]f32{ 0.48145466, 0.4578275, 0.40821073 };
+    const stdv = [3]f32{ 0.26862954, 0.26130258, 0.27577711 };
+    for (0..3) |c| {
+        for (chw[c * plane .. (c + 1) * plane]) |*v| v.* = ((v.* * 0.5 + 0.5) - mean[c]) / stdv[c];
+    }
+}
+
 fn resampleFilterFor(vp: chat_mod.VisionPreproc) qwen_vision.Filter {
     return switch (vp.mode) {
         .muse => .lanczos,
@@ -14517,7 +14537,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
         const min_pixels = bounds.min;
         const max_pixels = bounds.max;
-        if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
+        if (bounds.clamped and (vp.mode == .qwen or vp.mode == .mimo)) logVisionPixelClamp(vp.max_pixels);
         const rs = switch (vp.mode) {
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
@@ -14545,6 +14565,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             rw,
             resampleFilterFor(vp),
         ) catch return null;
+        if (vp.mode == .mimo) clipRenormalizeChw(chw, plane);
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
@@ -14648,6 +14669,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
             allocator.free(chw);
             return null;
         };
+        if (vp.mode == .mimo) clipRenormalizeChw(chw, @as(usize, rh) * rw);
         frames_chw.append(allocator, chw) catch {
             allocator.free(chw);
             return null;

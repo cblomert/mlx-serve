@@ -613,6 +613,20 @@ pub const MtpModel = struct {
     /// and the attention has NO output gate (FrontOut.gate stays a null-ctx
     /// handle; backChain skips the sigmoid multiply).
     eh_proj: ?QLinear = null,
+    /// mimo_v2_flash head (DeepSeek-style nextn layer over the SLIDING
+    /// attention geometry). Rides the Hy3 shape — eh_proj fusion, no output
+    /// gate — with five deltas the helpers below apply ONLY when set:
+    /// the sliding rope base (1e4, not the trunk's full-layer 1e7), a V
+    /// narrower than K (128 vs 192), no q/k norm, per-head sinks, and the
+    /// trunk's 128-token sliding window on its own cache.
+    mimo: bool = false,
+    /// `self_attn.attention_sink_bias` [n_heads] (mimo); null elsewhere.
+    sinks: mlx.mlx_array = .{ .ctx = null },
+    /// V multiplier applied before the cache write. 1.0 = none. The trunk
+    /// weights ship with MiMo's 0.707 already folded into v_proj (measured:
+    /// ppl 2.79 unscaled vs 3.33 scaled), so the default is 1.0;
+    /// MLX_SERVE_MIMO_MTP_VSCALE overrides it for the head alone.
+    v_scale: f32 = 1.0,
     pre_fc_norm_emb: mlx.mlx_array, // Qwen pre_fc_norm_embedding / Hy3 enorm
     pre_fc_norm_hidden: mlx.mlx_array, // Qwen pre_fc_norm_hidden / Hy3 hnorm
     final_norm: mlx.mlx_array, // mtp.norm
@@ -658,6 +672,7 @@ pub const MtpModel = struct {
         if (self.rerank_coarse) |*rc| rc.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         if (self.eh_proj) |*ep| ep.deinit();
+        if (self.sinks.ctx != null) _ = mlx.mlx_array_free(self.sinks);
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.pre_fc_norm_emb);
         _ = mlx.mlx_array_free(self.pre_fc_norm_hidden);
@@ -795,7 +810,11 @@ pub const MtpModel = struct {
         const cfg = &target.config;
         if (self.eh_proj != null) {
             // Hy3 head: no attention output gate, sigmoid-router MoE.
-            if (!std.mem.eql(u8, cfg.model_type, "hy_v3")) return error.UnsupportedMtpArch;
+            const arch_ok = if (self.mimo)
+                std.mem.eql(u8, cfg.model_type, "mimo_v2_flash")
+            else
+                std.mem.eql(u8, cfg.model_type, "hy_v3");
+            if (!arch_ok) return error.UnsupportedMtpArch;
             const en_shape = mlx.getShape(self.pre_fc_norm_emb);
             if (en_shape.len != 1 or en_shape[0] != @as(c_int, @intCast(cfg.hidden_size)))
                 return error.MtpTargetMismatch;
@@ -1502,6 +1521,7 @@ pub const sidecar_rel_paths = [_][]const u8{
     "mtp.safetensors", // others
     "model-mtp.safetensors", // others
     "optiq/mtp.safetensors", // oMLX OptiQ (delta-encoded norms — folded at load)
+    "mtp/model_mtp.safetensors", // mimo_v2_flash (Vontra MLX conversions)
 };
 
 /// Relative path (one of `sidecar_rel_paths`) of the first sidecar file under
@@ -1541,6 +1561,8 @@ const mtp_marker_keys = [_][]const u8{
     "language_model.mtp.fc.weight",
     "mtp.eh_proj.weight",
     "language_model.mtp.eh_proj.weight",
+    // mimo_v2_flash: DeepSeek-style `nextn` stack, one eh_proj PER layer.
+    "model.mtp.layers.0.eh_proj.weight",
 };
 
 /// Any tensor belonging to the head (either root prefix).
@@ -2111,6 +2133,7 @@ fn sidecarQuantMode(q: *const QLinear, hidden: u32) model_mod.QuantMode {
 /// `mtp.*`, mlx-lm-exported ones (the 35B-A3B artifacts) `language_model.mtp.*`.
 fn mtpKeyPrefix(weights: *const Weights) []const u8 {
     if (weights.get("language_model.mtp.fc.weight") != null) return "language_model.";
+    if (weights.get("model.mtp.layers.0.eh_proj.weight") != null) return "model.";
     return "";
 }
 
@@ -2203,6 +2226,13 @@ pub fn loadMtp(
             return std.fmt.bufPrint(buf, "{s}mtp.{s}", .{ pref, rest }) catch unreachable;
         }
     };
+
+    // mimo_v2_flash layout: a DeepSeek-style `nextn` STACK, `mtp.layers.N.*`
+    // with its own eh_proj per layer. Checked before Hy3, whose single
+    // `mtp.eh_proj` it would otherwise never match anyway.
+    if (weights.get(K.k(&kb, p, "layers.0.eh_proj.weight")) != null) {
+        return loadMimoMtp(io, allocator, s, &weights, p, model_dir);
+    }
 
     // Hy3 (hy_v3) layout: `mtp.eh_proj` + `mtp.layer.*` (full decoder layer,
     // sigmoid-router MoE). Detected by its distinctive projection name.
@@ -2377,6 +2407,179 @@ pub fn loadMtp(
 /// shared expert). Norms load VERBATIM — unlike the original Qwen repo,
 /// nothing here is delta-encoded. route_norm/route_scale are filled at
 /// bind() (the loader has no config).
+/// Rows `[r0, r1)` of a packed linear as an owned, CONTIGUOUS triple. Each row
+/// of an affine-quantized weight is quantized independently along the input
+/// axis, so slicing the output axis is exact — it is how a fused qkv_proj
+/// becomes the q/k/v the rest of the head expects.
+fn sliceLinearRows(lin: *const QLinear, r0: c_int, r1: c_int, s: mlx.mlx_stream) !QLinear {
+    var out: QLinear = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } };
+    errdefer out.deinit();
+    inline for (.{ "w", "s", "b" }) |f| {
+        const src = @field(lin, f);
+        if (src.ctx != null) {
+            const sh = mlx.getShape(src);
+            const start = [_]c_int{ r0, 0 };
+            const stop = [_]c_int{ r1, sh[1] };
+            const strides = [_]c_int{ 1, 1 };
+            var view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, src, &start, 2, &stop, 2, &strides, 2, s));
+            var c = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_contiguous(&c, view, false, s));
+            @field(out, f) = c;
+        } else {
+            @field(out, f) = mlx.mlx_array_new();
+        }
+    }
+    return out;
+}
+
+fn jsonU32At(obj: std.json.ObjectMap, key: []const u8, fallback: []const u8) ?u32 {
+    const v = obj.get(key) orelse obj.get(fallback) orelse return null;
+    return switch (v) {
+        .integer => |x| @intCast(x),
+        else => null,
+    };
+}
+
+/// MiMo-V2.6-Flash native MTP: 3 nextn layers, each
+///   h = eh_proj(cat(enorm(embed(t)), hnorm(prev_hidden)))
+///   h = h + attn(input_layernorm(h))       # SLIDING geometry, sinks
+///   h = h + mlp(pre_mlp_layernorm(h))      # dense SwiGLU
+///   return final_layernorm(h)              # -> trunk lm_head
+/// Matches vLLM's MiMoV2MTPLayer, which drives ONE layer recurrently for
+/// every draft step (`num_mtp_layers = 1`); MLX_SERVE_MIMO_MTP_LAYER picks
+/// which of the three (default 0). The checkpoint's own modeling file drops
+/// these weights on load, so vLLM is the only runnable reference.
+fn loadMimoMtp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    weights: *const Weights,
+    p: []const u8,
+    model_dir: []const u8,
+) !MtpModel {
+    const layer: u32 = blk: {
+        const e = std.c.getenv("MLX_SERVE_MIMO_MTP_LAYER") orelse break :blk 0;
+        break :blk std.fmt.parseInt(u32, std.mem.span(e), 10) catch 0;
+    };
+
+    // The fused qkv_proj is split by the SLIDING geometry, which only the
+    // trunk config states — the sidecar carries weights and nothing else.
+    var n_heads: u32 = 64;
+    var kv_heads: u32 = 8;
+    var head_dim: u32 = 192;
+    var v_head_dim: u32 = 128;
+    {
+        var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+        defer dir.close(io);
+        if (readDirFileAlloc(io, allocator, dir, "config.json", 8 << 20)) |bytes| {
+            defer allocator.free(bytes);
+            if (std.json.parseFromSlice(std.json.Value, allocator, bytes, .{})) |parsed| {
+                defer parsed.deinit();
+                if (parsed.value == .object) {
+                    const o = parsed.value.object;
+                    n_heads = jsonU32At(o, "swa_num_attention_heads", "num_attention_heads") orelse n_heads;
+                    kv_heads = jsonU32At(o, "swa_num_key_value_heads", "num_key_value_heads") orelse kv_heads;
+                    head_dim = jsonU32At(o, "swa_head_dim", "head_dim") orelse head_dim;
+                    v_head_dim = jsonU32At(o, "swa_v_head_dim", "v_head_dim") orelse v_head_dim;
+                }
+            } else |_| {}
+        }
+    }
+
+    var kb: [256]u8 = undefined;
+    var lb: [128]u8 = undefined;
+    const L = struct {
+        fn k(buf: []u8, lbuf: []u8, pref: []const u8, li: u32, rest: []const u8) []const u8 {
+            const tail = std.fmt.bufPrint(lbuf, "layers.{d}.{s}", .{ li, rest }) catch unreachable;
+            return std.fmt.bufPrint(buf, "{s}mtp.{s}", .{ pref, tail }) catch unreachable;
+        }
+    };
+    if (weights.get(L.k(&kb, &lb, p, layer, "eh_proj.weight")) == null) {
+        log.err("[mtp] mimo: nextn layer {d} not in the sidecar\n", .{layer});
+        return error.MissingMtpWeight;
+    }
+
+    var qkv = try loadLinear(weights, allocator, L.k(&kb, &lb, p, layer, "self_attn.qkv_proj"), s);
+    defer qkv.deinit();
+    const rows: c_int = mlx.getShape(qkv.w)[0];
+    const q_rows: c_int = @intCast(n_heads * head_dim);
+    const k_rows: c_int = @intCast(kv_heads * head_dim);
+    const v_rows: c_int = @intCast(kv_heads * v_head_dim);
+    if (q_rows + k_rows + v_rows != rows) {
+        log.err("[mtp] mimo: qkv_proj has {d} rows, geometry {d}x{d} + 2x{d}x({d}|{d}) expects {d}\n", .{
+            rows, n_heads, head_dim, kv_heads, head_dim, v_head_dim, q_rows + k_rows + v_rows,
+        });
+        return error.MtpTargetMismatch;
+    }
+
+    const v_scale: f32 = blk: {
+        const e = std.c.getenv("MLX_SERVE_MIMO_MTP_VSCALE") orelse break :blk 1.0;
+        break :blk std.fmt.parseFloat(f32, std.mem.span(e)) catch 1.0;
+    };
+
+    var m = MtpModel{
+        .allocator = allocator,
+        .s = s,
+        .quant_bits = 0,
+        .quant_group_size = 0,
+        .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
+        .eh_proj = try loadLinear(weights, allocator, L.k(&kb, &lb, p, layer, "eh_proj"), s),
+        .mimo = true,
+        .v_scale = v_scale,
+        .sinks = try ownWeight(weights, L.k(&kb, &lb, p, layer, "self_attn.attention_sink_bias")),
+        .pre_fc_norm_emb = try ownWeight(weights, L.k(&kb, &lb, p, layer, "enorm.weight")),
+        .pre_fc_norm_hidden = try ownWeight(weights, L.k(&kb, &lb, p, layer, "hnorm.weight")),
+        .final_norm = try ownWeight(weights, L.k(&kb, &lb, p, layer, "final_layernorm.weight")),
+        .input_norm = try ownWeight(weights, L.k(&kb, &lb, p, layer, "input_layernorm.weight")),
+        .post_attn_norm = try ownWeight(weights, L.k(&kb, &lb, p, layer, "pre_mlp_layernorm.weight")),
+        // No q/k norm on this head: null handles take normOrRetain's pass-through.
+        .q_norm = .{ .ctx = null },
+        .k_norm = .{ .ctx = null },
+        .q = try sliceLinearRows(&qkv, 0, q_rows, s),
+        .k = try sliceLinearRows(&qkv, q_rows, q_rows + k_rows, s),
+        .v = try sliceLinearRows(&qkv, q_rows + k_rows, rows, s),
+        .o = try loadLinear(weights, allocator, L.k(&kb, &lb, p, layer, "self_attn.o_proj"), s),
+        .mlp = .{ .dense = .{
+            .gate = try loadLinear(weights, allocator, L.k(&kb, &lb, p, layer, "mlp.gate_proj"), s),
+            .up = try loadLinear(weights, allocator, L.k(&kb, &lb, p, layer, "mlp.up_proj"), s),
+            .down = try loadLinear(weights, allocator, L.k(&kb, &lb, p, layer, "mlp.down_proj"), s),
+        } },
+    };
+    errdefer m.deinit();
+
+    {
+        const en_shape = mlx.getShape(m.pre_fc_norm_emb);
+        const hidden: u32 = if (en_shape.len == 1) @intCast(en_shape[0]) else 0;
+        m.quant_bits = inferBits(&m.q, hidden) orelse 4;
+        m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+        m.quant_mode = sidecarQuantMode(&m.q, hidden);
+    }
+
+    {
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        const d = &m.mlp.dense;
+        const arrs = [_]mlx.mlx_array{
+            m.eh_proj.?.w, m.eh_proj.?.s, m.pre_fc_norm_emb, m.pre_fc_norm_hidden,
+            m.final_norm,  m.input_norm,  m.post_attn_norm,  m.sinks,
+            m.q.w,         m.q.s,         m.k.w,             m.k.s,
+            m.v.w,         m.v.s,         m.o.w,             m.o.s,
+            d.gate.w,      d.up.w,        d.down.w,
+        };
+        for (arrs) |a| {
+            if (a.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        }
+        try mlx.check(mlx.mlx_eval(eval_vec));
+    }
+
+    log.info("[mtp] mimo nextn head: layer {d}/3, {d}h/{d}kv K{d}/V{d}, sinks, {d}-bit/gs{d}, v_scale={d:.3}\n", .{
+        layer, n_heads, kv_heads, head_dim, v_head_dim, m.quant_bits, m.quant_group_size, v_scale,
+    });
+    return m;
+}
+
 fn loadHy3Mtp(
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
@@ -2482,6 +2685,53 @@ fn loadHy3Mtp(
 }
 
 // ── Forward ──
+
+/// Rope base for the head: MiMo's nextn layer uses the SLIDING layers'
+/// base (`swa_rope_theta` = rope_local_base_freq, 1e4), 1000x below the
+/// full layers' rope_theta the other heads read.
+fn mtpRopeBase(self: *const MtpModel, cfg: *const model_mod.ModelConfig) f32 {
+    return if (self.mimo) cfg.rope_local_base_freq else cfg.rope_theta;
+}
+
+/// V head width: MiMo stores V at 128 against a 192-wide K.
+fn mtpVHeadDim(self: *const MtpModel, cfg: *const model_mod.ModelConfig) c_int {
+    return @intCast(if (self.mimo) cfg.valueHeadDim() else cfg.head_dim);
+}
+
+/// Cache view width for a `seq_len`-row step: MiMo's head is a sliding
+/// layer, so it reads `window + seq_len - 1` rows — the same `sliding.span`
+/// rule the trunk's sliding arms pass to `cache.update`. 0 = unbounded.
+fn mtpKvSpan(self: *const MtpModel, cfg: *const model_mod.ModelConfig, seq_len: c_int) u32 {
+    if (!self.mimo or cfg.sliding_window == 0) return 0;
+    return cfg.sliding_window + @as(u32, @intCast(@max(seq_len, 1))) - 1;
+}
+
+/// RMS-norm when the head ships the weight, else a retained reference:
+/// MiMo's head has no q/k norm, every other head always ships both.
+fn normOrRetain(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (w.ctx == null) {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&out, x));
+        return out;
+    }
+    return rmsNormFn(x, w, eps, s);
+}
+
+/// `v * scale` as an owned handle; a retained reference at scale 1.
+fn scaledOwned(x: mlx.mlx_array, scale: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    if (scale == 1.0) {
+        try mlx.check(mlx.mlx_array_set(&out, x));
+        return out;
+    }
+    const k = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(k);
+    var kc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kc);
+    try mlx.check(mlx.mlx_astype(&kc, k, mlx.mlx_array_dtype(x), s));
+    try mlx.check(mlx.mlx_multiply(&out, x, kc, s));
+    return out;
+}
 
 inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
@@ -2786,16 +3036,19 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
     defer _ = mlx.mlx_array_free(v_proj);
 
     const kv_shape = [_]c_int{ 1, seq_len, kv_h, hd };
+    const v_shape = [_]c_int{ 1, seq_len, kv_h, mtpVHeadDim(self, cfg) };
     var k_r = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_r);
-    var v_r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_r);
+    var v_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_raw);
     try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
-    try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
+    try mlx.check(mlx.mlx_reshape(&v_raw, v_proj, &v_shape, 4, s));
+    const v_r = try scaledOwned(v_raw, self.v_scale, s);
+    defer _ = mlx.mlx_array_free(v_r);
 
-    const q_normed = try rmsNormFn(queries, self.q_norm, eps, s);
+    const q_normed = try normOrRetain(queries, self.q_norm, eps, s);
     defer _ = mlx.mlx_array_free(q_normed);
-    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
+    const k_normed = try normOrRetain(k_r, self.k_norm, eps, s);
     defer _ = mlx.mlx_array_free(k_normed);
 
     const perm = [_]c_int{ 0, 2, 1, 3 };
@@ -2820,9 +3073,9 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
     const s = self.s;
     const cfg = &target.config;
     const h_count: c_int = @intCast(cfg.num_attention_heads);
-    const hd: c_int = @intCast(cfg.head_dim);
+    const vd: c_int = mtpVHeadDim(self, cfg);
     const eps = cfg.rms_norm_eps;
-    const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
+    const flat_shape = [_]c_int{ 1, seq_len, h_count * vd };
     const perm = [_]c_int{ 0, 2, 1, 3 };
 
     var attn_t = mlx.mlx_array_new();
@@ -2997,14 +3250,17 @@ pub fn appendKvOnly(
     defer _ = mlx.mlx_array_free(v_proj);
 
     const kv_shape = [_]c_int{ 1, seq_len, kv_h, hd };
+    const v_shape = [_]c_int{ 1, seq_len, kv_h, mtpVHeadDim(self, cfg) };
     var k_r = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_r);
-    var v_r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_r);
+    var v_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_raw);
     try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
-    try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
+    try mlx.check(mlx.mlx_reshape(&v_raw, v_proj, &v_shape, 4, s));
+    const v_r = try scaledOwned(v_raw, self.v_scale, s);
+    defer _ = mlx.mlx_array_free(v_r);
 
-    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
+    const k_normed = try normOrRetain(k_r, self.k_norm, eps, s);
     defer _ = mlx.mlx_array_free(k_normed);
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var k_t = mlx.mlx_array_new();
@@ -3033,10 +3289,10 @@ pub fn appendKvOnly(
             @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
         else
             rope_offset;
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(mtpRopeBase(self, cfg)), 1.0, effective_offset, .{ .ctx = null }, s));
     }
 
-    var kv_view = try cache.update(0, k_rope, v_t, s, 0);
+    var kv_view = try cache.update(0, k_rope, v_t, s, mtpKvSpan(self, cfg, seq_len));
     kv_view.deinit();
 }
 
@@ -3118,11 +3374,11 @@ pub fn forwardWithMrope(
             @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
         else
             rope_offset;
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, front.q_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, front.k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, front.q_t, rope_dims, false, mlx.mlx_optional_float.some(mtpRopeBase(self, cfg)), 1.0, effective_offset, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, front.k_t, rope_dims, false, mlx.mlx_optional_float.some(mtpRopeBase(self, cfg)), 1.0, effective_offset, .{ .ctx = null }, s));
     }
 
-    var kv_view = try cache.update(0, k_rope, front.v_t, s, 0);
+    var kv_view = try cache.update(0, k_rope, front.v_t, s, mtpKvSpan(self, cfg, seq_len));
     defer kv_view.deinit();
 
     var attn_out = mlx.mlx_array_new();
@@ -3132,7 +3388,7 @@ pub fn forwardWithMrope(
     // Multi-token (history rebuild / draft batch): try the fused hd-256
     // flash kernel first — same dispatch the trunk's prefill uses.
     var fused_done = false;
-    if (seq_len > 1) {
+    if (seq_len > 1 and self.sinks.ctx == null) {
         if (try transformer_mod.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
             _ = mlx.mlx_array_free(attn_out);
             attn_out = fused;
@@ -3141,7 +3397,7 @@ pub fn forwardWithMrope(
     }
     if (!fused_done) {
         const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, seq_len > 1 and transformer_mod.sdpaForceFused(q_rope, kv_view.k), s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, self.sinks, seq_len > 1 and transformer_mod.sdpaForceFused(q_rope, kv_view.k), s));
     }
 
     const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);
@@ -3242,7 +3498,7 @@ pub fn forwardLanes(self: *const MtpModel, target: *Transformer, lanes: []const 
         var by_lane = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(by_lane);
         try mlx.check(mlx.mlx_transpose_axes(&by_lane, x, &lanes_first, 4, s));
-        try mlx.check(mlx.mlx_fast_rope_dynamic(out, by_lane, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, off_arr, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_rope_dynamic(out, by_lane, rope_dims, false, mlx.mlx_optional_float.some(mtpRopeBase(self, cfg)), 1.0, off_arr, .{ .ctx = null }, s));
     }
 
     const none_mask = mlx.mlx_array_new();
@@ -3259,11 +3515,11 @@ pub fn forwardLanes(self: *const MtpModel, target: *Transformer, lanes: []const 
         defer _ = mlx.mlx_array_free(key);
         const val = try Transformer.axisView(s, front.v_t, 2, k);
         defer _ = mlx.mlx_array_free(val);
-        var kv_view = try lane.cache.update(0, key, val, s, 0);
+        var kv_view = try lane.cache.update(0, key, val, s, mtpKvSpan(self, cfg, 1));
         defer kv_view.deinit();
         outs[built] = mlx.mlx_array_new();
         built += 1;
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&outs[k], q, kv_view.k, kv_view.v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&outs[k], q, kv_view.k, kv_view.v, attn_scale, "", none_mask, self.sinks, false, s));
     }
     var attn_out = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_out);

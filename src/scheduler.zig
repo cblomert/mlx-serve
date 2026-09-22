@@ -3898,7 +3898,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var vision_ptr: ?*VisionEncoder = null;
     if (params.load_vision) {
         const v = try sch.allocator.create(VisionEncoder);
-        if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
+        const vres = if (params.config.mimo_vision)
+            VisionEncoder.initMimo(sch.allocator, params.config.*, params.model_dir)
+        else
+            VisionEncoder.init(sch.allocator, params.config.*, weights_ptr);
+        if (vres) |encoder| {
             v.* = encoder;
             vision_ptr = v;
         } else |err| {

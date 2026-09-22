@@ -559,6 +559,12 @@ pub const ModelConfig = struct {
     // NOT the Qwen ViT: split qkv, learned pos table resampled per image,
     // window/full attention per layer, and plain 1D text positions (no M-RoPE).
     muse_vision: bool = false,
+    /// mimo_v2_flash: MiMo ViT from `omnimodal/vision_encoder.safetensors`.
+    /// Qwen2-VL preprocessing (patch 16, merge 2, CLIP mean/std) and Qwen's
+    /// vision-start/end placeholders, but NOT Qwen's M-RoPE: image tokens
+    /// take plain 1-D positions in this trunk (vLLM's MiMoV2Omni does not
+    /// implement SupportsMRoPE).
+    mimo_vision: bool = false,
     mv_pos_side: u32 = 0, // learned pos table is pos_side x pos_side
     mv_projector_hidden: u32 = 0, // vision_adapter width
     mv_ln_eps: f32 = 1e-5,
@@ -2717,6 +2723,24 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (v == .integer) config.sliding_window = @intCast(v.integer);
         }
         config.kv_sliding_trimmed = true; // mimoAttnWith passes max_kv = sliding.span
+
+        // Vision: the tower ships beside the trunk in omnimodal/ (its geometry
+        // lives in omnimodal/config.json and is read from the weights at
+        // load); the trunk config carries only the placeholder ids. A pack
+        // without the file degrades to text-only via MissingVisionWeights.
+        config.has_vision = true;
+        config.mimo_vision = true;
+        config.qv_patch = 16;
+        config.qv_temporal_patch = 2;
+        config.qv_merge = 2;
+        config.qv_min_pixels = 3136;
+        config.qv_max_pixels = 12845056; // clamped to ENGINE_MAX_PIXELS by the server
+        config.qv_out_hidden = config.hidden_size;
+        inline for (.{ .{ "image_token_id", "image_token_id" }, .{ "video_token_id", "video_token_id" }, .{ "vision_start_token_id", "vision_start_token_id" }, .{ "vision_end_token_id", "vision_end_token_id" }, .{ "audio_token_id", "audio_token_id" } }) |kv| {
+            if (cfg_obj.get(kv[0])) |v| {
+                if (v == .integer) @field(config, kv[1]) = @intCast(v.integer);
+            }
+        }
         if (cfg_obj.get("hybrid_layer_pattern")) |v| {
             if (v == .array) {
                 config.has_explicit_layer_types = true;

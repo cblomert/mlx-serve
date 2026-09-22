@@ -41,7 +41,9 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    /// `mimo` = Qwen2-VL geometry with CLIP mean/std normalization (Qwen3-VL
+    /// uses 0.5/0.5; feeding MiMo that scaling is a silent quality loss).
+    mode: enum { gemma, qwen, muse, lfm2, mimo } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -226,7 +228,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     // not be served at all.
     const a = std.testing.allocator;
 
-    {   // the shape that panicked: pick the entry named "default"
+    { // the shape that panicked: pick the entry named "default"
         const json =
             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
             \\{"name":"default","template":"PLAIN"}]}
@@ -235,22 +237,25 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // no "default" named: fall back to the first usable entry
-        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+    { // no "default" named: fall back to the first usable entry
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // the ordinary string shape is untouched
-        const json = \\{"chat_template":"BARE"}
+    { // the ordinary string shape is untouched
+        const json =
+            \\{"chat_template":"BARE"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // junk shapes return null so the caller uses its jinja/family fallback
-        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+    { // junk shapes return null so the caller uses its jinja/family fallback
+        const json =
+            \\{"chat_template":[{"name":"x"},{"nope":1}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -258,27 +263,30 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     }
     try std.testing.expect(chatTemplateFromValue(null) == null);
 
-    {   // transformers >= 5 saves the template to chat_template.jinja and leaves
+    { // transformers >= 5 saves the template to chat_template.jinja and leaves
         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
         // Laguna-S-2.1-oQ4e-fast, issue #169). jinja.cpp has no `include`, so
         // taking the pointer literally fails the render and SILENTLY drops to
         // the generic fallback — wrong-family markers the model then echoes.
         // Read it as "no inline template" so the sidecar file is used.
-        const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
+        const json =
+            \\{"chat_template":"{% include 'chat_template.jinja' %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // whitespace/dash variants are the same pointer
-        const json = \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+    { // whitespace/dash variants are the same pointer
+        const json =
+            \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // a real template that merely CONTAINS the word include is untouched
-        const json = \\{"chat_template":"{% if x %}include{% endif %}"}
+    { // a real template that merely CONTAINS the word include is untouched
+        const json =
+            \\{"chat_template":"{% if x %}include{% endif %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -372,7 +380,6 @@ pub fn formatChat(
 ) ![]u32 {
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
-
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -2387,7 +2394,7 @@ fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commi
     {
         return " to=user<|message|>";
     }
-    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
+    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64..], "\n\r\t ");
     if (k2ThinkOpenerAt(tail)) |opener| {
         inline for (k2_think_openers) |o| {
             if (std.mem.eql(u8, opener, o)) return "</" ++ o[1..];
@@ -2773,21 +2780,30 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // of these into a real tool open. Order doesn't matter; first endsWith
     // hit wins. Listed shortest-first for legibility.
     const tail_prefixes = [_][]const u8{
-        "<",     "<t",     "<to",     "<too",     "<tool",
-        "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
-        "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
+        "<",        "<t",        "<to",       "<too",       "<tool",
+        "<|",       "<|t",       "<|to",      "<|too",      "<|tool",
+        "<|tool_",  "<|tool_c",  "<|tool_ca", "<|tool_cal",
         // MiniCPM5 V3 `<function name="…">` — COMPLETE ladder. `<funct` is a
         // real decomposition in this vocabulary (`<f` id 54303 + `unct` id
         // 14185 decode to exactly `<funct`); omitting that one rung flushed the
         // fragment and leaked the rest of the tag. The rungs are DERIVED in the
         // test, so a future gap fails there instead of shipping.
-        "<f", "<fu", "<fun", "<func", "<funct", "<functi", "<functio", "<function",
+        "<f",
+        "<fu",      "<fun",      "<func",     "<funct",     "<functi",
+        "<functio", "<function",
         // Muse ATEM (a fused multi-char BPE fragment can end mid-marker)
-        "<a", "<at", "<ate", "<atem", "<atem:",
+        "<a",        "<at",        "<ate",
+        "<atem",    "<atem:",
         // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
         // splits too in case the tokenizer spells the marker in pieces)
-        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
-        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+           "<\xef",     "<\xef\xbd",
+        "<｜",
+        "<｜D",
+        "<｜DS",
+        "<｜DSM",
+        "<｜DSML",
+        "<｜DSML\xef",
+        "<｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -3216,10 +3232,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
         // Gemma 4 close marker: `<tool_call|>`. Detected when after `<tool`
         // we see `_call|`. Let the Gemma 4 branch below pick this up.
-        if (next == '_'
-            and after_tool + 6 <= effective_text.len
-            and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|"))
-        {
+        if (next == '_' and after_tool + 6 <= effective_text.len and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|")) {
             search_pos = after_tool + 6;
             continue;
         }
@@ -4456,7 +4469,7 @@ fn parseSelfClosingToolTag(slice: []const u8) ?struct { name: []const u8, argume
         var w: usize = k + 1;
         while (w < slice.len and (slice[w] == ' ' or slice[w] == '\t' or slice[w] == '\n' or slice[w] == '\r')) w += 1;
         const close_markers = [_][]const u8{
-            "</tool_call>",   "</tool_calls>",
+            "</tool_call>",    "</tool_calls>",
             "</tool_request>", "</tool_requests>",
             "</tool>",
         };
@@ -6992,8 +7005,7 @@ test "collapseDoubledThinkTags leaves single </think> unchanged" {
 }
 
 test "collapseDoubledThinkTags handles multiple separated doublings" {
-    const out = try collapseDoubledThinkTags(testing.allocator,
-        "A</think></think>B</think></think>C");
+    const out = try collapseDoubledThinkTags(testing.allocator, "A</think></think>B</think></think>C");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("A</think>B</think>C", out);
 }
@@ -9699,8 +9711,7 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
     try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
     // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
-    try testing.expect(!templateConsumesEffort(
-        "{%- if enable_thinking %}<think>\n{%- endif %}"));
+    try testing.expect(!templateConsumesEffort("{%- if enable_thinking %}<think>\n{%- endif %}"));
     try testing.expect(!templateConsumesEffort(""));
 }
 
@@ -11106,7 +11117,7 @@ test "parseToolCalls: <tool_call>{JSON} truncated before </tool_call>" {
     const allocator = testing.allocator;
     const text = "\n\n<tool_call>\n" ++
         \\{"name": "writeFile", "arguments": {"path": "vite.config.js", "content": "ok"}}
-        ++ "\n</tool_cal";
+    ++ "\n</tool_cal";
     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
@@ -11129,7 +11140,7 @@ test "parseToolCalls: mismatched </tool_action> close still parses" {
     const allocator = testing.allocator;
     const text = "<tool_call>\n" ++
         \\{"name": "edit", "arguments": {"path":"mlx.html", "edits":[{"oldText": "  </ul>\n</body>", "newText": "  </ul>\n  <button onclick=\"alert('Hello from MLX')\">Click me</button>\n</body>"}]}
-        ++ "\n</tool_action>";
+    ++ "\n</tool_action>";
     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
@@ -11590,11 +11601,13 @@ fn jsonValueEql(a: std.json.Value, b: std.json.Value) bool {
 /// Value strings chosen to collide with every JSON literal spelling the
 /// tag-format parsers used to guess from.
 const adversarial_strings = [_][]const u8{
-    "false",      "true",         "False",   "True",    "null",   "None",
-    "42",         "-7",           "3.14",    "0",       "1",      "",
-    "[1,2]",      "{\"k\":1}",    "nan",     "inf",     "  ",     "yes",
-    "a\"b",       "line\nline",   "tab\there", "back\\slash", "café ☕", "0x1f",
-    "{not json",  "[unclosed",    "1e400",   "00",      "+5",     "-",
+    "false", "true",       "False",     "True",        "null", "None",
+    "42",    "-7",         "3.14",      "0",           "1",    "",
+    "[1,2]", "{\"k\":1}",  "nan",       "inf",         "  ",   "yes",
+    "a\"b",  "line\nline", "tab\there", "back\\slash",
+    "café ☕",
+    "0x1f",  "{not json",  "[unclosed", "1e400",       "00",   "+5",
+    "-",
 };
 
 test "fuzz: a conforming tool call round-trips byte-identical through parse+coerce" {
@@ -11659,8 +11672,7 @@ test "fuzz: a conforming tool call round-trips byte-identical through parse+coer
 
         // Serialize as a canonical Hermes JSON call — always VALID input.
         const args_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = args }, .{});
-        const raw = try std.fmt.allocPrint(arena,
-            "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
+        const raw = try std.fmt.allocPrint(arena, "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
 
         const calls = (try parseToolCalls(allocator, raw)) orelse {
             std.debug.print("\n[fuzz iter {d}] valid tool call did not parse\n  {s}\n", .{ iter, raw });
@@ -13584,7 +13596,6 @@ test "streamContentLead never touches whitespace inside the answer" {
     // whole, so its logprobs entry still describes bytes that reached content.
     try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
 }
-
 
 test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
     // A 4 KB edit call that hit EOS inside a string value. The object never
