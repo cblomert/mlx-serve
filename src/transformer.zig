@@ -32004,6 +32004,26 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
     const s_cols: u32 = if (s_shape.len >= 2) @intCast(s_shape[s_shape.len - 1]) else 0;
 
     if (mlx.mlx_array_dtype(sc) == .uint8) {
+        // uint8 scales mean an fp mode for THIS TENSOR, whatever the model-wide
+        // mode is — every fp mode stores E8M0/E4M3 scales, affine stores bf16.
+        // So solve the exact geometry FIRST, before consulting the config at
+        // all. The branch below used to be reached only when the model-wide
+        // mode was itself fp, which quietly assumed that a mixed checkpoint
+        // could only mix WITHIN the fp family (the LFM2.5 mxfp8-embedding case
+        // the next comment describes).
+        //
+        // mimo_v2_flash breaks that assumption: its `quantization` block is
+        // affine gs64 at the top level with 338 per-tensor overrides, of which
+        // the 141 MoE expert banks (`*.switch_mlp.*_proj`) are mxfp4 gs32.
+        // Falling through to the mxfp8 assumption below resolved those banks to
+        // bits 8 / gs 16 and died in gather_qmm ("expanded quantized matrix
+        // (2048, 2048) ... group_size=16, bits=8"). The geometry says it
+        // exactly: bits = w_cols*32/in = 512*32/4096 = 4, group = in/s_cols =
+        // 4096/128 = 32 -> mxfp4. Solving beats parsing the 338-entry map, and
+        // generalizes to the next mixed checkpoint without a config schema.
+        if (in_dim) |in| {
+            if (fpParamsFromGeometry(config, w_cols, s_cols, in)) |qp| return qp;
+        }
         if (config.quant_mode != .affine) {
             // A per-tensor override can live INSIDE the fp family: LFM2.5-2.6B-MLX's
             // mxfp4 build stores `model.embed_tokens` as mxfp8. Every fp mode
@@ -32012,9 +32032,6 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
             // 4 bits — an `mlx_dequantize` shape rejection, i.e. an MLX error,
             // i.e. a dead server on the first request. The packed geometry says
             // it exactly; solve, exactly as the affine arm below does.
-            if (in_dim) |in| {
-                if (fpParamsFromGeometry(config, w_cols, s_cols, in)) |qp| return qp;
-            }
             return .{ .bits = config.quant_bits, .group_size = config.quant_group_size, .mode = config.quant_mode };
         }
         const gs: u32 = if (w_cols > 0 and s_cols > 0) (w_cols * 32) / (s_cols * 8) else 32;
@@ -62552,4 +62569,52 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
     defer inkling.deinit();
     try put(&inkling, "model.layers.0.attn.wo_ud.weight", .bfloat16, s);
     try std.testing.expect(weightsHaveDenseAttnProj(&inkling));
+}
+
+test "computeQuantParams: fp scales on an AFFINE-declared model solve to their OWN mode (mixed quant)" {
+    // mimo_v2_flash ships `quantization` as affine gs64 at the top level with
+    // 338 per-tensor overrides, 141 of which put the MoE expert banks at mxfp4
+    // gs32. Before the geometry solve was hoisted, uint8 scales under an
+    // affine model-wide mode fell through to a hardcoded bits-8/mxfp8 guess and
+    // gather_qmm rejected the bank. The scales DTYPE is the family evidence
+    // (affine ships bf16, every fp mode ships uint8) and the packed geometry is
+    // the rest, so no config schema is needed to read a mixed checkpoint.
+    const s = mlx.gpuStream();
+    var cfg = ModelConfig{};
+    cfg.quant_mode = .affine;
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 64;
+
+    // The real shapes from the checkpoint: [E, out, in/8] u32 + [E, out,
+    // in/gs] u8, with in = hidden = 4096.
+    const w_shape = [_]c_int{ 256, 2048, 512 };
+    const s_shape = [_]c_int{ 256, 2048, 128 };
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &w_shape, 3, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_zeros(&sc, &s_shape, 3, .uint8, s));
+
+    const qp = computeQuantParams(&cfg, w, sc, 4096);
+    try testing.expectEqual(@as(u32, 4), qp.bits);
+    try testing.expectEqual(@as(u32, 32), qp.group_size);
+    try testing.expectEqual(QuantMode.mxfp4, qp.mode);
+
+    // Regression guard: the attention banks in the SAME checkpoint ship bf16
+    // scales and must still resolve to the model-wide affine gs64 — the fix
+    // must not drag every tensor into the fp family.
+    const aw_shape = [_]c_int{ 12288, 512 };
+    const as_shape = [_]c_int{ 12288, 64 };
+    var aw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(aw);
+    try mlx.check(mlx.mlx_zeros(&aw, &aw_shape, 2, .uint32, s));
+    var asc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(asc);
+    try mlx.check(mlx.mlx_zeros(&asc, &as_shape, 2, .bfloat16, s));
+
+    const aqp = computeQuantParams(&cfg, aw, asc, 4096);
+    try testing.expectEqual(@as(u32, 4), aqp.bits);
+    try testing.expectEqual(@as(u32, 64), aqp.group_size);
+    try testing.expectEqual(QuantMode.affine, aqp.mode);
 }
