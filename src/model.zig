@@ -490,6 +490,17 @@ pub const ModelConfig = struct {
 
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
+
+    /// This arch's attention arms TRIM the sliding layers' KV to the window
+    /// (`cache.update(..., max_kv = sliding.span)`), so those layers are a
+    /// FIXED cost, not a per-token one — see `kvBytesPerToken`.
+    ///
+    /// Opt-in per arch, NOT derived from `has_sliding_window`: that field
+    /// defaults to TRUE and is simply ignored by archs that do not slide, so
+    /// keying on it billed a dense 24-layer qwen3 as 4 layers. gpt_oss, laguna
+    /// and gemma4 all trim too and would qualify, but each needs its own
+    /// measurement before its memory model moves.
+    kv_sliding_trimmed: bool = false,
     layer_is_global: [128]bool = @splat(false),
 
     // Vision encoder (Gemma 4 SigLIP)
@@ -831,7 +842,48 @@ pub const ModelConfig = struct {
             @as(u64, self.num_attention_heads)
         else
             @as(u64, self.num_key_value_heads);
-        return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
+        // A SLIDING layer does not grow with the sequence: its cache is
+        // trimmed to `window + q - 1` on every update (every sliding arm passes
+        // `max_kv = sliding.span` to `cache.update`), so it is a FIXED cost —
+        // `slidingKvFixedBytes` — not a per-token one. Billing it per token is
+        // the lfm2 3.75x above, one axis over: mimo_v2_flash was charged
+        // 222,720 B/token against a true 23,040 (9.7x), which clamped the
+        // prefix-cache budget to zero and cut advertised safe context to a
+        // tenth of the real figure.
+        //
+        // Only the sliding arm reads the per-layer geometry. A uniform arch
+        // keeps the exact expression it had, so no existing bill moves.
+        if (!self.kv_sliding_trimmed or !self.has_sliding_window or self.isMla()) {
+            return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
+        }
+        var total: u64 = 0;
+        var li: u32 = 0;
+        while (li < self.num_hidden_layers) : (li += 1) {
+            if (self.isLinearLayer(li)) continue; // recurrent state, billed elsewhere
+            if (!self.isGlobalLayer(li)) continue; // sliding: fixed, not per token
+            total += @as(u64, self.layerKVHeads(li)) *
+                (@as(u64, self.layerHeadDim(li)) + @as(u64, self.valueHeadDim())) * 2;
+        }
+        return total;
+    }
+
+    /// KV bytes the SLIDING layers hold however long the sequence gets: each
+    /// keeps `window + chunk - 1` rows and no more. Zero on a uniform arch.
+    /// Charged ONCE per session beside `kvBytesPerToken() * ctx`, which is the
+    /// affine shape the cache actually has — slope from the full-attention
+    /// layers, intercept from the sliding ones.
+    pub fn slidingKvFixedBytes(self: *const ModelConfig, chunk: u64) u64 {
+        if (!self.kv_sliding_trimmed or !self.has_sliding_window or self.isMla()) return 0;
+        const span: u64 = @as(u64, self.sliding_window) + @max(chunk, 1) - 1;
+        var total: u64 = 0;
+        var li: u32 = 0;
+        while (li < self.num_hidden_layers) : (li += 1) {
+            if (self.isLinearLayer(li)) continue;
+            if (self.isGlobalLayer(li)) continue;
+            total += span * @as(u64, self.layerKVHeads(li)) *
+                (@as(u64, self.layerHeadDim(li)) + @as(u64, self.valueHeadDim())) * 2;
+        }
+        return total;
     }
 
     /// Dense bf16 bytes of QSA indexer history ONE token occupies: the pooled
@@ -2664,6 +2716,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("sliding_window")) |v| {
             if (v == .integer) config.sliding_window = @intCast(v.integer);
         }
+        config.kv_sliding_trimmed = true; // mimoAttnWith passes max_kv = sliding.span
         if (cfg_obj.get("hybrid_layer_pattern")) |v| {
             if (v == .array) {
                 config.has_explicit_layer_types = true;
@@ -7617,4 +7670,46 @@ test "valueHeadDim falls back to head_dim for every symmetric arch" {
     try testing.expectEqual(@as(u32, 128), c.valueHeadDim());
     c.v_head_dim = 64;
     try testing.expectEqual(@as(u32, 64), c.valueHeadDim());
+}
+
+test "kvBytesPerToken: a TRIMMED sliding layer is a fixed cost, not a per-token one" {
+    const c = try parseConfigFromJson(testing.allocator, MIMO_V2_FLASH_SHIPPED);
+    try testing.expect(c.kv_sliding_trimmed);
+
+    // Only the 9 full-attention layers grow with the sequence, at their own
+    // (4 kv heads, K 192 / V 128) geometry.
+    try testing.expectEqual(@as(u64, 9 * 4 * (192 + 128) * 2), c.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 23_040), c.kvBytesPerToken());
+
+    // The old uniform expression billed all 48 layers at the SLIDING layers'
+    // 8 kv heads and 2 x head_dim: 294,912 B/token, a 12.8x over-bill. That is
+    // what clamped the prefix cache to "mem-cap=0.0 MB" and advertised 105k of
+    // safe context on a model whose real ceiling is ~1M.
+    try testing.expect(c.kvBytesPerToken() * 12 < 48 * 8 * 2 * 192 * 2);
+
+    // The 39 sliding layers hold window + chunk - 1 rows and no more, whatever
+    // the context length — so this term does NOT scale with ctx.
+    const fixed_4k = c.slidingKvFixedBytes(4096);
+    try testing.expectEqual(@as(u64, 39 * (128 + 4096 - 1) * 8 * (192 + 128) * 2), fixed_4k);
+    try testing.expectEqual(fixed_4k, c.slidingKvFixedBytes(4096)); // ctx-independent
+
+    // At 1M context the affine model is dominated by the slope, which is the
+    // whole point: 24.2 GB of growth against 0.8 GB of fixed window.
+    const ctx: u64 = 1_048_576;
+    try testing.expect(c.kvBytesPerToken() * ctx > 20 * fixed_4k);
+}
+
+test "kv_sliding_trimmed is opt-in: a dense arch keeps its exact old bill" {
+    // Regression guard for the bug this fix first introduced: `has_sliding_window`
+    // DEFAULTS to true and is ignored by archs that do not slide, so keying the
+    // affine path on it billed a dense 24-layer qwen3 as 4 layers (16,384 vs
+    // 98,304) and broke eight downstream memory tests.
+    var dense = ModelConfig{ .model_type = "qwen3" };
+    dense.num_hidden_layers = 24;
+    dense.num_key_value_heads = 8;
+    dense.head_dim = 128;
+    try testing.expect(!dense.kv_sliding_trimmed);
+    try testing.expect(dense.has_sliding_window); // the trap: true by default
+    try testing.expectEqual(@as(u64, 24 * 8 * 2 * 128 * 2), dense.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 0), dense.slidingKvFixedBytes(4096));
 }

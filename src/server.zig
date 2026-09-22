@@ -3733,7 +3733,11 @@ pub fn planHotCache(
     const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
     const reserve_chunk = clampReserveWidth(config, chunk);
     const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
-    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+    // Affine, not linear: the full-attention layers scale with ctx, the sliding
+    // ones hold a fixed window whatever the sequence length. Billing the latter
+    // per token is what clamped this cache to zero on mimo_v2_flash.
+    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +|
+        config.qsaRingBytes() +| config.slidingKvFixedBytes(chunk);
     return .{
         .chunk = chunk,
         .reserve_chunk = reserve_chunk,
