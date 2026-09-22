@@ -1179,6 +1179,14 @@ pub const ModelConfig = struct {
         // k2_horizon: the template opens a think marker on every assistant
         // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
         if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
+        // mimo_v2_flash: an RL-tuned reasoner whose template leaves thinking ON
+        // unless explicitly disabled — `enable_thinking is false` is the ONLY
+        // branch that commits `<think></think>`. Defaulting a silent request to
+        // off does not merely decline to reason: it spends two tokens actively
+        // SUPPRESSING the pass the checkpoint was trained to run, and makes an
+        // identical request render a different prompt here than under mlx-lm
+        // (measured: 17 tokens vs 19 on the same messages).
+        if (std.mem.eql(u8, self.model_type, "mimo_v2_flash")) return true;
 
         return false;
     }
@@ -4393,6 +4401,15 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     // checkpoint and left a tool-less silent request answering without
     // reasoning — muse can do that because its prompt commits a to=user
     // channel, and this arch has no such fallback.
+    // mimo_v2_flash opts IN on both arms for the same reason as ling, plus a
+    // sharper one: its template's ONLY thinking branch is `enable_thinking is
+    // false`, which COMMITS `<think></think>`. Defaulting off does not decline
+    // to reason, it spends two tokens suppressing the pass — and renders a
+    // different prompt than mlx-lm does for the identical request (19 tokens
+    // vs 17, measured on the shipped checkpoint).
+    const mimo = ModelConfig{ .model_type = "mimo_v2_flash" };
+    try testing.expect(mimo.defaultEnableThinking(false));
+    try testing.expect(mimo.defaultEnableThinking(true));
     const ling = ModelConfig{ .model_type = "bailing_hybrid" };
     try testing.expect(ling.defaultEnableThinking(false));
     try testing.expect(ling.defaultEnableThinking(true));
