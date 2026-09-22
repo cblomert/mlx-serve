@@ -81,6 +81,10 @@ pub const VideoData = struct {
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
+    /// Seconds each temporal-patch group spans (tps / sampling fps). MiMo
+    /// writes a `MM:SS` timestamp before every group; 0 = unknown, which
+    /// MiMo reads as its native 2 fps sampling (one group per second).
+    seconds_per_grid: f32 = 0,
 };
 
 /// OpenAI spells the system turn `developer` for reasoning models (pi does

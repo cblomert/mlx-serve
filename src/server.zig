@@ -8189,7 +8189,12 @@ fn handleChatCompletions(
                         for (frames_val.array.items) |f| {
                             if (f == .string) frame_urls.append(allocator, f.string) catch continue;
                         }
-                        appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
+                        const fps: f32 = if (vid_obj.object.get("fps")) |fv| switch (fv) {
+                            .float => |x| @floatCast(x),
+                            .integer => |x| @floatFromInt(x),
+                            else => 0,
+                        } else 0;
+                        appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config), fps);
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
                         if (!decode_this_message) continue;
                         // OpenAI-style audio block. For the Gemma 4 12B unified
@@ -13939,6 +13944,54 @@ fn lfm2ImageSegment(
     return try seg.toOwnedSlice(allocator);
 }
 
+/// MiMo's video framing (its HF processor, not Qwen's): per video
+///   <|mimo_video_start|>
+///   for each temporal-patch group g:  "MM:SS" <|vision_start|> pad x n <|vision_end|>
+///   <|mimo_video_end|>
+/// The timestamp is plain text; this tokenizer splits every digit into its
+/// own token ('0'..'9' = 15..24, ':' = 25 — verified against the shipped
+/// tokenizer), so it is built here without a tokenizer handle.
+fn appendMimoVideoSegments(
+    allocator: std.mem.Allocator,
+    seg: *std.ArrayList(u32),
+    config: *const model_mod.ModelConfig,
+    msg: ?*const chat_mod.Message,
+    n_video: usize,
+) !void {
+    const VIDEO_START: u32 = 151670; // <|mimo_video_start|>
+    const VIDEO_END: u32 = 151671; // <|mimo_video_end|>
+    const DIGIT0: u32 = 15;
+    const COLON: u32 = 25;
+    const merge2: usize = @as(usize, config.qv_merge) * config.qv_merge;
+    const vids: []const chat_mod.VideoData = if (msg) |m| (m.videos orelse &.{}) else &.{};
+    var emitted: usize = 0;
+    for (vids) |vd| {
+        const per: usize = @as(usize, vd.grid_h) * vd.grid_w / merge2;
+        const spg: f32 = if (vd.seconds_per_grid > 0) vd.seconds_per_grid else 1.0;
+        try seg.append(allocator, VIDEO_START);
+        for (0..vd.grid_t) |g| {
+            const secs: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(g)) * spg));
+            const mm = secs / 60;
+            const ss = secs % 60;
+            try seg.appendSlice(allocator, &.{ DIGIT0 + (mm / 10) % 10, DIGIT0 + mm % 10, COLON, DIGIT0 + ss / 10, DIGIT0 + ss % 10 });
+            try seg.append(allocator, config.vision_start_token_id);
+            try seg.appendNTimes(allocator, config.video_token_id, per);
+            try seg.append(allocator, config.vision_end_token_id);
+            emitted += per;
+        }
+        try seg.append(allocator, VIDEO_END);
+    }
+    // The pad count is the contract with the splice: if the message's grids
+    // did not account for every soft token, emit the rest plainly rather than
+    // desynchronize embeddings from placeholders.
+    if (emitted < n_video) {
+        log.warn("[vision] mimo: {d} video tokens unaccounted by grids, appending plainly\n", .{n_video - emitted});
+        try seg.append(allocator, config.vision_start_token_id);
+        try seg.appendNTimes(allocator, config.video_token_id, n_video - emitted);
+        try seg.append(allocator, config.vision_end_token_id);
+    }
+}
+
 fn insertMultimodalTokens(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
@@ -13980,7 +14033,9 @@ fn insertMultimodalTokens(
             if (eoi > 0) try seg.append(allocator, eoi);
         }
     }
-    if (want_video) {
+    if (want_video and config.mimo_vision) {
+        try appendMimoVideoSegments(allocator, &seg, config, if (active_media) |m| m.message else null, n_video);
+    } else if (want_video) {
         if (boi > 0) try seg.append(allocator, boi);
         try seg.appendNTimes(allocator, video_token_id, n_video);
         if (eoi > 0) try seg.append(allocator, eoi);
@@ -14617,7 +14672,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 /// patch groups — the last group pads by repeating its final frame, matching
 /// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
-    if (vp.mode != .qwen or frame_urls.len == 0) return null;
+    if ((vp.mode != .qwen and vp.mode != .mimo) or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
 
@@ -14707,8 +14762,11 @@ pub fn appendVideoUrlContent(
     list: *std.ArrayList(chat_mod.VideoData),
     frame_urls: []const []const u8,
     vp: chat_mod.VisionPreproc,
+    fps: f32,
 ) void {
-    if (decodeVideoUrlContent(allocator, frame_urls, vp)) |vid| {
+    if (decodeVideoUrlContent(allocator, frame_urls, vp)) |decoded| {
+        var vid = decoded;
+        if (fps > 0) vid.seconds_per_grid = @as(f32, @floatFromInt(vp.tps)) / fps;
         list.append(allocator, vid) catch allocator.free(vid.pixels);
     }
 }
