@@ -59,6 +59,10 @@ pub const DflashConfig = struct {
     num_attention_heads: u32,
     num_key_value_heads: u32,
     head_dim: u32,
+    /// Rotary width. `partial_rotary_factor * head_dim` when the drafter ships
+    /// the field, else the full head. MiMo's drafter declares 0.5 over a
+    /// 128-wide head, so rotating all 128 dims corrupts every draft.
+    rotary_dim: u32,
     intermediate_size: u32,
     rms_norm_eps: f32,
     rope_theta: f32,
@@ -272,6 +276,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const n_heads: u32 = try jsonU32(root.get("num_attention_heads") orelse return error.IncompleteDflashConfig);
     const kv_heads: u32 = if (root.get("num_key_value_heads")) |v| try jsonU32(v) else n_heads;
     const head_dim: u32 = try jsonU32(root.get("head_dim") orelse return error.IncompleteDflashConfig);
+    const partial: f32 = if (root.get("partial_rotary_factor")) |v| jsonFloat(v) else 1.0;
+    const rotary_dim: u32 = blk: {
+        if (partial <= 0.0 or partial > 1.0) break :blk head_dim;
+        const d: u32 = @intFromFloat(@as(f32, @floatFromInt(head_dim)) * partial);
+        break :blk if (d == 0) head_dim else d;
+    };
     const intermediate: u32 = try jsonU32(root.get("intermediate_size") orelse return error.IncompleteDflashConfig);
     const eps: f32 = jsonFloat(root.get("rms_norm_eps") orelse return error.IncompleteDflashConfig);
     const sliding: u32 = if (root.get("sliding_window")) |v| try jsonU32(v) else 0;
@@ -315,6 +325,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .num_attention_heads = n_heads,
         .num_key_value_heads = kv_heads,
         .head_dim = head_dim,
+        .rotary_dim = rotary_dim,
         .intermediate_size = intermediate,
         .rms_norm_eps = eps,
         .rope_theta = rope_theta,
@@ -637,6 +648,13 @@ pub const DflashLayer = struct {
     up: DflashLinear, // [hidden → intermediate]
     down: DflashLinear, // [intermediate → hidden]
 
+    /// Learned per-head attention sink bias (`self_attn.attention_sink_bias`).
+    /// MiMo's DFlash drafter ships one per layer because its attention is
+    /// sliding-windowed WITH sinks, exactly like the trunk it drafts for.
+    /// Null on a drafter that has none; passing a null handle to SDPA is the
+    /// no-sink path, so this stays one expression at both call sites.
+    sinks: mlx.mlx_array = .{ .ctx = null },
+
     // DFlash2 only — null on a v1 assistant.
     attention_conv: ?DynConv = null,
     mlp_conv: ?DynConv = null,
@@ -648,6 +666,7 @@ pub const DflashLayer = struct {
         _ = mlx.mlx_array_free(self.post_attn_norm);
         _ = mlx.mlx_array_free(self.q_norm);
         _ = mlx.mlx_array_free(self.k_norm);
+        if (self.sinks.ctx != null) _ = mlx.mlx_array_free(self.sinks);
         self.q.deinit();
         self.k.deinit();
         self.v.deinit();
@@ -662,6 +681,7 @@ pub const DflashLayer = struct {
         _ = mlx.mlx_vector_array_append_value(vec, self.post_attn_norm);
         _ = mlx.mlx_vector_array_append_value(vec, self.q_norm);
         _ = mlx.mlx_vector_array_append_value(vec, self.k_norm);
+        if (self.sinks.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, self.sinks);
         for ([_]*const DflashLinear{ &self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down }) |lin| {
             lin.appendEval(vec);
         }
@@ -919,6 +939,16 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     return owned;
 }
 
+/// `key` if the drafter ships it, else a null handle. For weights whose
+/// ABSENCE is a valid architecture rather than a broken checkpoint — the sink
+/// bias exists only on a drafter whose attention is sinked.
+fn ownWeightOpt(w: *const Weights, key: []const u8) mlx.mlx_array {
+    const arr = w.get(key) orelse return .{ .ctx = null };
+    var owned = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_array_set(&owned, arr)) catch return .{ .ctx = null };
+    return owned;
+}
+
 /// `key`, falling back to `alt` — the DFlash2 codebooks ship WITHOUT a
 /// `.weight` suffix (the reference loader renames them before load_weights);
 /// a re-export through transformers would put the suffix back.
@@ -1062,6 +1092,7 @@ pub fn loadDflashQuant(
             .q_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_norm.weight", .{li})),
             .k = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj", .{li}), hidden, bits, s),
             .k_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_norm.weight", .{li})),
+            .sinks = ownWeightOpt(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.attention_sink_bias", .{li})),
             .v = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj", .{li}), hidden, bits, s),
             .o = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj", .{li}), q_out, bits, s),
             .gate = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj", .{li}), hidden, bits, s),
@@ -1243,6 +1274,7 @@ fn projectHeads(
     norm_w: mlx.mlx_array,
     n_heads: u32,
     head_dim: u32,
+    rope_dim: u32,
     eps: f32,
     theta: f32,
     rope_offset: usize,
@@ -1271,7 +1303,7 @@ fn projectHeads(
     try mlx.check(mlx.mlx_fast_rope(
         &roped,
         transposed,
-        @intCast(head_dim),
+        @intCast(rope_dim),
         rope_traditional,
         .{ .value = theta, .has_value = true },
         1.0,
@@ -1840,7 +1872,7 @@ pub fn appendContext(
     defer _ = mlx.mlx_array_free(enc);
 
     for (model.layers, 0..) |*lw, li| {
-        const k = try projectHeads(enc, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, cfg.rope_traditional, s);
+        const k = try projectHeads(enc, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rotary_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(k);
         const v = try projectHeadsNoNorm(enc, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(v);
@@ -1933,9 +1965,9 @@ pub fn forwardBlock(
         };
         const attn_in = if (attn_prep) |*cp| cp.hidden else normed;
 
-        const q = try projectHeads(attn_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
+        const q = try projectHeads(attn_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rotary_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(q);
-        const bk = try projectHeads(attn_in, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
+        const bk = try projectHeads(attn_in, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rotary_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(bk);
         const bv = try projectHeadsNoNorm(attn_in, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(bv);
@@ -1951,9 +1983,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, lw.sinks, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, lw.sinks, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();
