@@ -2440,6 +2440,27 @@ fn continuationPrefill(messages: []const Message, continue_final: bool) ?[]const
     return if (trimmed.len > 0) trimmed else null;
 }
 
+/// MiMo sometimes writes its whole answer inside the thinking block and then
+/// stops on its own without ever closing it. Seen on a plain "transcribe this
+/// recording" with thinking on: the transcript lands in reasoning, the reply is
+/// empty. For a generation that ENDED ON ITS OWN (the caller checks: not a
+/// length cut), with no close tag in `text` and no content, the reasoning is
+/// the answer and is delivered as content too; reasoning stays reported.
+/// Reasoning that carries tool-call markup is left alone: a call the model only
+/// thought about must never execute. Other families keep treating an unclosed
+/// block as truncated reasoning (`splitThinkBlockKeepingMarkup`).
+pub fn promoteUnclosedAnswer(split: ThinkSplit, text: []const u8) ThinkSplit {
+    if (std.mem.trim(u8, split.content, " \t\r\n").len > 0) return split;
+    if (indexOfThinkCloseTag(text, 0) != null) return split;
+    const reasoning = split.reasoning_content orelse return split;
+    if (trimLeakedToolMarkup(reasoning).len != reasoning.len) return split;
+    // The model may open its own block inside the template's: drop that tag.
+    var answer = std.mem.trim(u8, reasoning, " \t\r\n");
+    if (thinkOpenTagLenAt(answer)) |n| answer = std.mem.trim(u8, answer[n..], " \t\r\n");
+    if (answer.len == 0) return split;
+    return .{ .reasoning_content = answer, .content = answer };
+}
+
 /// Split model output into reasoning_content and content.
 /// Handles both `<think>...</think>` and Gemma 4's `<|channel>thought\n...<channel|>`.
 /// `opened_by_template`: the generation prompt ended with a template-injected
@@ -7050,6 +7071,29 @@ test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload
 
 test "split content: text without think tags passes through" {
     try testing.expectEqualStrings("Hello world", splitThinkBlock("Hello world", true, false).content);
+}
+
+test "promoteUnclosedAnswer delivers an answer MiMo left inside an unclosed think block" {
+    const raw = "<think>The meeting room code is four seven one one.";
+    const split = splitThinkBlock(raw, true, true);
+    try std.testing.expectEqualStrings("", split.content);
+    const p = promoteUnclosedAnswer(split, raw);
+    try std.testing.expectEqualStrings("The meeting room code is four seven one one.", p.content);
+    try std.testing.expectEqualStrings("The meeting room code is four seven one one.", p.reasoning_content.?);
+}
+
+test "promoteUnclosedAnswer leaves closed blocks, real answers and tool calls alone" {
+    const closed = "plan</think>\n\n";
+    const cs = splitThinkBlock(closed, true, true);
+    try std.testing.expectEqualStrings(cs.content, promoteUnclosedAnswer(cs, closed).content);
+
+    const answered = "plan</think>the answer";
+    const as = splitThinkBlock(answered, true, true);
+    try std.testing.expectEqualStrings("the answer", promoteUnclosedAnswer(as, answered).content);
+
+    const tool = "I will call it <tool_call>{\"name\":\"rm\",\"arguments\":{}}</tool_call>";
+    const ts = splitThinkBlockKeepingMarkup(tool, true, true);
+    try std.testing.expectEqualStrings("", promoteUnclosedAnswer(ts, tool).content);
 }
 
 test "splitThinkBlock with complete think block" {

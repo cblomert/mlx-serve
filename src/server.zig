@@ -9723,7 +9723,15 @@ fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, reas
     }
 }
 
-fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: generate_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
+/// Whether this finished generation may have its answer promoted out of an
+/// unclosed think block (`chat.promoteUnclosedAnswer`): a model known to do
+/// it, and a turn that ended on its own. A length cut is truncated reasoning.
+fn promotesUnclosedAnswer(lm: *const LoadedModel, finish_reason: []const u8) bool {
+    const c = lm.config orelse return false;
+    return c.answersInsideUnclosedThink() and !std.mem.eql(u8, finish_reason, "length");
+}
+
+fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: generate_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool, promote_unclosed: bool) !chat_mod.ThinkSplit {
     if (sampling.constraint) |c| {
         if (c.proto) |p| {
             routed.* = rp_mod.Delivery.init(p);
@@ -9735,7 +9743,8 @@ fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Deliv
             return .{ .reasoning_content = if (reasoning.len == 0) null else reasoning, .content = d.content.items };
         }
     }
-    return if (keep_markup) chat_mod.splitThinkBlockKeepingMarkup(text, true, opened) else chat_mod.splitThinkBlock(text, true, opened);
+    const split = if (keep_markup) chat_mod.splitThinkBlockKeepingMarkup(text, true, opened) else chat_mod.splitThinkBlock(text, true, opened);
+    return if (promote_unclosed) chat_mod.promoteUnclosedAnswer(split, text) else split;
 }
 
 fn handleNonStreamingGeneration(
@@ -9967,7 +9976,7 @@ fn handleNonStreamingGeneration(
     // stripped (tokens we discarded still counted against tok/s).
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think, promotesUnclosedAnswer(lm, result.finish_reason));
     const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
@@ -11267,7 +11276,9 @@ fn handleStreamingGeneration(
                 const flush_norm = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
-                const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const raw_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                // An exhausted budget is a cut, not an answer left inside the block.
+                const think_split = if (!budget_exhausted and promotesUnclosedAnswer(lm, finish_reason)) chat_mod.promoteUnclosedAnswer(raw_split, flush_text) else raw_split;
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -16336,7 +16347,7 @@ fn handleAnthropicNonStreaming(
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
     {
-        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids), promotesUnclosedAnswer(lm, result.finish_reason));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = chat_mod.trimLeakedToolMarkup(r);
@@ -17231,7 +17242,8 @@ fn handleAnthropicStreaming(
                 const flush_norm = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
-                const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const raw_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const think_split = if (promotesUnclosedAnswer(lm, finish_reason)) chat_mod.promoteUnclosedAnswer(raw_split, flush_text) else raw_split;
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
                         \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
@@ -18481,7 +18493,7 @@ fn handleResponsesInner(
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, lm, tok, prompt_ids));
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, lm, tok, prompt_ids), promotesUnclosedAnswer(lm, result.finish_reason));
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 

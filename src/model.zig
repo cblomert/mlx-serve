@@ -1076,6 +1076,12 @@ pub const ModelConfig = struct {
     /// on MiMo's 256-expert top-8 MoE every drafted row pulls its own experts,
     /// so PLD at 3.5 accepted/round buys +9% solo, while at 3 streams its
     /// serial ticks cost the batch 26% (63.6 vs 86.1 tok/s aggregate).
+    /// MiMo can end a turn inside an unclosed think block with its answer in
+    /// it (`chat.promoteUnclosedAnswer`).
+    pub fn answersInsideUnclosedThink(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "mimo_v2_flash");
+    }
+
     pub fn pldYieldsToBatch(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "mimo_v2_flash");
     }
