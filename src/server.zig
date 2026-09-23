@@ -13224,6 +13224,15 @@ fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresen
         if (tv != .string) continue;
         if (style == .anthropic) {
             if (std.mem.eql(u8, tv.string, "image")) out.images = true;
+            if (std.mem.eql(u8, tv.string, "tool_result")) {
+                const rc = part.object.get("content") orelse continue;
+                if (rc != .array) continue;
+                for (rc.array.items) |inner| {
+                    if (inner != .object) continue;
+                    const it = inner.object.get("type") orelse continue;
+                    if (it == .string and std.mem.eql(u8, it.string, "image")) out.images = true;
+                }
+            }
         } else if (std.mem.eql(u8, tv.string, "image_url")) {
             out.images = true;
         } else if (std.mem.eql(u8, tv.string, "video_url")) {
@@ -13406,6 +13415,21 @@ test "activeWireMediaIndex crosses Anthropic tool use and result" {
     defer parsed.deinit();
     const msgs = parsed.value.object.get("messages").?.array.items;
     try std.testing.expectEqual(@as(?usize, 0), activeWireMediaIndex(msgs, false, .anthropic));
+}
+
+test "activeWireMediaIndex selects an image returned inside an Anthropic tool_result" {
+    const body =
+        \\{"messages":[
+        \\  {"role":"user","content":"read the screenshot"},
+        \\  {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"read_image","input":{}}]},
+        \\  {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expect(wireMediaPresence(msgs[2], .anthropic).images);
+    try std.testing.expectEqual(@as(?usize, 2), activeWireMediaIndex(msgs, false, .anthropic));
 }
 
 test "activeWireMediaIndex keeps media for an assistant-prefix continuation" {
@@ -14429,6 +14453,33 @@ const RequestMedia = struct {
 /// exactly one entry. Returns false when nothing could be decoded (a remote
 /// URL, bad base64, an unreadable payload) so the caller can refuse by name
 /// instead of answering a prompt the image silently fell out of.
+/// Decode one Anthropic image block (source = {type:"base64", media_type,
+/// data} or {type:"url", url}) into `list`. Returns false when the block is
+/// malformed or its pixels fail to decode.
+fn appendAnthropicImageBlock(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    block: std.json.Value,
+    vp: chat_mod.VisionPreproc,
+) !bool {
+    const src_val = block.object.get("source") orelse return false;
+    if (src_val != .object) return false;
+    const stype = if (src_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+    const data_url: []const u8 = if (std.mem.eql(u8, stype, "base64")) blk: {
+        const media_type = if (src_val.object.get("media_type")) |v| (if (v == .string) v.string else "image/png") else "image/png";
+        const data = if (src_val.object.get("data")) |v| (if (v == .string) v.string else "") else "";
+        if (data.len == 0) return false;
+        break :blk try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media_type, data });
+    } else if (std.mem.eql(u8, stype, "url")) blk: {
+        const url = if (src_val.object.get("url")) |v| (if (v == .string) v.string else "") else "";
+        if (url.len == 0) return false;
+        // Pass through as-is (parseImageUrlContent handles data URLs).
+        break :blk try allocator.dupe(u8, url);
+    } else return false;
+    defer allocator.free(data_url);
+    return appendImageUrlContent(allocator, list, data_url, vp);
+}
+
 pub fn appendImageUrlContent(
     allocator: std.mem.Allocator,
     list: *std.ArrayList(chat_mod.ImageData),
@@ -15283,28 +15334,21 @@ fn handleAnthropicMessages(
                             }
                         } else if (std.mem.eql(u8, btype, "image")) {
                             if (!decode_this_message) continue;
-                            // Anthropic image block: source = {type:"base64", media_type, data}
-                            //                    or = {type:"url", url}
-                            const src_val = block.object.get("source") orelse continue;
-                            if (src_val != .object) continue;
-                            const stype = if (src_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-                            const data_url = blk: {
-                                if (std.mem.eql(u8, stype, "base64")) {
-                                    const media_type = if (src_val.object.get("media_type")) |v| (if (v == .string) v.string else "image/png") else "image/png";
-                                    const data = if (src_val.object.get("data")) |v| (if (v == .string) v.string else "") else "";
-                                    if (data.len == 0) break :blk @as(?[]const u8, null);
-                                    break :blk @as(?[]const u8, try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media_type, data }));
-                                } else if (std.mem.eql(u8, stype, "url")) {
-                                    const url = if (src_val.object.get("url")) |v| (if (v == .string) v.string else "") else "";
-                                    if (url.len == 0) break :blk @as(?[]const u8, null);
-                                    // Pass through as-is (parseImageUrlContent handles data URLs).
-                                    break :blk @as(?[]const u8, try allocator.dupe(u8, url));
-                                }
-                                break :blk @as(?[]const u8, null);
-                            };
-                            if (data_url) |du| {
-                                defer allocator.free(du);
-                                if (!appendImageUrlContent(allocator, media.images(img_slot), du, visionPreprocFromConfig(config))) image_decode_failed = true;
+                            if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocFromConfig(config))) image_decode_failed = true;
+                        } else if (std.mem.eql(u8, btype, "tool_result")) {
+                            // A tool that returns an image (read_image,
+                            // screenshots) nests it in the result's content.
+                            // Its text went to the tool message above; the
+                            // pixels join this turn's user message, which the
+                            // template renders right after the tool response.
+                            if (!decode_this_message) continue;
+                            const rc = block.object.get("content") orelse continue;
+                            if (rc != .array) continue;
+                            for (rc.array.items) |inner| {
+                                if (inner != .object) continue;
+                                const itype = if (inner.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+                                if (!std.mem.eql(u8, itype, "image")) continue;
+                                if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), inner, visionPreprocFromConfig(config))) image_decode_failed = true;
                             }
                         }
                     }
