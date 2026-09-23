@@ -2474,6 +2474,8 @@ fn handleConnection(
         return;
     }
 
+    captureRequestBody(method, path, request[0..header_end_pos], request[header_end_pos..total_read]);
+
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, lm);
@@ -6919,6 +6921,79 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
 ///
 /// An EMPTY object (or no body at all) is left alone — "the default model" is
 /// the documented shorthand this endpoint has always taken.
+var request_capture_seq = std.atomic.Value(u64).init(0);
+var request_capture_logged = false;
+
+/// DIAGNOSTIC (MLX_SERVE_REQUEST_LOG_DIR=<dir>): write every text-generation
+/// POST body verbatim to `<dir>/<unix_s>-<seq>-<route>.json`, wrapped with
+/// the path and the client's User-Agent, so the exact prefix each agent sends
+/// (system prompt, tools, first turns) can be read back — e.g. to build
+/// prefix-cache priming requests. Bodies carry whatever the clients send,
+/// prompts and code included: point it at a private directory, and unset it
+/// once the capture is done. Unset = no-op (one cached getenv).
+fn captureRequestBody(method: []const u8, path: []const u8, headers: []const u8, body: []const u8) void {
+    const dir_z = std.c.getenv("MLX_SERVE_REQUEST_LOG_DIR") orelse return;
+    if (!std.mem.eql(u8, method, "POST")) return;
+    const route: []const u8 = if (std.mem.eql(u8, path, "/v1/chat/completions"))
+        "chat"
+    else if (std.mem.eql(u8, path, "/v1/messages"))
+        "messages"
+    else if (std.mem.eql(u8, path, "/v1/responses"))
+        "responses"
+    else if (std.mem.eql(u8, path, "/api/chat"))
+        "ollama-chat"
+    else if (std.mem.eql(u8, path, "/v1/completions"))
+        "completions"
+    else
+        return;
+    const dir = std.mem.span(dir_z);
+    const seq = request_capture_seq.fetchAdd(1, .monotonic);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const now: i64 = @intCast(ts.sec);
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "{s}/{d}-{d:0>5}-{s}.json", .{ dir, now, seq, route }, 0) catch return;
+    const f = std.c.fopen(name.ptr, "wb") orelse {
+        log.warn("[request-log] cannot open {s}\n", .{name});
+        return;
+    };
+    defer _ = std.c.fclose(f);
+
+    // User-Agent, case-insensitive; quotes/backslashes/control bytes dropped
+    // so the wrapper stays valid JSON.
+    var ua: []const u8 = "";
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    while (it.next()) |line| {
+        if (line.len > 11 and std.ascii.eqlIgnoreCase(line[0..11], "user-agent:")) {
+            ua = std.mem.trim(u8, line[11..], " \t");
+            break;
+        }
+    }
+    var ua_buf: [256]u8 = undefined;
+    var ua_n: usize = 0;
+    for (ua) |ch| {
+        if (ua_n == ua_buf.len) break;
+        if (ch == '"' or ch == '\\' or ch < 0x20) continue;
+        ua_buf[ua_n] = ch;
+        ua_n += 1;
+    }
+    var head_buf: [512]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "{{\"path\":\"{s}\",\"user_agent\":\"{s}\",\"ts\":{d},\"body\":", .{ path, ua_buf[0..ua_n], now }) catch return;
+    _ = std.c.fwrite(head.ptr, 1, head.len, f);
+    // The body is the client's JSON, embedded as-is; an empty body becomes null.
+    const b = std.mem.trim(u8, body, " \t\r\n");
+    if (b.len == 0) {
+        _ = std.c.fwrite("null", 1, 4, f);
+    } else {
+        _ = std.c.fwrite(b.ptr, 1, b.len, f);
+    }
+    _ = std.c.fwrite("}\n", 1, 2, f);
+    if (!request_capture_logged) {
+        request_capture_logged = true;
+        log.warn("[request-log] DIAGNOSTIC: writing request bodies to {s} (unset MLX_SERVE_REQUEST_LOG_DIR to stop)\n", .{dir});
+    }
+}
+
 fn unloadBodyNamesNoModel(obj: std.json.ObjectMap) bool {
     if (obj.count() == 0) return false;
     if (obj.get("model")) |m| return m != .string;
