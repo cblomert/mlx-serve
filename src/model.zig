@@ -1071,7 +1071,21 @@ pub const ModelConfig = struct {
     ///
     /// Says nothing about MoE/hybrid archs that merely share the same
     /// forward — those stay serial, by name, in both callers.
+    /// Should a PLD slot give up speculation to join a batched decode tick
+    /// when it has company? True where a verify round is priced like a batch:
+    /// on MiMo's 256-expert top-8 MoE every drafted row pulls its own experts,
+    /// so PLD at 3.5 accepted/round buys +9% solo, while at 3 streams its
+    /// serial ticks cost the batch 26% (63.6 vs 86.1 tok/s aggregate).
+    pub fn pldYieldsToBatch(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "mimo_v2_flash");
+    }
+
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        // MiMo-V2-Flash: no recurrent state at all, routed experts are
+        // row-generic, and `mimoAttnWith` carries its own per-slot branch
+        // (each slot's cache, window trim and sinks). Serial decode here left
+        // N streams at exactly the aggregate of one.
+        if (std.mem.eql(u8, self.model_type, "mimo_v2_flash")) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;

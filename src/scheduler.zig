@@ -2359,6 +2359,29 @@ pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
     return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode();
 }
 
+var pld_yield_logged: bool = false;
+
+/// With company (the caller only reaches here at active.len >= 2), a PLD slot
+/// on a model whose verify rounds cost like a batch (`pldYieldsToBatch`)
+/// turns PLD off the way its own yield gate does, so it rides the batched
+/// tick. The documented `slotTicksRegular` policy then applies: it stays off
+/// while it keeps company, and the serial path's periodic re-enable check
+/// brings it back once the slot decodes alone.
+fn yieldPldToBatch(slot: *Slot) void {
+    const cfg = slot.model.config orelse return;
+    if (!cfg.pldYieldsToBatch()) return;
+    const gen = if (slot.legacy_gen) |*g| g else return;
+    if (gen.spec_disabled_runtime) return;
+    const mode = specTickMode(slot.enable_mtp, gen.mtp != null, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled);
+    if (mode != .pld) return;
+    gen.spec_disabled_runtime = true;
+    gen.disabled_steps = 0;
+    if (!pld_yield_logged) {
+        pld_yield_logged = true;
+        log.info("[batched] pld yields to batched decode while slots share the model (model={s})\n", .{slot.model.id});
+    }
+}
+
 /// One line per slot the first time it decodes serial beside live company;
 /// the counter moves every tick so the rate is visible under `--metrics`.
 fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
@@ -6702,6 +6725,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var batchable_n: usize = 0;
     var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
+    for (active) |s| yieldPldToBatch(s);
     for (active) |s| {
         const why = sch.batchVerdict(s);
         if (why == .ok and batchable_n < batchable_buf.len) {

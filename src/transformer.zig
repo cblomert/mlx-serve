@@ -20202,6 +20202,25 @@ pub const Transformer = struct {
         // A layer whose state is not initialized on EVERY slot cannot be
         // merged (widths would disagree) — the caller gates on
         // `batchedGdnReady`.
+        // Stateless trunk (MiMo): every layer is attention + MLP, so there is
+        // no GDN/PLE state to merge or split — just the per-slot KV caches the
+        // attention arm reaches through `batch_slots`.
+        if (!self.hasMergeableState()) {
+            var scratch_off: usize = rope_offsets[0];
+            var sctx: ForwardCtx = .{
+                .cache = ctxs[0].cache,
+                .moe_seq_offset = &scratch_off,
+                .ssm_entries = null,
+                .capture_hidden = hidden_last,
+                .capture_hidden_all = hidden_all,
+                .capture_ssm_seq = false,
+                .vision_embeddings = null,
+                .batch_slots = ctxs,
+                .batch_rope_offsets = rope_offset_arr,
+            };
+            return self.forwardMoeWith(&sctx, token_arr);
+        }
+
         const persist = self.persistent_group_state_override orelse true;
         self.ssm_group.allocator = self.allocator;
         const stable = persist and self.ssm_group.live and self.ssm_group.matches(ctxs);
@@ -20348,6 +20367,8 @@ pub const Transformer = struct {
     /// zero-state would otherwise be merged at the wrong width.
     pub fn batchedGdnReady(self: *const Transformer, ctxs: []const *ForwardCtx) bool {
         const ml = self.moe_layers orelse return false;
+        // A trunk with no recurrent layers (MiMo) has nothing to merge.
+        if (!self.hasMergeableState()) return true;
         for (ctxs) |c| {
             const entries = c.ssm_entries orelse return false;
             if (entries.len != ml.len) return false;
@@ -20361,6 +20382,13 @@ pub const Transformer = struct {
             }
         }
         return true;
+    }
+
+    /// Any layer with per-slot state the batched driver must merge (GDN or PLE)?
+    fn hasMergeableState(self: *const Transformer) bool {
+        const ml = self.moe_layers orelse return false;
+        for (ml) |*lw| if (lw.is_linear or lw.ple != null) return true;
+        return false;
     }
 
     /// Does this transformer support `forwardMoeBatchedDecode`? The GDN trunk
@@ -26338,8 +26366,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(q_rope);
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+        if (ctx.batch_rope_offsets) |off_arr| {
+            // Batched decode: each row sits at its own slot's position.
+            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, rope_base, 1.0, off_arr, .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, off_arr, .{ .ctx = null }, self.s));
+        } else {
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+        }
 
         var v_r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(v_r);
@@ -26347,6 +26381,61 @@ pub const Transformer = struct {
         var v_t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(v_t);
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+
+        // Batched decode (one token per slot). Projections, rope and — in the
+        // caller — the routed experts run once over all N rows; only the KV
+        // read/write is per slot, because every slot owns its cache and its
+        // own kv_len. Each slot's row goes through exactly the serial decode
+        // arm below (same window trim, same sinks), so a batched step is the
+        // serial step up to GEMM row order.
+        if (ctx.batch_slots) |slots| {
+            std.debug.assert(seq_len == 1);
+            var outs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
+            var n_out: usize = 0;
+            defer for (outs[0..n_out]) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            const sw: c_int = @intCast(cfg.sliding_window);
+            for (slots, 0..) |slot_ctx, i| {
+                const q_i = try axisView(self.s, q_rope, 0, i);
+                defer _ = mlx.mlx_array_free(q_i);
+                const k_i = try axisView(self.s, k_rope, 0, i);
+                defer _ = mlx.mlx_array_free(k_i);
+                const v_i = try axisView(self.s, v_t, 0, i);
+                defer _ = mlx.mlx_array_free(v_i);
+                const pos: c_int = @intCast(slot_ctx.cache.seqLen(layer));
+                const sv = slidingViewFor(cfg, pos + 1, 1);
+                const mk: u32 = if (is_full) 0 else sv.span;
+                var view = try slot_ctx.cache.update(layer, k_i, v_i, self.s, mk);
+                defer view.deinit();
+                var o = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(o);
+                const view_len: c_int = mlx.getShape(view.k)[2];
+                if (!is_full and view_len > sw) {
+                    const m = try self.createSlidingWindowDecodeMask(view_len, sw);
+                    defer _ = mlx.mlx_array_free(m);
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q_i, view.k, view.v, attn_scale, "array", m, sinks, false, self.s));
+                } else {
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q_i, view.k, view.v, attn_scale, "", none_mask, sinks, false, self.s));
+                }
+                outs[n_out] = o;
+                n_out += 1;
+            }
+            var cat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cat);
+            {
+                const vec = mlx.mlx_vector_array_new_data(&outs, n_out);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, self.s));
+            }
+            var cat_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cat_t);
+            try mlx.check(mlx.mlx_transpose_axes(&cat_t, cat, &perm, 4, self.s));
+            var cat_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cat_flat);
+            try mlx.check(mlx.mlx_reshape(&cat_flat, cat_t, &flat_shape, 3, self.s));
+            return self.attnProj(cat_flat, fa.o_w, fa.o_s, fa.o_b, false, layer);
+        }
 
         // Same trimmed-view discipline as gpt_oss: the view width and every
         // mask built below must come from ONE slidingViewFor call, or SDPA
