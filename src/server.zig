@@ -8224,8 +8224,8 @@ fn handleChatCompletions(
     const wire_continue_final = wireContinuationRequested(messages_val.array.items, .openai) and
         (if (root.get("continue_final_message")) |v| v == .bool and v.bool else false);
     const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .openai);
-    // Earlier turns' images are materialized too when the model keeps them.
-    const keep_history_images = historyImagesEnabled(config);
+    // Earlier turns' images and audio are materialized too when the model keeps them.
+    const keep_history_media = historyMediaEnabled(config);
 
     for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
@@ -8254,7 +8254,7 @@ fn handleChatCompletions(
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
-                        if (!decode_this_message and !keep_history_images) continue;
+                        if (!decode_this_message and !keep_history_media) continue;
                         // Parse image_url content block
                         const img_obj = part.object.get("image_url") orelse continue;
                         if (img_obj != .object) continue;
@@ -8283,7 +8283,7 @@ fn handleChatCompletions(
                         } else 0;
                         appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config), fps);
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
-                        if (!decode_this_message) continue;
+                        if (!decode_this_message and !keep_history_media) continue;
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
                         // (format "mlx_pcm_f32") base64-encoded in `data`.
@@ -8772,7 +8772,7 @@ fn handleChatCompletions(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyImagesEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
@@ -13242,13 +13242,16 @@ fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresen
         if (tv != .string) continue;
         if (style == .anthropic) {
             if (std.mem.eql(u8, tv.string, "image")) out.images = true;
+            if (isAnthropicAudioType(tv.string)) out.audio = true;
             if (std.mem.eql(u8, tv.string, "tool_result")) {
                 const rc = part.object.get("content") orelse continue;
                 if (rc != .array) continue;
                 for (rc.array.items) |inner| {
                     if (inner != .object) continue;
                     const it = inner.object.get("type") orelse continue;
-                    if (it == .string and std.mem.eql(u8, it.string, "image")) out.images = true;
+                    if (it != .string) continue;
+                    if (std.mem.eql(u8, it.string, "image")) out.images = true;
+                    if (isAnthropicAudioType(it.string)) out.audio = true;
                 }
             }
         } else if (std.mem.eql(u8, tv.string, "image_url")) {
@@ -14125,16 +14128,18 @@ fn appendMimoVideoSegments(
     }
 }
 
-/// MiMo keeps the images of EARLIER turns in the prompt instead of dropping
-/// them once the conversation moves on. Dropping them costs twice: the model
-/// can no longer look back at a screenshot, and the prompt changes at the old
-/// image's position, so everything after it misses the prefix cache and is
-/// prefilled again. Kept images are re-encoded from the embedding cache
-/// (scheduler `VisionEmbCache`) and matched in the prefix cache through
-/// pixel-hash pseudo-ids (`mediaCacheIds`). Only images: historical video and
-/// audio still drop. MLX_SERVE_HISTORY_IMAGES=0 restores the old behavior.
-fn historyImagesEnabled(config: *const model_mod.ModelConfig) bool {
+/// MiMo keeps the images and audio clips of EARLIER turns in the prompt
+/// instead of dropping them once the conversation moves on. Dropping them
+/// costs twice: the model can no longer refer back to a screenshot or a clip,
+/// and the prompt changes at the old media's position, so everything after it
+/// misses the prefix cache and is prefilled again. Kept media is re-encoded
+/// from the embedding cache (scheduler `VisionEmbCache`) and matched in the
+/// prefix cache through content-hash pseudo-ids (`mediaPseudoId`). Historical
+/// video still drops. MLX_SERVE_HISTORY_MEDIA=0 (or the older
+/// MLX_SERVE_HISTORY_IMAGES=0) restores the active-turn-only behavior.
+fn historyMediaEnabled(config: *const model_mod.ModelConfig) bool {
     if (!config.mimo_vision) return false;
+    if (std.c.getenv("MLX_SERVE_HISTORY_MEDIA")) |v| return v[0] != '0';
     if (std.c.getenv("MLX_SERVE_HISTORY_IMAGES")) |v| return v[0] != '0';
     return true;
 }
@@ -14266,8 +14271,8 @@ fn placeHistoryMedia(
     return .{ .prompt = prompt, .view = try view.toOwnedSlice(allocator) };
 }
 
-/// Encode and place the images of every user turn (plus the active turn's
-/// video/audio) at their own turns. Null when there is nothing to place or
+/// Encode and place the images and audio of every user turn (plus the active
+/// turn's video) at their own turns. Null when there is nothing to place or
 /// the placement cannot be proven consistent; the caller then takes the
 /// active-turn-only path.
 fn encodeHistoryMedia(
@@ -14279,7 +14284,15 @@ fn encodeHistoryMedia(
     config: *const model_mod.ModelConfig,
 ) !?HistoryMedia {
     const sch = global_scheduler orelse return null;
-    const MediaTurn = struct { info: ActiveTurnMedia, full: bool, n_images: usize };
+    const MediaTurn = struct {
+        info: ActiveTurnMedia,
+        full: bool,
+        /// Index ranges into the flat image / audio lists below.
+        img_start: usize = 0,
+        n_images: usize,
+        aud_start: usize = 0,
+        n_clips: usize,
+    };
     var turns = std.ArrayList(MediaTurn).empty;
     defer turns.deinit(allocator);
     var users_after: usize = 0;
@@ -14291,18 +14304,13 @@ fn encodeHistoryMedia(
         users_after -= 1;
         const is_active = if (active) |a| a.message == m else false;
         const n_img = if (m.images) |im| im.len else 0;
-        if (n_img == 0 and !is_active) continue;
-        try turns.append(allocator, .{ .info = turnMediaAt(msgs, i, users_after), .full = is_active, .n_images = n_img });
+        const n_aud = if (m.audio) |au| au.len else 0;
+        if (n_img == 0 and n_aud == 0 and !is_active) continue;
+        try turns.append(allocator, .{ .info = turnMediaAt(msgs, i, users_after), .full = is_active, .n_images = n_img, .n_clips = n_aud });
     }
-    if (turns.items.len == 0) return null;
-    // Even a lone new image takes this path: its cache entry must be keyed the
+    // Even a lone new item takes this path: its cache entry must be keyed the
     // way the next turn (which keeps it as history) will look it up.
-    // The encoder emits all images, then video, then audio; that is document
-    // order only while the turn carrying video/audio is the last media turn.
-    for (turns.items[0 .. turns.items.len - 1]) |t| {
-        const m = t.info.message;
-        if (t.full and ((m.videos != null and m.videos.?.len > 0) or (m.audio != null and m.audio.?.len > 0))) return null;
-    }
+    if (turns.items.len == 0) return null;
 
     var pix = std.ArrayList(scheduler_mod.VisionImagePixels).empty;
     defer pix.deinit(allocator);
@@ -14310,31 +14318,49 @@ fn encodeHistoryMedia(
     defer vids.deinit(allocator);
     var auds = std.ArrayList([]const u8).empty;
     defer auds.deinit(allocator);
-    for (turns.items) |t| {
+    // Soft-token order = prompt order: per turn, its images, video, audio.
+    var order = std.ArrayList(scheduler_mod.MediaRef).empty;
+    defer order.deinit(allocator);
+    for (turns.items) |*t| {
         const m = t.info.message;
-        for (m.images orelse &.{}) |img| try pix.append(allocator, .{
-            .pixels = img.pixels,
-            .width = @intCast(img.width),
-            .height = @intCast(img.height),
-            .grid_h = img.grid_h,
-            .grid_w = img.grid_w,
-        });
-        if (!t.full) continue;
-        for (m.videos orelse &.{}) |vid| try vids.append(allocator, .{ .pixels = vid.pixels, .grid_t = vid.grid_t, .grid_h = vid.grid_h, .grid_w = vid.grid_w });
-        for (m.audio orelse &.{}) |a| try auds.append(allocator, a.samples);
+        t.img_start = pix.items.len;
+        for (m.images orelse &.{}) |img| {
+            try order.append(allocator, .{ .kind = .image, .index = @intCast(pix.items.len) });
+            try pix.append(allocator, .{
+                .pixels = img.pixels,
+                .width = @intCast(img.width),
+                .height = @intCast(img.height),
+                .grid_h = img.grid_h,
+                .grid_w = img.grid_w,
+            });
+        }
+        if (t.full) for (m.videos orelse &.{}) |vid| {
+            try order.append(allocator, .{ .kind = .video, .index = @intCast(vids.items.len) });
+            try vids.append(allocator, .{ .pixels = vid.pixels, .grid_t = vid.grid_t, .grid_h = vid.grid_h, .grid_w = vid.grid_w });
+        };
+        t.aud_start = auds.items.len;
+        for (m.audio orelse &.{}) |a| {
+            try order.append(allocator, .{ .kind = .audio, .index = @intCast(auds.items.len) });
+            try auds.append(allocator, a.samples);
+        }
     }
-    const counts = try allocator.alloc(usize, pix.items.len);
-    defer allocator.free(counts);
-    @memset(counts, 0);
+    const img_counts = try allocator.alloc(usize, pix.items.len);
+    defer allocator.free(img_counts);
+    @memset(img_counts, 0);
+    const aud_counts = try allocator.alloc(usize, auds.items.len);
+    defer allocator.free(aud_counts);
+    @memset(aud_counts, 0);
 
-    log.info("Multimodal: processing {d} image(s) across {d} turn(s), {d} video(s), {d} audio clip(s)\n", .{ pix.items.len, turns.items.len, vids.items.len, auds.items.len });
+    log.info("Multimodal: processing {d} image(s), {d} video(s), {d} audio clip(s) across {d} turn(s)\n", .{ pix.items.len, vids.items.len, auds.items.len, turns.items.len });
     var req = scheduler_mod.VisionEncodeRequest{
         .model = lm,
         .images = pix.items,
         .videos = vids.items,
         .audio = auds.items,
         .allocator = allocator,
-        .image_token_counts = counts,
+        .image_token_counts = img_counts,
+        .audio_token_counts = aud_counts,
+        .order = order.items,
     };
     const emb = sch.encodeVision(&req) catch |err| {
         if (req.error_name) |e| {
@@ -14347,30 +14373,34 @@ fn encodeHistoryMedia(
     defer if (!keep_emb) {
         _ = mlx.mlx_array_free(emb);
     };
-    var counted: usize = 0;
-    for (counts) |c| counted += c;
-    if (counted != req.n_vision_tokens) {
-        log.warn("[vision] history media: per-image counts {d} != {d} encoded rows; active turn only\n", .{ counted, req.n_vision_tokens });
+    var img_total: usize = 0;
+    for (img_counts) |c| img_total += c;
+    var aud_total: usize = 0;
+    for (aud_counts) |c| aud_total += c;
+    if (img_total != req.n_vision_tokens or aud_total != req.n_audio_tokens) {
+        log.warn("[vision] history media: per-item counts {d}+{d} != {d}+{d} encoded rows; active turn only\n", .{ img_total, aud_total, req.n_vision_tokens, req.n_audio_tokens });
         return null;
     }
 
     const placed_turns = try allocator.alloc(PlacedTurn, turns.items.len);
     defer allocator.free(placed_turns);
-    var img_i: usize = 0;
     var key = std.hash.Wyhash.init(0x415d_31a7);
     for (turns.items, placed_turns) |t, *pt| {
         const m = t.info.message;
         var n_img: usize = 0;
-        for (counts[img_i .. img_i + t.n_images]) |c| n_img += c;
-        img_i += t.n_images;
+        for (img_counts[t.img_start .. t.img_start + t.n_images]) |c| n_img += c;
+        var n_aud: usize = 0;
+        for (aud_counts[t.aud_start .. t.aud_start + t.n_clips]) |c| n_aud += c;
+        // A turn's hash covers exactly the media it contributes, so it is the
+        // same while the turn is active and after it becomes history (video,
+        // which history drops, is the one exception: that turn misses once).
         const vids_here: []const chat_mod.VideoData = if (t.full) (m.videos orelse &.{}) else &.{};
-        const auds_here: []const chat_mod.AudioData = if (t.full) (m.audio orelse &.{}) else &.{};
         pt.* = .{
             .info = t.info,
             .n_image = n_img,
             .n_video = if (t.full) req.n_video_tokens else 0,
-            .n_audio = if (t.full) req.n_audio_tokens else 0,
-            .hash = mediaKey(m.images orelse &.{}, vids_here, auds_here),
+            .n_audio = n_aud,
+            .hash = mediaKey(m.images orelse &.{}, vids_here, m.audio orelse &.{}),
         };
         key.update(std.mem.asBytes(&pt.hash));
     }
@@ -14766,6 +14796,38 @@ fn appendAnthropicImageBlock(
     } else return false;
     defer allocator.free(data_url);
     return appendImageUrlContent(allocator, list, data_url, vp);
+}
+
+/// Decode one audio block on the Anthropic surface, which has no official
+/// audio type. Two shapes are accepted, mirroring the image block and the
+/// OpenAI part: `{"type":"audio","source":{"type":"base64","media_type":
+/// "audio/wav","data":…}}` and `{"type":"input_audio","input_audio":{"data":
+/// …,"format":"wav"}}`. The payload is a WAV file or raw 16 kHz float32 PCM,
+/// as for chat completions (`parseAudioContent`). Returns false when the
+/// block is malformed or does not decode.
+fn appendAnthropicAudioBlock(allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.AudioData), block: std.json.Value) !bool {
+    const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+    const data: []const u8 = if (std.mem.eql(u8, btype, "input_audio")) blk: {
+        const ia = block.object.get("input_audio") orelse return false;
+        if (ia != .object) return false;
+        const d = ia.object.get("data") orelse return false;
+        break :blk if (d == .string) d.string else return false;
+    } else blk: {
+        const src = block.object.get("source") orelse return false;
+        if (src != .object) return false;
+        const d = src.object.get("data") orelse return false;
+        break :blk if (d == .string) d.string else return false;
+    };
+    const aud = parseAudioContent(allocator, data) orelse return false;
+    list.append(allocator, aud) catch |err| {
+        allocator.free(aud.samples);
+        return err;
+    };
+    return true;
+}
+
+fn isAnthropicAudioType(t: []const u8) bool {
+    return std.mem.eql(u8, t, "audio") or std.mem.eql(u8, t, "input_audio");
 }
 
 pub fn appendImageUrlContent(
@@ -15519,6 +15581,7 @@ fn handleAnthropicMessages(
 
     var messages = std.ArrayList(chat_mod.Message).empty;
     var image_decode_failed = false;
+    var audio_decode_failed = false;
     defer messages.deinit(allocator);
 
     // Decoded image buffers for every message in this request. `Message`
@@ -15568,8 +15631,8 @@ fn handleAnthropicMessages(
     const wire_continue_final = wireContinuationRequested(messages_val.array.items, .anthropic) and
         continuationRejectReason(lm.ds4_engine != null) == null;
     const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .anthropic);
-    // Earlier turns' images are materialized too when the model keeps them.
-    const keep_history_images = historyImagesEnabled(config);
+    // Earlier turns' images and audio are materialized too when the model keeps them.
+    const keep_history_media = historyMediaEnabled(config);
 
     // Convert Anthropic messages to internal format
     for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
@@ -15613,6 +15676,7 @@ fn handleAnthropicMessages(
                     var msg_text = std.ArrayList(u8).empty;
                     defer msg_text.deinit(allocator);
                     const img_slot = try media.openImages();
+                    const aud_slot = try media.openAudio();
                     for (arr.items) |block| {
                         if (block != .object) continue;
                         const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
@@ -15623,22 +15687,28 @@ fn handleAnthropicMessages(
                                 try msg_text.appendSlice(allocator, text);
                             }
                         } else if (std.mem.eql(u8, btype, "image")) {
-                            if (!decode_this_message and !keep_history_images) continue;
+                            if (!decode_this_message and !keep_history_media) continue;
                             if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocFromConfig(config))) image_decode_failed = true;
+                        } else if (isAnthropicAudioType(btype)) {
+                            if (!decode_this_message and !keep_history_media) continue;
+                            if (!try appendAnthropicAudioBlock(allocator, media.audio(aud_slot), block)) audio_decode_failed = true;
                         } else if (std.mem.eql(u8, btype, "tool_result")) {
                             // A tool that returns an image (read_image,
                             // screenshots) nests it in the result's content.
                             // Its text went to the tool message above; the
                             // pixels join this turn's user message, which the
                             // template renders right after the tool response.
-                            if (!decode_this_message and !keep_history_images) continue;
+                            if (!decode_this_message and !keep_history_media) continue;
                             const rc = block.object.get("content") orelse continue;
                             if (rc != .array) continue;
                             for (rc.array.items) |inner| {
                                 if (inner != .object) continue;
                                 const itype = if (inner.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-                                if (!std.mem.eql(u8, itype, "image")) continue;
-                                if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), inner, visionPreprocFromConfig(config))) image_decode_failed = true;
+                                if (std.mem.eql(u8, itype, "image")) {
+                                    if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), inner, visionPreprocFromConfig(config))) image_decode_failed = true;
+                                } else if (isAnthropicAudioType(itype)) {
+                                    if (!try appendAnthropicAudioBlock(allocator, media.audio(aud_slot), inner)) audio_decode_failed = true;
+                                }
                             }
                         }
                     }
@@ -15646,7 +15716,7 @@ fn handleAnthropicMessages(
                     // its pixels were deliberately not materialized. It still
                     // contributes the same empty user-role template boundary
                     // as before this optimization.
-                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0 or wire_presence.images) {
+                    if (msg_text.items.len > 0 or media.images(img_slot).items.len > 0 or media.audio(aud_slot).items.len > 0 or wire_presence.images or wire_presence.audio) {
                         const owned_text = if (msg_text.items.len > 0) blk: {
                             const s = try allocator.dupe(u8, msg_text.items);
                             try content_allocs.append(allocator, s);
@@ -15658,6 +15728,7 @@ fn handleAnthropicMessages(
                             .tool_calls = null,
                             .tool_call_id = null,
                             .images = media.imagesSlice(img_slot),
+                            .audio = media.audioSlice(aud_slot),
                         });
                     }
                 },
@@ -15755,6 +15826,12 @@ fn handleAnthropicMessages(
     if (image_decode_failed) {
         log.warn("POST /v1/messages -> 400 (undecodable image)\n", .{});
         try sendAnthropicError(allocator, stream, "invalid_request_error", IMAGE_DECODE_REJECT, 400);
+        return;
+    }
+    // A silent drop would have the model answer as if it had heard nothing.
+    if (audio_decode_failed) {
+        log.warn("POST /v1/messages -> 400 (undecodable audio)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "audio block could not be decoded: send {\"type\":\"audio\",\"source\":{\"type\":\"base64\",\"media_type\":\"audio/wav\",\"data\":...}} or {\"type\":\"input_audio\",\"input_audio\":{\"data\":...,\"format\":\"wav\"}} with a base64 WAV file or raw 16 kHz float32 PCM", 400);
         return;
     }
     if (messages.items.len == 0) {
@@ -16012,7 +16089,7 @@ fn handleAnthropicMessages(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyImagesEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
@@ -17776,7 +17853,7 @@ fn handleResponsesInner(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyImagesEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
@@ -21060,6 +21137,81 @@ test "placeHistoryMedia gives an image the same cache view whether it is new or 
 
     // Turn N's whole cache view is a prefix of turn N+1's: a full prefix hit.
     try testing.expectEqualSlices(u32, a.view, b.view[0..a.view.len]);
+}
+
+test "appendAnthropicAudioBlock accepts the audio and input_audio shapes" {
+    // 8 zero bytes = two float32 samples of headerless PCM.
+    const body =
+        \\[{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"AAAAAAAAAAA="}},
+        \\ {"type":"input_audio","input_audio":{"data":"AAAAAAAAAAA=","format":"wav"}},
+        \\ {"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"AAAAAA=="}},
+        \\ {"type":"audio","source":{"type":"url","url":"https://example.invalid/a.wav"}}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const blocks = parsed.value.array.items;
+    // Test-owned list, freed right here (handlers must use RequestMedia).
+    var list: std.ArrayList(chat_mod.AudioData) = .empty;
+    defer {
+        for (list.items) |a| testing.allocator.free(a.samples);
+        list.deinit(testing.allocator);
+    }
+    try testing.expect(try appendAnthropicAudioBlock(testing.allocator, &list, blocks[0]));
+    try testing.expect(try appendAnthropicAudioBlock(testing.allocator, &list, blocks[1]));
+    // "AAAAAA==" is 4 bytes: one float32 sample, accepted. A url source
+    // carries no inline data and is refused.
+    try testing.expect(try appendAnthropicAudioBlock(testing.allocator, &list, blocks[2]));
+    try testing.expect(!try appendAnthropicAudioBlock(testing.allocator, &list, blocks[3]));
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+    try testing.expectEqual(@as(usize, 8), list.items[0].samples.len);
+}
+
+test "wireMediaPresence sees Anthropic audio at top level and inside tool_result" {
+    const body =
+        \\[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA"}}]},
+        \\ {"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"audio","source":{"type":"base64","data":"AAAA"}}]}]},
+        \\ {"role":"user","content":[{"type":"text","text":"no media"}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.array.items;
+    try testing.expect(wireMediaPresence(msgs[0], .anthropic).audio);
+    try testing.expect(wireMediaPresence(msgs[1], .anthropic).audio);
+    try testing.expect(!wireMediaPresence(msgs[2], .anthropic).any());
+}
+
+test "placeHistoryMedia keeps an earlier audio clip at its own turn, after its images" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.vision_start_token_id = 200;
+    config.vision_end_token_id = 201;
+    config.image_token_id = 999;
+    config.boa_token_id = 300;
+    config.eoa_token_id = 301;
+    config.audio_token_id = 888;
+
+    const clip = [_]chat_mod.AudioData{.{ .samples = &.{} }};
+    const img = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "listen", .audio = &clip },
+        .{ .role = "assistant", .content = "heard" },
+        .{ .role = "user", .content = "and this", .images = &img, .audio = &clip },
+    };
+    const prompt = [_]u32{ 1, 105, 11, 50, 60, 50, 105, 22, 50 };
+    const turns = [_]PlacedTurn{
+        .{ .info = turnMediaAt(&msgs, 0, 1), .n_image = 0, .n_video = 0, .n_audio = 2, .hash = 0x0A0A_0A0A_0B0B_0B0B },
+        .{ .info = turnMediaAt(&msgs, 2, 0), .n_image = 1, .n_video = 0, .n_audio = 1, .hash = 0x0C0C_0C0C_0D0D_0D0D },
+    };
+    var placed = (try placeHistoryMedia(testing.allocator, &prompt, &config, &turns)) orelse return error.TestExpectedPlacement;
+    defer placed.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 11, 50, 60, 50, 105, 200, 999, 201, 300, 888, 301, 22, 50 }, placed.prompt);
+    // Pseudo-ids number a turn's placeholders across image and audio rows.
+    try testing.expectEqual(mediaPseudoId(turns[0].hash, 0), placed.view[3]);
+    try testing.expectEqual(mediaPseudoId(turns[0].hash, 1), placed.view[4]);
+    try testing.expectEqual(mediaPseudoId(turns[1].hash, 0), placed.view[12]);
+    try testing.expectEqual(mediaPseudoId(turns[1].hash, 1), placed.view[15]);
+    try testing.expectEqual(@as(u32, 300), placed.view[14]);
 }
 
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {

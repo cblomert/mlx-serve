@@ -1109,6 +1109,12 @@ pub const VisionVideoPixels = struct {
 /// `done`. Ownership of `result` transfers to the caller on success — pass
 /// to `scheduler.submit(.{ .vision_embeddings = arr, ... })` and the slot's
 /// `deinit` will free it.
+/// One media item of a `VisionEncodeRequest`, by kind and index into its list.
+pub const MediaRef = struct {
+    kind: enum { image, video, audio },
+    index: u32,
+};
+
 pub const VisionEncodeRequest = struct {
     /// Plan 05 Phase D: target model whose `vision_encoder` services this
     /// request. The conn thread holds a refcount (via `ensureLoaded`) for
@@ -1138,6 +1144,13 @@ pub const VisionEncodeRequest = struct {
     /// caller-owned. Lets the caller place each image's placeholders at its
     /// own message instead of one block.
     image_token_counts: ?[]usize = null,
+    /// Optional output: per-clip soft-token counts, `audio.len` long.
+    audio_token_counts: ?[]usize = null,
+    /// Optional: the order the soft tokens are concatenated in, one entry per
+    /// image/video/clip. Without it `result` is all images, then all videos,
+    /// then all audio, which is prompt order only while one message carries
+    /// the media; a conversation keeping several turns' media interleaves.
+    order: ?[]const MediaRef = null,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
@@ -4849,9 +4862,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 /// Plan 05 Phase D: routes the encode through `req.model.vision_encoder`,
 /// not the scheduler's borrowed-view singleton — each LoadedModel has its
 /// own vision encoder when applicable.
-/// Encoded image embeddings by pixel hash. A conversation that keeps its
-/// earlier screenshots re-sends every one of them each turn; the ViT runs once
-/// per distinct image. Touched only on the inference thread (runVisionEncode),
+/// Encoded image (and MiMo audio clip) embeddings by content hash. A
+/// conversation that keeps its earlier screenshots and clips re-sends every
+/// one of them each turn; the encoder runs once per distinct item. Touched only on the inference thread (runVisionEncode),
 /// so it needs no lock. Budget: MLX_SERVE_VISION_EMB_CACHE_MB (default 1024,
 /// 0 disables); a 1334x750 screenshot is ~8 MB.
 const VisionEmbCache = struct {
@@ -4881,6 +4894,14 @@ const VisionEmbCache = struct {
         h.update(std.mem.asBytes(&img.grid_h));
         h.update(std.mem.asBytes(&img.grid_w));
         h.update(img.pixels);
+        return h.final();
+    }
+
+    fn audioKey(model: *const model_registry_mod.LoadedModel, clip: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0xa0d1_0c1b);
+        h.update(std.mem.asBytes(&@intFromPtr(model)));
+        h.update(model.path);
+        h.update(clip);
         return h.final();
     }
 
@@ -4956,6 +4977,18 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
     }.f;
 
+    // Which `emb_parts` entry each item produced (maxInt = none), for `req.order`.
+    const none_part = std.math.maxInt(usize);
+    var img_parts = std.ArrayList(usize).empty;
+    defer img_parts.deinit(req.allocator);
+    var vid_parts = std.ArrayList(usize).empty;
+    defer vid_parts.deinit(req.allocator);
+    var aud_parts = std.ArrayList(usize).empty;
+    defer aud_parts.deinit(req.allocator);
+    img_parts.ensureTotalCapacity(req.allocator, req.images.len) catch |err| return failParts(sch, req, emb_parts.items, @errorName(err));
+    vid_parts.ensureTotalCapacity(req.allocator, req.videos.len) catch |err| return failParts(sch, req, emb_parts.items, @errorName(err));
+    aud_parts.ensureTotalCapacity(req.allocator, req.audio.len) catch |err| return failParts(sch, req, emb_parts.items, @errorName(err));
+
     var n_vision: usize = 0;
     for (req.images, 0..) |img, img_i| {
         var emb: mlx.mlx_array = undefined;
@@ -4997,6 +5030,7 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             failParts(sch, req, emb_parts.items, @errorName(err));
             return;
         };
+        img_parts.appendAssumeCapacity(emb_parts.items.len - 1);
     }
 
     var n_video: usize = 0;
@@ -5017,32 +5051,47 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             failParts(sch, req, emb_parts.items, @errorName(err));
             return;
         };
+        vid_parts.appendAssumeCapacity(emb_parts.items.len - 1);
     }
 
     // Audio: frame each clip into 640-sample tokens, project through the
     // unified audio embedder → [1, n_frames, hidden].
     var n_audio: usize = 0;
-    for (req.audio) |clip| {
+    for (req.audio, 0..) |clip, clip_i| {
         if (vision_enc.isMimoAudio()) {
-            const pcm = mimo_audio_mod.pcmFromPayload(req.allocator, clip) catch |err| {
-                failParts(sch, req, emb_parts.items, @errorName(err));
-                return;
+            const aud_key = VisionEmbCache.audioKey(req.model, clip);
+            const cached = vision_emb_cache.get(aud_key);
+            const emb = cached orelse blk: {
+                const pcm = mimo_audio_mod.pcmFromPayload(req.allocator, clip) catch |err| {
+                    failParts(sch, req, emb_parts.items, @errorName(err));
+                    return;
+                };
+                defer req.allocator.free(pcm);
+                const fresh = vision_enc.forwardMimoAudio(pcm) catch |err| {
+                    failParts(sch, req, emb_parts.items, @errorName(err));
+                    return;
+                };
+                vision_emb_cache.put(sch.allocator, aud_key, fresh);
+                break :blk fresh;
             };
-            defer req.allocator.free(pcm);
-            const emb = vision_enc.forwardMimoAudio(pcm) catch |err| {
-                failParts(sch, req, emb_parts.items, @errorName(err));
-                return;
-            };
-            n_audio += @intCast(mlx.getShape(emb)[1]);
+            const rows: usize = @intCast(mlx.getShape(emb)[1]);
+            n_audio += rows;
+            if (req.audio_token_counts) |counts| {
+                if (clip_i < counts.len) counts[clip_i] = rows;
+            }
             emb_parts.append(req.allocator, emb) catch |err| {
                 _ = mlx.mlx_array_free(emb);
                 failParts(sch, req, emb_parts.items, @errorName(err));
                 return;
             };
+            aud_parts.appendAssumeCapacity(emb_parts.items.len - 1);
             continue;
         }
         const n_samples = clip.len / 4;
-        if (n_samples == 0) continue;
+        if (n_samples == 0) {
+            aud_parts.appendAssumeCapacity(none_part);
+            continue;
+        }
         const cfg = req.model.config orelse {
             failParts(sch, req, emb_parts.items, "NoConfig");
             return;
@@ -5065,16 +5114,47 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             return;
         };
         n_audio += n_frames;
+        if (req.audio_token_counts) |counts| {
+            if (clip_i < counts.len) counts[clip_i] = n_frames;
+        }
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
             failParts(sch, req, emb_parts.items, @errorName(err));
             return;
         };
+        aud_parts.appendAssumeCapacity(emb_parts.items.len - 1);
     }
 
     if (emb_parts.items.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
+    }
+
+    // Requested order: permute the parts (handles, not data) before the concat.
+    if (req.order) |order| {
+        var ordered = std.ArrayList(mlx.mlx_array).empty;
+        defer ordered.deinit(req.allocator);
+        const seen = req.allocator.alloc(bool, emb_parts.items.len) catch |err| return failParts(sch, req, emb_parts.items, @errorName(err));
+        defer req.allocator.free(seen);
+        @memset(seen, false);
+        var used: usize = 0;
+        for (order) |ref| {
+            const list = switch (ref.kind) {
+                .image => img_parts.items,
+                .video => vid_parts.items,
+                .audio => aud_parts.items,
+            };
+            if (ref.index >= list.len) return failParts(sch, req, emb_parts.items, "MediaOrderOutOfRange");
+            const part = list[ref.index];
+            if (part == none_part) continue;
+            // A part listed twice would be freed twice after the concat.
+            if (seen[part]) return failParts(sch, req, emb_parts.items, "MediaOrderDuplicate");
+            seen[part] = true;
+            ordered.append(req.allocator, emb_parts.items[part]) catch |err| return failParts(sch, req, emb_parts.items, @errorName(err));
+            used += 1;
+        }
+        if (used != emb_parts.items.len) return failParts(sch, req, emb_parts.items, "MediaOrderIncomplete");
+        @memcpy(emb_parts.items, ordered.items);
     }
 
     // Single modality/clip: pass through. Multiple: concatenate along token dim.
