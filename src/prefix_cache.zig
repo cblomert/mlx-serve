@@ -1829,7 +1829,7 @@ pub const HotPrefixCache = struct {
             }
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                const merged = self.mergeCheckpointLists(cloned, own, eff_media_start) catch |err| {
+                const merged = self.mergeCheckpointLists(cloned, own, eff_media_start, prompt_len) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     new_bytes -= new_ssm_bytes;
@@ -1890,7 +1890,7 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new, eff_media_start);
+                break :blk try self.mergeCheckpointLists(old, new, eff_media_start, prompt_len);
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -2372,6 +2372,12 @@ pub const HotPrefixCache = struct {
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
         media_start: ?usize,
+        /// The committed turn's prompt length (0 = unknown). Its prompt-end
+        /// checkpoint is protected from thinning when no media boundary is:
+        /// with an end-of-turn checkpoint above it (`ModelConfig.swaRing`)
+        /// it is the tightest interior span and would go first, yet it is
+        /// where a re-sent turn whose answer re-renders differently restores.
+        prompt_len: usize,
     ) !?[]SSMCheckpoint {
         var merged = std.ArrayList(SSMCheckpoint).empty;
         var i: usize = 0;
@@ -2422,7 +2428,8 @@ pub const HotPrefixCache = struct {
             const drop = transformer_mod.ssmCheckpointDropIndex(
                 merged.items,
                 self.cp_thin,
-                boundaryCheckpointIndex(merged.items, media_start),
+                boundaryCheckpointIndex(merged.items, media_start) orelse
+                    boundaryCheckpointIndex(merged.items, if (prompt_len > 0) prompt_len else null),
             );
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
@@ -8795,4 +8802,20 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     // One workload = plain LRU: C goes first.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "checkpoint thinning keeps the prompt-end checkpoint under an end-of-turn one" {
+    // Stride checkpoints, the prompt-end snapshot (prompt 31844 - backoff 31)
+    // and the sliding-window ring's end-of-turn checkpoint 16 tokens later:
+    // over the cap of 16, `.min_span` alone picks the prompt-end one.
+    var layer: [1]transformer_mod.SSMCacheEntrySnapshot = undefined;
+    var cps: [17]SSMCheckpoint = undefined;
+    for (cps[0..15], 0..) |*cp, i| cp.* = .{ .pos = (i + 1) * 2048, .layers = &layer };
+    cps[15] = .{ .pos = 31813, .layers = &layer };
+    cps[16] = .{ .pos = 31860, .layers = &layer };
+    try std.testing.expectEqual(@as(usize, 15), transformer_mod.ssmCheckpointDropIndex(&cps, .min_span, null));
+    const protect = HotPrefixCache.boundaryCheckpointIndex(&cps, 31844);
+    try std.testing.expectEqual(@as(?usize, 15), protect);
+    const drop = transformer_mod.ssmCheckpointDropIndex(&cps, .min_span, protect);
+    try std.testing.expect(drop != 15 and drop != 16);
 }
