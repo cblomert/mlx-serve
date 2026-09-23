@@ -647,7 +647,7 @@ pub const HotPrefixCache = struct {
         // rebuilding that state. Off until dsv4 state rides the ssm-entry
         // machinery (needsSsmEntries class).
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return false;
-        const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
+        const has_ssm_layers = config.hasCheckpointedState();
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
     }

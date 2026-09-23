@@ -1708,6 +1708,8 @@ pub fn serve(
     if (scheduler.hot_prefix_cache != null) {
         const ssm_note: []const u8 = if (config.has_hybrid_layers)
             " [hybrid: SSM checkpoints]"
+        else if (config.swaRing())
+            " [sliding-window ring: state checkpoints]"
         else
             "";
         if (resolvedPrefixCacheMem() > 0) {
@@ -1716,7 +1718,7 @@ pub fn serve(
         } else {
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
         }
-        if (config.has_hybrid_layers) {
+        if (config.has_hybrid_layers or config.swaRing()) {
             log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ ssm_checkpoint_stride, ssm_checkpoint_max });
         }
     } else if (prefix_cache_capacity > 0) {

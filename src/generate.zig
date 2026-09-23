@@ -4278,8 +4278,20 @@ pub const Generator = struct {
                 entries.len > 0 and entries[0].spec_state_seq.ctx != null
             else
                 false;
+            // Sliding-window ring: KV rewinds by truncation, the ring from the
+            // pre-verify snapshot plus the verify rows it still holds.
+            const swa_keep: usize = if (xfm.config.sliding_window > 0) xfm.config.sliding_window - 1 else 0;
+            const ring_rollback = xfm.config.swaRing() and ssm_snaps != null and 1 + m <= swa_keep;
 
-            if (gdn_captured) {
+            if (ring_rollback) {
+                const accepted_len: usize = 1 + @as(usize, accepted);
+                try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
+                for (self.ctx.ssm_entries.?, ssm_snaps.?, 0..) |*entry, *sn, li| {
+                    if (xfm.config.isGlobalLayer(@intCast(li))) continue;
+                    try transformer_mod.swaRingRollback(s, entry, sn, 1 + m, accepted_len, swa_keep);
+                }
+                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
+            } else if (gdn_captured) {
                 const accepted_len: usize = 1 + @as(usize, accepted);
                 // `truncate` overwrites cache.step with its length arg; on this
                 // family cache.step is a stale counter the model never reads

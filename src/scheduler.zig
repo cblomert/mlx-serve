@@ -449,6 +449,40 @@ fn firstMediaPlaceholder(
     return null;
 }
 
+/// The sliding-window ring (`ModelConfig.swaRing`) checkpoints its state at the
+/// END of the turn as well. Prefill checkpoints stop 30 tokens short of the
+/// prompt; an agent's next request re-sends this whole turn, generated tokens
+/// included, and restores only at a checkpoint, so without this one every turn
+/// would re-prefill its predecessor's answer. ~25 MB (39 layers x 127 rows).
+/// Returns the list to commit (ownership as for `takeSsmCheckpoints`).
+fn appendEndOfTurnCheckpoint(slot: *Slot, gen: *Generator, cps: ?[]transformer_mod.SSMCheckpoint) ?[]transformer_mod.SSMCheckpoint {
+    const cfg = slot.model.config orelse return cps;
+    if (!cfg.swaRing()) return cps;
+    const ents = slot.ssm_entries orelse return cps;
+    const xf = slot.model.transformer orelse return cps;
+    const pos = slot.cache.step;
+    if (pos == 0) return cps;
+    if (cps) |c| {
+        if (c[c.len - 1].pos >= pos) return cps;
+    }
+    const a = gen.ssm_checkpoint_alloc orelse slot.allocator;
+    var cp = transformer_mod.captureSsmCheckpoint(a, ents, pos, xf.s) catch |err| {
+        log.warn("[hot-cache] end-of-turn ring checkpoint failed: {s}\n", .{@errorName(err)});
+        return cps;
+    };
+    const old_len = if (cps) |c| c.len else 0;
+    const out = a.alloc(transformer_mod.SSMCheckpoint, old_len + 1) catch {
+        cp.deinit(a);
+        return cps;
+    };
+    if (cps) |c| {
+        @memcpy(out[0..old_len], c);
+        a.free(c);
+    }
+    out[old_len] = cp;
+    return out;
+}
+
 /// The prompt tokens the prefix cache matches and stores for this slot.
 fn cacheTokens(slot: *const Slot) []const u32 {
     return slot.cache_ids orelse slot.full_prompt;
@@ -765,7 +799,10 @@ pub const Slot = struct {
             .drafter = params.drafter,
             .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
-            .enable_mtp = params.enable_mtp,
+            // MTP's verify rollback needs a per-step capture of recurrent
+            // state (`gdn_captured`) and has no snapshot fallback when state
+            // exists; the sliding-window ring provides none.
+            .enable_mtp = params.enable_mtp and !config.swaRing(),
             .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
@@ -4342,14 +4379,22 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
         // Every failure mode is caught: persistence silently stays off, the
         // RAM cache is unaffected.
-        const has_ssm_layers = params.config.has_hybrid_layers or
-            params.config.full_attention_interval > 0;
+        const has_ssm_layers = params.config.hasCheckpointedState();
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+            const fp_model = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
+            defer sch.allocator.free(fp_model);
+            // A sliding-window ring persists different state (ring checkpoints,
+            // no sliding-layer rows) than a full-history store of the same
+            // weights: its own directory, so neither ever reads the other's
+            // entries. The old one ages out through `sweepSiblings`.
+            const fp = if (params.config.swaRing())
+                std.fmt.allocPrint(sch.allocator, "{s}-swaring1", .{fp_model}) catch break :attach
+            else
+                sch.allocator.dupe(u8, fp_model) catch break :attach;
             defer sch.allocator.free(fp);
             const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
             defer sch.allocator.free(base);
@@ -5438,12 +5483,13 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
     const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
-    const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+    var ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
+    ssm_cps_opt = appendEndOfTurnCheckpoint(slot, gen_ptr, ssm_cps_opt);
     // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer history as a view
     // of the capacity buffer (the slot is torn down right after). A failure commits the
     // entry history-less, which a QSA arch treats as a miss.

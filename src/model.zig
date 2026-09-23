@@ -8,6 +8,9 @@ const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
+/// Cached MLX_SERVE_SWA_RING (see `ModelConfig.swaRing`).
+var swa_ring_env: ?bool = null;
+
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
 /// MLX quantization mode from config.json's `quantization.mode`. All
@@ -1047,7 +1050,29 @@ pub const ModelConfig = struct {
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
-        return self.has_hybrid_layers or self.full_attention_interval > 0 or self.isInkling();
+        return self.has_hybrid_layers or self.full_attention_interval > 0 or self.isInkling() or self.swaRing();
+    }
+
+    /// MiMo's sliding-window layers keep only their last `window - 1` K/V rows,
+    /// as per-layer recurrent state in the slot's `ssm_entries` (conv_state = K,
+    /// ssm_state = V), instead of full history in the KVCache. 39 of its 48
+    /// layers are sliding with window 128, so full history spent ~90% of the KV
+    /// (~200 of ~223 KB per token) on rows no attention ever reads again. As
+    /// state, the prefix cache restores them through the hybrid checkpoint
+    /// path. MLX_SERVE_SWA_RING=0 restores full-history sliding layers.
+    pub fn swaRing(self: *const ModelConfig) bool {
+        if (!std.mem.eql(u8, self.model_type, "mimo_v2_flash") or self.sliding_window == 0) return false;
+        if (swa_ring_env == null) {
+            const raw = std.c.getenv("MLX_SERVE_SWA_RING");
+            swa_ring_env = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        }
+        return swa_ring_env.?;
+    }
+
+    /// Any per-layer recurrent state the prefix cache can only restore at a
+    /// checkpoint (the gate `HotPrefixCache.shouldUse` and the SSD tier apply).
+    pub fn hasCheckpointedState(self: *const ModelConfig) bool {
+        return self.has_hybrid_layers or self.full_attention_interval > 0 or self.swaRing();
     }
 
     /// Block-diffusion checkpoint (DiffusionGemma): generation is the canvas

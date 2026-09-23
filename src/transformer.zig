@@ -1151,6 +1151,128 @@ fn cachedScalarInt(v: c_int) mlx.mlx_array {
     return arr;
 }
 
+test "swaRingUpdate keeps the last rows and hands out ring ++ new, never mutating old state" {
+    const s = mlx.gpuStream();
+    // Rows numbered by absolute position: value = position, shape [1, 1, n, 1].
+    const Mk = struct {
+        fn rows(st: mlx.mlx_stream, start: usize, n: usize) !mlx.mlx_array {
+            _ = st;
+            var buf: [64]f32 = undefined;
+            for (0..n) |i| buf[i] = @floatFromInt(start + i);
+            const shape = [_]c_int{ 1, 1, @intCast(n), 1 };
+            return mlx.mlx_array_new_data(&buf, &shape, 4, .float32);
+        }
+        fn values(a: mlx.mlx_array, out: []f32) ![]f32 {
+            if (mlx.mlx_array_eval(a) != 0) return error.Eval;
+            const n: usize = @intCast(mlx.getShape(a)[2]);
+            const d = mlx.mlx_array_data_float32(a) orelse return error.NoData;
+            for (0..n) |i| out[i] = d[i];
+            return out[0..n];
+        }
+    };
+    var entry = SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    defer {
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+    }
+    const keep: usize = 3;
+    var tmp: [64]f32 = undefined;
+
+    // A 5-row prefill chunk from empty: the view is the chunk, the ring its last 3 rows.
+    {
+        const k = try Mk.rows(s, 0, 5);
+        defer _ = mlx.mlx_array_free(k);
+        var view = try Transformer.swaRingUpdate(s, &entry, k, k, keep, true);
+        defer view.deinit();
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 1, 2, 3, 4 }, try Mk.values(view.k, &tmp));
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 4 }, try Mk.values(entry.conv_state, &tmp));
+    }
+    // A snapshot of the ring now must survive the next update untouched.
+    var held = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(held);
+    try mlx.check(mlx.mlx_array_set(&held, entry.conv_state));
+    // Decode: ring(3) ++ 1 new = 4-row view; the ring slides by one.
+    {
+        const k = try Mk.rows(s, 5, 1);
+        defer _ = mlx.mlx_array_free(k);
+        var view = try Transformer.swaRingUpdate(s, &entry, k, k, keep, false);
+        defer view.deinit();
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 4, 5 }, try Mk.values(view.k, &tmp));
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 3, 4, 5 }, try Mk.values(entry.conv_state, &tmp));
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 3, 4, 5 }, try Mk.values(entry.ssm_state, &tmp));
+    }
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 4 }, try Mk.values(held, &tmp));
+    // A chunk shorter than the ring from a short ring: 2 rows from empty keep both.
+    var short = SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    defer {
+        _ = mlx.mlx_array_free(short.conv_state);
+        _ = mlx.mlx_array_free(short.ssm_state);
+    }
+    {
+        const k = try Mk.rows(s, 0, 2);
+        defer _ = mlx.mlx_array_free(k);
+        var view = try Transformer.swaRingUpdate(s, &short, k, k, keep, true);
+        defer view.deinit();
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 1 }, try Mk.values(short.conv_state, &tmp));
+    }
+}
+
+test "swaRingRollback lands where a re-forward of the accepted rows would" {
+    const s = mlx.gpuStream();
+    const Mk = struct {
+        fn rows(start: usize, n: usize) mlx.mlx_array {
+            var buf: [64]f32 = undefined;
+            for (0..n) |i| buf[i] = @floatFromInt(start + i);
+            const shape = [_]c_int{ 1, 1, @intCast(n), 1 };
+            return mlx.mlx_array_new_data(&buf, &shape, 4, .float32);
+        }
+        fn values(a: mlx.mlx_array, out: []f32) ![]f32 {
+            if (mlx.mlx_array_eval(a) != 0) return error.Eval;
+            const n: usize = @intCast(mlx.getShape(a)[2]);
+            const d = mlx.mlx_array_data_float32(a) orelse return error.NoData;
+            for (0..n) |i| out[i] = d[i];
+            return out[0..n];
+        }
+        fn feed(st: mlx.mlx_stream, e: *SSMCacheEntry, start: usize, n: usize, keep: usize) !void {
+            const k = rows(start, n);
+            defer _ = mlx.mlx_array_free(k);
+            var v = try Transformer.swaRingUpdate(st, e, k, k, keep, true);
+            v.deinit();
+        }
+    };
+    var tmp: [64]f32 = undefined;
+    const keep: usize = 3;
+    // Full ring: [2,3,4], verify [5,6,7], accept 2 rows -> [4,5,6].
+    {
+        var e = SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        defer {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        try Mk.feed(s, &e, 0, 5, keep);
+        var snap = ssmSnapshot(&e);
+        defer ssmSnapshotDeinit(&snap);
+        try Mk.feed(s, &e, 5, 3, keep);
+        try swaRingRollback(s, &e, &snap, 3, 2, keep);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 4, 5, 6 }, try Mk.values(e.conv_state, &tmp));
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 4, 5, 6 }, try Mk.values(e.ssm_state, &tmp));
+    }
+    // Short ring: [0], verify [1,2], accept 1 row -> [0,1].
+    {
+        var e = SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        defer {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        try Mk.feed(s, &e, 0, 1, keep);
+        var snap = ssmSnapshot(&e);
+        defer ssmSnapshotDeinit(&snap);
+        try Mk.feed(s, &e, 1, 2, keep);
+        try swaRingRollback(s, &e, &snap, 2, 1, keep);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 0, 1 }, try Mk.values(e.conv_state, &tmp));
+    }
+}
+
 test "vqmm scalar cache never evicts a scalar the caller is still holding" {
     // The live crash, as a pure decision: every verifyQmm-family call site
     // takes K then N back to back and holds BOTH handles in one `inputs_arr`.
@@ -8566,6 +8688,56 @@ pub const SSMCacheEntrySnapshot = struct {
     ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
     ple_prev_valid: bool = false,
 };
+
+/// Roll a sliding-window ring (`ModelConfig.swaRing`) back to a partial accept
+/// without re-forwarding. After a verify of `verify_rows` tokens the ring's
+/// last `verify_rows` rows ARE those tokens' K/V (verify widths stay far below
+/// the ring), and `snap` holds the ring from before the verify, so the ring at
+/// `accepted_rows` of them is the last `keep` rows of `snap ++ verify[0..acc)`.
+pub fn swaRingRollback(
+    s: mlx.mlx_stream,
+    entry: *SSMCacheEntry,
+    snap: *const SSMCacheEntrySnapshot,
+    verify_rows: usize,
+    accepted_rows: usize,
+    keep: usize,
+) !void {
+    if (!entry.initialized) return;
+    const cur: usize = @intCast(mlx.getShape(entry.conv_state)[2]);
+    if (verify_rows > cur or accepted_rows > verify_rows) return error.SwaRingRollbackBeyondRing;
+    const had: usize = if (snap.initialized and snap.conv_state.ctx != null) @intCast(mlx.getShape(snap.conv_state)[2]) else 0;
+    const end = had + accepted_rows;
+    const start = end - @min(keep, end);
+    const states = [_]struct { live: *mlx.mlx_array, old: mlx.mlx_array }{
+        .{ .live = &entry.conv_state, .old = snap.conv_state },
+        .{ .live = &entry.ssm_state, .old = snap.ssm_state },
+    };
+    var fresh: [2]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    errdefer for (fresh[0..made]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (states, 0..) |st, i| {
+        const verify = try Transformer.sliceRowsAxis2(s, st.live.*, cur - verify_rows, cur);
+        defer _ = mlx.mlx_array_free(verify);
+        var joined = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(joined);
+        if (had > 0) {
+            const parts = [_]mlx.mlx_array{ st.old, verify };
+            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 2, s));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&joined, verify));
+        }
+        fresh[i] = try Transformer.sliceRowsAxis2(s, joined, start, end);
+        made += 1;
+    }
+    for (states, 0..) |st, i| {
+        _ = mlx.mlx_array_free(st.live.*);
+        st.live.* = fresh[i];
+    }
+}
 
 pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
     var out: SSMCacheEntrySnapshot = .{
@@ -26300,6 +26472,73 @@ pub const Transformer = struct {
     ///
     /// No YaRN arm: the checkpoint ships `rope_type: default` at a native 1M
     /// window, so there is nothing to interpolate.
+    /// One sliding layer's K/V as a bounded ring (`ModelConfig.swaRing`): the
+    /// layer's SSMCacheEntry holds its last `keep` post-RoPE rows (conv_state =
+    /// K, ssm_state = V, [B, kv_heads, rows, dim]). Returns the attention view
+    /// `ring ++ new` (owned), which is exactly the tail the full-history cache's
+    /// trimmed view was: `min(total_kv, window + q_len - 1)` rows, so the masks
+    /// built for that view apply unchanged. The state is replaced, never
+    /// written in place, so a snapshot or checkpoint holding the old handles
+    /// stays valid (PLD rollback, prefix-cache capture). `materialize` copies
+    /// the new ring out of the view so a prefill chunk's rows are not pinned.
+    fn swaRingUpdate(
+        s: mlx.mlx_stream,
+        entry: *SSMCacheEntry,
+        k: mlx.mlx_array,
+        v: mlx.mlx_array,
+        keep: usize,
+        materialize: bool,
+    ) !DenseKVView {
+        var k_all = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(k_all);
+        var v_all = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(v_all);
+        if (entry.initialized) {
+            const kp = [_]mlx.mlx_array{ entry.conv_state, k };
+            const kvec = mlx.mlx_vector_array_new_data(&kp, 2);
+            defer _ = mlx.mlx_vector_array_free(kvec);
+            try mlx.check(mlx.mlx_concatenate_axis(&k_all, kvec, 2, s));
+            const vp = [_]mlx.mlx_array{ entry.ssm_state, v };
+            const vvec = mlx.mlx_vector_array_new_data(&vp, 2);
+            defer _ = mlx.mlx_vector_array_free(vvec);
+            try mlx.check(mlx.mlx_concatenate_axis(&v_all, vvec, 2, s));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&k_all, k));
+            try mlx.check(mlx.mlx_array_set(&v_all, v));
+        }
+        const total: usize = @intCast(mlx.getShape(k_all)[2]);
+        const n = @min(total, keep);
+        var k_ring = try sliceRowsAxis2(s, k_all, total - n, total);
+        errdefer _ = mlx.mlx_array_free(k_ring);
+        var v_ring = try sliceRowsAxis2(s, v_all, total - n, total);
+        errdefer _ = mlx.mlx_array_free(v_ring);
+        if (materialize and n < total) {
+            const kc = try materializedOwnedCopy(s, k_ring);
+            _ = mlx.mlx_array_free(k_ring);
+            k_ring = kc;
+            const vc = try materializedOwnedCopy(s, v_ring);
+            _ = mlx.mlx_array_free(v_ring);
+            v_ring = vc;
+        }
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.conv_state = k_ring;
+        entry.ssm_state = v_ring;
+        entry.initialized = true;
+        return .{ .k = k_all, .v = v_all, .owned = true };
+    }
+
+    fn sliceRowsAxis2(s: mlx.mlx_stream, x: mlx.mlx_array, start: usize, stop: usize) !mlx.mlx_array {
+        const sh = mlx.getShape(x);
+        const lo = [_]c_int{ 0, 0, @intCast(start), 0 };
+        const hi = [_]c_int{ sh[0], sh[1], @intCast(stop), sh[3] };
+        const st = [_]c_int{ 1, 1, 1, 1 };
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_slice(&out, x, &lo, 4, &hi, 4, &st, 4, s));
+        return out;
+    }
+
     fn mimoAttnWith(
         self: *Transformer,
         ctx: *ForwardCtx,
@@ -26406,7 +26645,14 @@ pub const Transformer = struct {
                 const pos: c_int = @intCast(slot_ctx.cache.seqLen(layer));
                 const sv = slidingViewFor(cfg, pos + 1, 1);
                 const mk: u32 = if (is_full) 0 else sv.span;
-                var view = try slot_ctx.cache.update(layer, k_i, v_i, self.s, mk);
+                const ring_entry: ?*SSMCacheEntry = if (!is_full and cfg.swaRing())
+                    (if (slot_ctx.ssm_entries) |ents| &ents[layer] else null)
+                else
+                    null;
+                var view = if (ring_entry) |re|
+                    try swaRingUpdate(self.s, re, k_i, v_i, cfg.sliding_window - 1, false)
+                else
+                    try slot_ctx.cache.update(layer, k_i, v_i, self.s, mk);
                 defer view.deinit();
                 var o = mlx.mlx_array_new();
                 errdefer _ = mlx.mlx_array_free(o);
@@ -26442,7 +26688,14 @@ pub const Transformer = struct {
         // fails to broadcast them and MLX aborts the process.
         const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
         const max_kv: u32 = if (is_full) 0 else sliding.span;
-        var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        const ring_entry: ?*SSMCacheEntry = if (!is_full and cfg.swaRing())
+            (if (ctx.ssm_entries) |ents| &ents[layer] else null)
+        else
+            null;
+        var kv_view = if (ring_entry) |re|
+            try swaRingUpdate(self.s, re, k_rope, v_t, cfg.sliding_window - 1, seq_len > 1)
+        else
+            try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
         defer kv_view.deinit();
         const full_k = kv_view.k;
         const full_v = kv_view.v;
