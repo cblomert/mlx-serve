@@ -4427,6 +4427,18 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.enableBackgroundWriter();
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
             entry.prefix_cache.?.disk.?.sweepSiblings();
+        } else if (params.config.swaRing() and entry.prefix_cache.?.disk != null and
+            prefix_cache_mod.ssdFirstEnabled())
+        {
+            // The sliding-window ring arms the disk half of SSD-first only: files written off
+            // the inference thread (a synchronous 512 MB flush stalled every co-tenant slot up
+            // to 1.8 s and banked ~15k tokens per turn, so deep agent prefixes never landed
+            // before a restart), checkpoints beside their chunk, chunk links, the sibling
+            // sweep. The hot-cache half (RAM trim, liens, write-through) stays off: it was
+            // measured on qwen4_exp only. MLX_SERVE_PREFIX_SSD_FIRST=0 turns this off too.
+            entry.prefix_cache.?.disk.?.ssd_first = true;
+            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
+            entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
