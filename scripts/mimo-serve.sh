@@ -108,6 +108,22 @@ MIMO_PREFIX_MEM="${MIMO_PREFIX_MEM:-20GB}"
 # (512 from ~17k tokens), which is also the measured optimum there (67k: 512
 # -> 265 tok/s, 2048 -> 237). Without this flag the load-time sizer picks 4096.
 MIMO_PREFILL_CHUNK="${MIMO_PREFILL_CHUNK:-2048}"
+
+# Prefix-cache priming. Every agent session starts with the same system prompt
+# + tool definitions (~10k tokens, ~25 s of prefill cold). After the server is
+# healthy, `mimo-prime run` replays each prime file in MIMO_PRIME_DIR (one per
+# agent prefix, built from captured requests by `mimo-prime build`) with
+# max_tokens 1, so the first session after a restart starts warm. Measured:
+# 19 s -> 0.9 s for a fresh session. MIMO_PRIME_DIR= disables it.
+MIMO_PRIME_DIR="${MIMO_PRIME_DIR-$HOME/.mlx-serve/prime}"
+# Request capture for (re)building the primes: MIMO_REQUEST_LOG=1 writes every
+# chat request body to ~/.mlx-serve/request-capture (prompts and code included
+# -- a private dir; turn it off again once the capture is done).
+MIMO_REQUEST_LOG="${MIMO_REQUEST_LOG:-0}"
+if [ "$MIMO_REQUEST_LOG" = "1" ]; then
+  export MLX_SERVE_REQUEST_LOG_DIR="$HOME/.mlx-serve/request-capture"
+  mkdir -p "$MLX_SERVE_REQUEST_LOG_DIR" && chmod 700 "$MLX_SERVE_REQUEST_LOG_DIR"
+fi
 MIMO_TTS_DIR="${MIMO_TTS_DIR-$HOME/.mlx-serve/tts-models}"   # Kokoro lives here
 MIMO_PREFIX_DISK="${MIMO_PREFIX_DISK:-48GB}"
 
@@ -170,6 +186,18 @@ mkdir -p "$(dirname "$CRASHLOG")"
 TTS_ARGS=()
 if [ -n "$MIMO_TTS_DIR" ] && [ -d "$MIMO_TTS_DIR" ]; then
   TTS_ARGS+=(--model-dir "$MIMO_TTS_DIR")
+fi
+
+if [ -n "$MIMO_PRIME_DIR" ] && [ -x "$HOME/bin/mimo-prime" ] && ls "$MIMO_PRIME_DIR"/*.json >/dev/null 2>&1; then
+  mkdir -p "$HOME/.mlx-serve/logs"
+  (
+    for _ in $(seq 1 300); do
+      curl -sf "http://127.0.0.1:$MIMO_PORT/health" >/dev/null 2>&1 && break
+      sleep 2
+    done
+    echo "=== $(date '+%Y-%m-%d %H:%M:%S') priming from $MIMO_PRIME_DIR"
+    "$HOME/bin/mimo-prime" run "$MIMO_PRIME_DIR" --url "http://127.0.0.1:$MIMO_PORT"
+  ) >> "$HOME/.mlx-serve/logs/mimo-prime.log" 2>&1 < /dev/null &
 fi
 
 REASON_ARGS=()
