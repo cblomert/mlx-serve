@@ -8224,6 +8224,8 @@ fn handleChatCompletions(
     const wire_continue_final = wireContinuationRequested(messages_val.array.items, .openai) and
         (if (root.get("continue_final_message")) |v| v == .bool and v.bool else false);
     const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .openai);
+    // Earlier turns' images are materialized too when the model keeps them.
+    const keep_history_images = historyImagesEnabled(config);
 
     for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
         // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
@@ -8252,7 +8254,7 @@ fn handleChatCompletions(
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
-                        if (!decode_this_message) continue;
+                        if (!decode_this_message and !keep_history_images) continue;
                         // Parse image_url content block
                         const img_obj = part.object.get("image_url") orelse continue;
                         if (img_obj != .object) continue;
@@ -8765,18 +8767,31 @@ fn handleChatCompletions(
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
+    defer clearPendingMediaCacheIds();
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
-            log.warn("Vision encoding failed: {}\n", .{err});
+        const hist: ?HistoryMedia = if (historyImagesEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+            log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
-        };
-        if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
+        } else null;
+        if (hist) |h| {
+            local_ve = h.embeddings;
+            vis_key = h.key;
             allocator.free(prompt_ids_raw);
-            prompt_ids_raw = new_ids;
+            prompt_ids_raw = h.prompt;
+            setPendingMediaCacheIds(h.cache_ids);
+        } else {
+            local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+                log.warn("Vision encoding failed: {}\n", .{err});
+                break :blk null;
+            };
+            if (local_ve != null) {
+                const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
+                allocator.free(prompt_ids_raw);
+                prompt_ids_raw = new_ids;
+            }
         }
     } else if (mediaRejectReason(messages.items)) |reason| {
         allocator.free(prompt_ids_raw);
@@ -9272,6 +9287,7 @@ fn handleStreamingCompletion(
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
+        .media_cache_ids = pendingMediaCacheIds(prompt_ids.len),
         .cached_tokens = 0,
         .has_tools = false,
         .enable_thinking = false,
@@ -9521,6 +9537,7 @@ fn nonStreamingViaScheduler(
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,
+        .media_cache_ids = pendingMediaCacheIds(full_prompt.len),
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
         .enable_thinking = enable_thinking,
@@ -10490,6 +10507,7 @@ fn handleStreamingGeneration(
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
+        .media_cache_ids = pendingMediaCacheIds(prompt_ids.len),
         .cached_tokens = 0,
         .has_tools = has_tools,
         .enable_thinking = enable_thinking,
@@ -13532,26 +13550,32 @@ fn activeTurnMediaMessage(msgs: []const chat_mod.Message, continue_final: bool) 
             (msg.videos != null and msg.videos.?.len > 0) or
             (msg.audio != null and msg.audio.?.len > 0))
         {
-            var media = ActiveTurnMedia{ .message = msg, .user_markers_after = user_markers_after };
-            var prev_tool = false;
-            for (msgs, 0..) |*m, j| {
-                const is_tool = std.mem.eql(u8, m.role, "tool");
-                if (std.mem.eql(u8, m.role, "user")) media.total_users += 1;
-                if (is_tool) {
-                    media.total_tool_msgs += 1;
-                    if (!prev_tool) media.total_tool_runs += 1;
-                    if (j > i) {
-                        media.tool_msgs_after += 1;
-                        if (!prev_tool) media.tool_runs_after += 1;
-                    }
-                }
-                prev_tool = is_tool;
-            }
-            return media;
+            return turnMediaAt(msgs, i, user_markers_after);
         }
         user_markers_after += 1;
     }
     return null;
+}
+
+/// The marker bookkeeping `resolvedUserMarkersAfter` needs to place media at
+/// `msgs[i]`, for any user message (the active one or a historical one).
+fn turnMediaAt(msgs: []const chat_mod.Message, i: usize, user_markers_after: usize) ActiveTurnMedia {
+    var media = ActiveTurnMedia{ .message = &msgs[i], .user_markers_after = user_markers_after };
+    var prev_tool = false;
+    for (msgs, 0..) |*m, j| {
+        const is_tool = std.mem.eql(u8, m.role, "tool");
+        if (std.mem.eql(u8, m.role, "user")) media.total_users += 1;
+        if (is_tool) {
+            media.total_tool_msgs += 1;
+            if (!prev_tool) media.total_tool_runs += 1;
+            if (j > i) {
+                media.tool_msgs_after += 1;
+                if (!prev_tool) media.tool_runs_after += 1;
+            }
+        }
+        prev_tool = is_tool;
+    }
+    return media;
 }
 
 /// How many user-turn markers sit after the media message in the RENDERED
@@ -14099,6 +14123,270 @@ fn appendMimoVideoSegments(
         try seg.appendNTimes(allocator, config.video_token_id, n_video - emitted);
         try seg.append(allocator, config.vision_end_token_id);
     }
+}
+
+/// MiMo keeps the images of EARLIER turns in the prompt instead of dropping
+/// them once the conversation moves on. Dropping them costs twice: the model
+/// can no longer look back at a screenshot, and the prompt changes at the old
+/// image's position, so everything after it misses the prefix cache and is
+/// prefilled again. Kept images are re-encoded from the embedding cache
+/// (scheduler `VisionEmbCache`) and matched in the prefix cache through
+/// pixel-hash pseudo-ids (`mediaCacheIds`). Only images: historical video and
+/// audio still drop. MLX_SERVE_HISTORY_IMAGES=0 restores the old behavior.
+fn historyImagesEnabled(config: *const model_mod.ModelConfig) bool {
+    if (!config.mimo_vision) return false;
+    if (std.c.getenv("MLX_SERVE_HISTORY_IMAGES")) |v| return v[0] != '0';
+    return true;
+}
+
+/// Cache view of the prompt being submitted from this connection thread (see
+/// `SubmitParams.media_cache_ids`). Set by the media step of a handler and
+/// read where that handler builds its submit params: the handlers' long
+/// parameter chains stay unchanged. Each connection thread serves one request
+/// at a time, and the reader checks the length against its own prompt.
+threadlocal var pending_media_cache_ids: ?[]u32 = null;
+
+fn setPendingMediaCacheIds(ids: ?[]u32) void {
+    clearPendingMediaCacheIds();
+    pending_media_cache_ids = ids;
+}
+
+fn clearPendingMediaCacheIds() void {
+    if (pending_media_cache_ids) |ids| std.heap.page_allocator.free(ids);
+    pending_media_cache_ids = null;
+}
+
+fn pendingMediaCacheIds(prompt_len: usize) ?[]const u32 {
+    const ids = pending_media_cache_ids orelse return null;
+    return if (ids.len == prompt_len) ids else null;
+}
+
+/// The prefix-cache stand-in for the `k`-th placeholder of a media block
+/// whose pixels hash to `h`. Real vocab ids stay far below 2^31, so a
+/// pseudo-id never equals a text token; alternating halves of the hash make
+/// two different images agree on at most ~2^-62 of their first two rows.
+fn mediaPseudoId(h: u64, k: usize) u32 {
+    const half: u32 = if (k % 2 == 0) @truncate(h) else @truncate(h >> 32);
+    return 0x8000_0000 | (half & 0x7fff_ffff);
+}
+
+const HistoryMedia = struct {
+    embeddings: mlx.mlx_array,
+    /// The prompt with every media block inserted. Owned by the caller's allocator.
+    prompt: []u32,
+    /// `prompt` with placeholders replaced by `mediaPseudoId`s. page_allocator.
+    cache_ids: []u32,
+    key: u64,
+};
+
+/// One media-bearing user turn as `placeHistoryMedia` places it.
+const PlacedTurn = struct {
+    info: ActiveTurnMedia,
+    n_image: usize,
+    n_video: usize,
+    n_audio: usize,
+    /// `mediaKey` of the media this turn contributes: its placeholders' pseudo-ids.
+    hash: u64,
+};
+
+const PlacedPrompt = struct {
+    prompt: []u32,
+    view: []u32,
+
+    fn deinit(self: *PlacedPrompt, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        allocator.free(self.view);
+    }
+};
+
+/// Insert each turn's media block (MiMo layout: image run, then video
+/// segments, then audio run) at that turn's user marker, and build the
+/// matching prefix-cache view. `turns` is in document order. Null when two
+/// turns resolve to one position: the template's marker convention was not
+/// recognized, and misplaced rows are worse than falling back.
+fn placeHistoryMedia(
+    allocator: std.mem.Allocator,
+    prompt_ids: []const u32,
+    config: *const model_mod.ModelConfig,
+    turns: []const PlacedTurn,
+) !?PlacedPrompt {
+    const positions = try allocator.alloc(usize, turns.len);
+    defer allocator.free(positions);
+    for (turns, 0..) |t, k| {
+        positions[k] = userTurnInsertPos(prompt_ids, config, resolvedUserMarkersAfter(prompt_ids, config, t.info));
+        if (k > 0 and positions[k] <= positions[k - 1]) {
+            log.warn("[vision] history media: turn {d} resolves to position {d} <= {d}; active turn only\n", .{ k, positions[k], positions[k - 1] });
+            return null;
+        }
+    }
+
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(allocator);
+    var view = std.ArrayList(u32).empty;
+    defer view.deinit(allocator);
+    var seg = std.ArrayList(u32).empty;
+    defer seg.deinit(allocator);
+    var cursor: usize = 0;
+    for (turns, 0..) |t, k| {
+        try out.appendSlice(allocator, prompt_ids[cursor..positions[k]]);
+        try view.appendSlice(allocator, prompt_ids[cursor..positions[k]]);
+        cursor = positions[k];
+
+        seg.clearRetainingCapacity();
+        if (t.n_image > 0) {
+            try seg.append(allocator, config.vision_start_token_id);
+            try seg.appendNTimes(allocator, config.image_token_id, t.n_image);
+            try seg.append(allocator, config.vision_end_token_id);
+        }
+        if (t.n_video > 0) try appendMimoVideoSegments(allocator, &seg, config, t.info.message, t.n_video);
+        if (t.n_audio > 0) {
+            if (config.boa_token_id > 0) try seg.append(allocator, config.boa_token_id);
+            try seg.appendNTimes(allocator, config.audio_token_id, t.n_audio);
+            if (config.eoa_token_id > 0) try seg.append(allocator, config.eoa_token_id);
+        }
+        var ph: usize = 0;
+        for (seg.items) |id| {
+            try out.append(allocator, id);
+            const is_ph = id == config.image_token_id or
+                (config.video_token_id > 0 and id == config.video_token_id) or
+                (config.audio_token_id > 0 and id == config.audio_token_id);
+            if (is_ph) {
+                try view.append(allocator, mediaPseudoId(t.hash, ph));
+                ph += 1;
+            } else try view.append(allocator, id);
+        }
+        log.info("  Inserted {d} image + {d} video + {d} audio soft tokens for turn {d}/{d} at position {d}\n", .{
+            t.n_image, t.n_video, t.n_audio, k + 1, turns.len, out.items.len - seg.items.len,
+        });
+    }
+    try out.appendSlice(allocator, prompt_ids[cursor..]);
+    try view.appendSlice(allocator, prompt_ids[cursor..]);
+    const prompt = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(prompt);
+    return .{ .prompt = prompt, .view = try view.toOwnedSlice(allocator) };
+}
+
+/// Encode and place the images of every user turn (plus the active turn's
+/// video/audio) at their own turns. Null when there is nothing to place or
+/// the placement cannot be proven consistent; the caller then takes the
+/// active-turn-only path.
+fn encodeHistoryMedia(
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    msgs: []const chat_mod.Message,
+    active: ?ActiveTurnMedia,
+    prompt_ids: []const u32,
+    config: *const model_mod.ModelConfig,
+) !?HistoryMedia {
+    const sch = global_scheduler orelse return null;
+    const MediaTurn = struct { info: ActiveTurnMedia, full: bool, n_images: usize };
+    var turns = std.ArrayList(MediaTurn).empty;
+    defer turns.deinit(allocator);
+    var users_after: usize = 0;
+    for (msgs) |m| {
+        if (std.mem.eql(u8, m.role, "user")) users_after += 1;
+    }
+    for (msgs, 0..) |*m, i| {
+        if (!std.mem.eql(u8, m.role, "user")) continue;
+        users_after -= 1;
+        const is_active = if (active) |a| a.message == m else false;
+        const n_img = if (m.images) |im| im.len else 0;
+        if (n_img == 0 and !is_active) continue;
+        try turns.append(allocator, .{ .info = turnMediaAt(msgs, i, users_after), .full = is_active, .n_images = n_img });
+    }
+    if (turns.items.len == 0) return null;
+    // Even a lone new image takes this path: its cache entry must be keyed the
+    // way the next turn (which keeps it as history) will look it up.
+    // The encoder emits all images, then video, then audio; that is document
+    // order only while the turn carrying video/audio is the last media turn.
+    for (turns.items[0 .. turns.items.len - 1]) |t| {
+        const m = t.info.message;
+        if (t.full and ((m.videos != null and m.videos.?.len > 0) or (m.audio != null and m.audio.?.len > 0))) return null;
+    }
+
+    var pix = std.ArrayList(scheduler_mod.VisionImagePixels).empty;
+    defer pix.deinit(allocator);
+    var vids = std.ArrayList(scheduler_mod.VisionVideoPixels).empty;
+    defer vids.deinit(allocator);
+    var auds = std.ArrayList([]const u8).empty;
+    defer auds.deinit(allocator);
+    for (turns.items) |t| {
+        const m = t.info.message;
+        for (m.images orelse &.{}) |img| try pix.append(allocator, .{
+            .pixels = img.pixels,
+            .width = @intCast(img.width),
+            .height = @intCast(img.height),
+            .grid_h = img.grid_h,
+            .grid_w = img.grid_w,
+        });
+        if (!t.full) continue;
+        for (m.videos orelse &.{}) |vid| try vids.append(allocator, .{ .pixels = vid.pixels, .grid_t = vid.grid_t, .grid_h = vid.grid_h, .grid_w = vid.grid_w });
+        for (m.audio orelse &.{}) |a| try auds.append(allocator, a.samples);
+    }
+    const counts = try allocator.alloc(usize, pix.items.len);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+
+    log.info("Multimodal: processing {d} image(s) across {d} turn(s), {d} video(s), {d} audio clip(s)\n", .{ pix.items.len, turns.items.len, vids.items.len, auds.items.len });
+    var req = scheduler_mod.VisionEncodeRequest{
+        .model = lm,
+        .images = pix.items,
+        .videos = vids.items,
+        .audio = auds.items,
+        .allocator = allocator,
+        .image_token_counts = counts,
+    };
+    const emb = sch.encodeVision(&req) catch |err| {
+        if (req.error_name) |e| {
+            log.err("Vision encode (history) failed: {s}\n", .{e});
+            allocator.free(e);
+        }
+        return err;
+    };
+    var keep_emb = false;
+    defer if (!keep_emb) {
+        _ = mlx.mlx_array_free(emb);
+    };
+    var counted: usize = 0;
+    for (counts) |c| counted += c;
+    if (counted != req.n_vision_tokens) {
+        log.warn("[vision] history media: per-image counts {d} != {d} encoded rows; active turn only\n", .{ counted, req.n_vision_tokens });
+        return null;
+    }
+
+    const placed_turns = try allocator.alloc(PlacedTurn, turns.items.len);
+    defer allocator.free(placed_turns);
+    var img_i: usize = 0;
+    var key = std.hash.Wyhash.init(0x415d_31a7);
+    for (turns.items, placed_turns) |t, *pt| {
+        const m = t.info.message;
+        var n_img: usize = 0;
+        for (counts[img_i .. img_i + t.n_images]) |c| n_img += c;
+        img_i += t.n_images;
+        const vids_here: []const chat_mod.VideoData = if (t.full) (m.videos orelse &.{}) else &.{};
+        const auds_here: []const chat_mod.AudioData = if (t.full) (m.audio orelse &.{}) else &.{};
+        pt.* = .{
+            .info = t.info,
+            .n_image = n_img,
+            .n_video = if (t.full) req.n_video_tokens else 0,
+            .n_audio = if (t.full) req.n_audio_tokens else 0,
+            .hash = mediaKey(m.images orelse &.{}, vids_here, auds_here),
+        };
+        key.update(std.mem.asBytes(&pt.hash));
+    }
+    var placed = (try placeHistoryMedia(allocator, prompt_ids, config, placed_turns)) orelse return null;
+    errdefer placed.deinit(allocator);
+    const cache_ids = try std.heap.page_allocator.dupe(u32, placed.view);
+    allocator.free(placed.view);
+    const prompt = placed.prompt;
+    keep_emb = true;
+    log.info("  Multimodal: → {d} vision + {d} video + {d} audio rows (prompt: {d} -> {d} tokens)\n", .{ req.n_vision_tokens, req.n_video_tokens, req.n_audio_tokens, prompt_ids.len, prompt.len });
+    return .{
+        .embeddings = emb,
+        .prompt = prompt,
+        .cache_ids = cache_ids,
+        .key = key.final() | 1,
+    };
 }
 
 fn insertMultimodalTokens(
@@ -15280,6 +15568,8 @@ fn handleAnthropicMessages(
     const wire_continue_final = wireContinuationRequested(messages_val.array.items, .anthropic) and
         continuationRejectReason(lm.ds4_engine != null) == null;
     const active_wire_media = activeWireMediaIndex(messages_val.array.items, wire_continue_final, .anthropic);
+    // Earlier turns' images are materialized too when the model keeps them.
+    const keep_history_images = historyImagesEnabled(config);
 
     // Convert Anthropic messages to internal format
     for (messages_val.array.items, 0..) |msg_val, raw_msg_index| {
@@ -15333,7 +15623,7 @@ fn handleAnthropicMessages(
                                 try msg_text.appendSlice(allocator, text);
                             }
                         } else if (std.mem.eql(u8, btype, "image")) {
-                            if (!decode_this_message) continue;
+                            if (!decode_this_message and !keep_history_images) continue;
                             if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocFromConfig(config))) image_decode_failed = true;
                         } else if (std.mem.eql(u8, btype, "tool_result")) {
                             // A tool that returns an image (read_image,
@@ -15341,7 +15631,7 @@ fn handleAnthropicMessages(
                             // Its text went to the tool message above; the
                             // pixels join this turn's user message, which the
                             // template renders right after the tool response.
-                            if (!decode_this_message) continue;
+                            if (!decode_this_message and !keep_history_images) continue;
                             const rc = block.object.get("content") orelse continue;
                             if (rc != .array) continue;
                             for (rc.array.items) |inner| {
@@ -15717,18 +16007,31 @@ fn handleAnthropicMessages(
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
+    defer clearPendingMediaCacheIds();
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
-            log.warn("Vision encoding failed: {}\n", .{err});
+        const hist: ?HistoryMedia = if (historyImagesEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+            log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
-        };
-        if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
+        } else null;
+        if (hist) |h| {
+            local_ve = h.embeddings;
+            vis_key = h.key;
             allocator.free(prompt_ids_raw);
-            prompt_ids_raw = new_ids;
+            prompt_ids_raw = h.prompt;
+            setPendingMediaCacheIds(h.cache_ids);
+        } else {
+            local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+                log.warn("Vision encoding failed: {}\n", .{err});
+                break :blk null;
+            };
+            if (local_ve != null) {
+                const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
+                allocator.free(prompt_ids_raw);
+                prompt_ids_raw = new_ids;
+            }
         }
     } else if (mediaRejectReason(messages.items)) |reason| {
         allocator.free(prompt_ids_raw);
@@ -16166,6 +16469,7 @@ fn handleAnthropicStreaming(
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
+        .media_cache_ids = pendingMediaCacheIds(prompt_ids.len),
         .cached_tokens = 0,
         .has_tools = has_tools,
         .enable_thinking = enable_thinking,
@@ -17467,18 +17771,31 @@ fn handleResponsesInner(
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
+    defer clearPendingMediaCacheIds();
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
-            log.warn("Vision encoding failed: {}\n", .{err});
+        const hist: ?HistoryMedia = if (historyImagesEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+            log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
-        };
-        if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
+        } else null;
+        if (hist) |h| {
+            local_ve = h.embeddings;
+            vis_key = h.key;
             allocator.free(prompt_ids_raw);
-            prompt_ids_raw = new_ids;
+            prompt_ids_raw = h.prompt;
+            setPendingMediaCacheIds(h.cache_ids);
+        } else {
+            local_ve = processVisionImages(allocator, lm, ve, active_media, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+                log.warn("Vision encoding failed: {}\n", .{err});
+                break :blk null;
+            };
+            if (local_ve != null) {
+                const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, active_media);
+                allocator.free(prompt_ids_raw);
+                prompt_ids_raw = new_ids;
+            }
         }
     } else if (mediaRejectReason(pi.messages.items)) |reason| {
         allocator.free(prompt_ids_raw);
@@ -17715,6 +18032,7 @@ fn handleResponsesInner(
             .model = lm,
             .prompt_ids = prompt_ids,
             .full_prompt = prompt_ids,
+            .media_cache_ids = pendingMediaCacheIds(prompt_ids.len),
             .cached_tokens = 0,
             .has_tools = active_has_tools,
             .enable_thinking = enable_thinking,
@@ -20657,6 +20975,91 @@ test "insertMultimodalTokens counts a ChatML tool-response user marker" {
     const llama_out = try insertMultimodalTokens(testing.allocator, &llama_prompt, 999, 1, 777, 0, 888, 0, &config, media);
     defer testing.allocator.free(llama_out);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 44, 44, 105, 33 }, llama_out);
+}
+
+test "mediaPseudoId stays out of the vocab and tells images apart" {
+    const a: u64 = 0x1234_5678_9abc_def1;
+    const b: u64 = 0x1234_5678_9abc_def3;
+    for (0..4) |k| {
+        try testing.expect(mediaPseudoId(a, k) >= 0x8000_0000);
+        try testing.expectEqual(mediaPseudoId(a, k), mediaPseudoId(a, k));
+    }
+    // Alternating halves: the pair of rows differs even when one half agrees.
+    try testing.expect(mediaPseudoId(a, 0) != mediaPseudoId(b, 0) or mediaPseudoId(a, 1) != mediaPseudoId(b, 1));
+    try testing.expect(mediaPseudoId(a, 0) != mediaPseudoId(a, 1));
+}
+
+test "placeHistoryMedia keeps an earlier image at its own turn" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.vision_start_token_id = 200;
+    config.vision_end_token_id = 201;
+    config.image_token_id = 999;
+
+    const img_a = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const img_b = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 2, .height = 2 }};
+    const calls = [_]chat_mod.ToolCall{.{ .id = "call-1", .name = "read_image", .arguments = "{}" }};
+    // Turn 1 carried screenshot A; the agent then read screenshot B through a
+    // tool, whose pixels ride the user message after the tool result.
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "look", .images = &img_a },
+        .{ .role = "assistant", .content = "seen" },
+        .{ .role = "user", .content = "now read b" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "", .tool_call_id = "call-1" },
+        .{ .role = "user", .content = "", .images = &img_b },
+    };
+    // ChatML: one marker per user message plus one per tool-response run.
+    const prompt = [_]u32{ 1, 105, 11, 50, 105, 22, 50, 105, 33, 105, 44, 50 };
+    const turns = [_]PlacedTurn{
+        .{ .info = turnMediaAt(&msgs, 0, 2), .n_image = 2, .n_video = 0, .n_audio = 0, .hash = 0xAAAA_AAAA_1111_1111 },
+        .{ .info = turnMediaAt(&msgs, 5, 0), .n_image = 1, .n_video = 0, .n_audio = 0, .hash = 0xBBBB_BBBB_2222_2222 },
+    };
+    var placed = (try placeHistoryMedia(testing.allocator, &prompt, &config, &turns)) orelse return error.TestExpectedPlacement;
+    defer placed.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 11, 50, 105, 22, 50, 105, 33, 105, 200, 999, 201, 44, 50 }, placed.prompt);
+
+    // The cache view differs only under the placeholders, and there by image.
+    try testing.expectEqual(placed.prompt.len, placed.view.len);
+    for (placed.prompt, placed.view) |p_id, v_id| {
+        if (p_id == 999) try testing.expect(v_id >= 0x8000_0000) else try testing.expectEqual(p_id, v_id);
+    }
+    try testing.expectEqual(mediaPseudoId(turns[0].hash, 0), placed.view[3]);
+    try testing.expectEqual(mediaPseudoId(turns[0].hash, 1), placed.view[4]);
+    try testing.expectEqual(mediaPseudoId(turns[1].hash, 0), placed.view[15]);
+}
+
+test "placeHistoryMedia gives an image the same cache view whether it is new or history" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.vision_start_token_id = 200;
+    config.vision_end_token_id = 201;
+    config.image_token_id = 999;
+    const img = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const h: u64 = 0x5eed_5eed_5eed_5eed;
+
+    // Turn N: the image is new (the active turn).
+    const first = [_]chat_mod.Message{.{ .role = "user", .content = "look", .images = &img }};
+    const p1 = [_]u32{ 1, 105, 11, 50 };
+    const t1 = [_]PlacedTurn{.{ .info = turnMediaAt(&first, 0, 0), .n_image = 2, .n_video = 0, .n_audio = 0, .hash = h }};
+    var a = (try placeHistoryMedia(testing.allocator, &p1, &config, &t1)) orelse return error.TestExpectedPlacement;
+    defer a.deinit(testing.allocator);
+
+    // Turn N+1: the same image is history, the conversation grew after it.
+    const second = [_]chat_mod.Message{
+        .{ .role = "user", .content = "look", .images = &img },
+        .{ .role = "assistant", .content = "seen" },
+        .{ .role = "user", .content = "and now?" },
+    };
+    const p2 = [_]u32{ 1, 105, 11, 50, 60, 50, 105, 77, 50 };
+    const t2 = [_]PlacedTurn{.{ .info = turnMediaAt(&second, 0, 1), .n_image = 2, .n_video = 0, .n_audio = 0, .hash = h }};
+    var b = (try placeHistoryMedia(testing.allocator, &p2, &config, &t2)) orelse return error.TestExpectedPlacement;
+    defer b.deinit(testing.allocator);
+
+    // Turn N's whole cache view is a prefix of turn N+1's: a full prefix hit.
+    try testing.expectEqualSlices(u32, a.view, b.view[0..a.view.len]);
 }
 
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {

@@ -282,6 +282,13 @@ pub const SubmitParams = struct {
     vision_embeddings: ?mlx.mlx_array = null,
     /// Prefix-cache key for the media under the placeholder tokens (0 = none).
     vision_key: u64 = 0,
+    /// The prompt as the prefix cache should see it: `full_prompt` with every
+    /// media placeholder replaced by a pseudo-id derived from that media's
+    /// pixel hash (`server.mediaCacheIds`). Token-prefix matching alone then
+    /// tells images apart, so a conversation that keeps its earlier images
+    /// reuses its whole prefix and the entries stay text-keyed (SSD-eligible).
+    /// Borrowed; copied by `submit`. Ignored unless its length matches.
+    media_cache_ids: ?[]const u32 = null,
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
@@ -442,6 +449,11 @@ fn firstMediaPlaceholder(
     return null;
 }
 
+/// The prompt tokens the prefix cache matches and stores for this slot.
+fn cacheTokens(slot: *const Slot) []const u32 {
+    return slot.cache_ids orelse slot.full_prompt;
+}
+
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
     allocator: std.mem.Allocator,
@@ -516,6 +528,9 @@ pub const Slot = struct {
     // ── Submission data. Owned by the slot, freed in deinit. ──
     prompt_ids: []u32,
     full_prompt: []u32,
+    /// Owned cache view of `full_prompt` (see `SubmitParams.media_cache_ids`);
+    /// null = the cache sees `full_prompt` itself.
+    cache_ids: ?[]u32 = null,
     sampling: SamplingParams,
     eos_token_ids: []u32,
     max_tokens: u32,
@@ -688,7 +703,14 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
-        const media_start = firstMediaPlaceholder(
+        const cache_ids_owned: ?[]u32 = if (params.media_cache_ids) |ids|
+            (if (params.vision_embeddings != null and ids.len == full_prompt_owned.len) try allocator.dupe(u32, ids) else null)
+        else
+            null;
+        errdefer if (cache_ids_owned) |ids| allocator.free(ids);
+        // With a cache view the pseudo-ids carry the media identity, so the
+        // entry is keyed like text: no pixel key, no media boundary.
+        const media_start = if (cache_ids_owned != null) null else firstMediaPlaceholder(
             params.vision_embeddings != null,
             full_prompt_owned,
             config.image_token_id,
@@ -706,7 +728,7 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
-            .vision_key = params.vision_key,
+            .vision_key = if (cache_ids_owned != null) 0 else params.vision_key,
             .cache_key = params.cache_key,
             .media_start = media_start,
             .mrope_pos = params.mrope_pos,
@@ -721,6 +743,7 @@ pub const Slot = struct {
             .llama_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
             .prompt_ids = prompt_owned,
             .full_prompt = full_prompt_owned,
+            .cache_ids = cache_ids_owned,
             .sampling = params.sampling,
             .eos_token_ids = eos_owned,
             .max_tokens = params.max_tokens,
@@ -836,6 +859,7 @@ pub const Slot = struct {
         if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
+        if (self.cache_ids) |ids| self.allocator.free(ids);
         self.allocator.free(self.eos_token_ids);
         if (self.error_code) |code| self.allocator.free(code);
         if (self.generated_ids) |g| self.allocator.free(g);
@@ -1110,6 +1134,10 @@ pub const VisionEncodeRequest = struct {
     n_vision_tokens: usize = 0,
     n_video_tokens: usize = 0,
     n_audio_tokens: usize = 0,
+    /// Optional output: per-image soft-token counts, `images.len` long and
+    /// caller-owned. Lets the caller place each image's placeholders at its
+    /// own message instead of one block.
+    image_token_counts: ?[]usize = null,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
@@ -4821,6 +4849,90 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 /// Plan 05 Phase D: routes the encode through `req.model.vision_encoder`,
 /// not the scheduler's borrowed-view singleton — each LoadedModel has its
 /// own vision encoder when applicable.
+/// Encoded image embeddings by pixel hash. A conversation that keeps its
+/// earlier screenshots re-sends every one of them each turn; the ViT runs once
+/// per distinct image. Touched only on the inference thread (runVisionEncode),
+/// so it needs no lock. Budget: MLX_SERVE_VISION_EMB_CACHE_MB (default 1024,
+/// 0 disables); a 1334x750 screenshot is ~8 MB.
+const VisionEmbCache = struct {
+    const Entry = struct { key: u64, arr: mlx.mlx_array, bytes: usize, used: u64 };
+    entries: std.ArrayList(Entry) = .empty,
+    bytes: usize = 0,
+    tick: u64 = 0,
+    budget: ?usize = null,
+
+    fn budgetBytes(self: *VisionEmbCache) usize {
+        if (self.budget) |b| return b;
+        const mb: usize = if (std.c.getenv("MLX_SERVE_VISION_EMB_CACHE_MB")) |v|
+            std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024
+        else
+            1024;
+        self.budget = mb * 1024 * 1024;
+        return self.budget.?;
+    }
+
+    fn imageKey(model: *const model_registry_mod.LoadedModel, img: VisionImagePixels) u64 {
+        var h = std.hash.Wyhash.init(0x1a6e_e3b0);
+        // Pointer AND path: a hot swap can reuse the address for another checkpoint.
+        h.update(std.mem.asBytes(&@intFromPtr(model)));
+        h.update(model.path);
+        h.update(std.mem.asBytes(&img.width));
+        h.update(std.mem.asBytes(&img.height));
+        h.update(std.mem.asBytes(&img.grid_h));
+        h.update(std.mem.asBytes(&img.grid_w));
+        h.update(img.pixels);
+        return h.final();
+    }
+
+    /// A new reference to the cached embedding (caller frees), or null.
+    fn get(self: *VisionEmbCache, key: u64) ?mlx.mlx_array {
+        for (self.entries.items) |*e| {
+            if (e.key != key) continue;
+            self.tick += 1;
+            e.used = self.tick;
+            var out = mlx.mlx_array_new();
+            if (mlx.mlx_array_set(&out, e.arr) != 0) {
+                _ = mlx.mlx_array_free(out);
+                return null;
+            }
+            return out;
+        }
+        return null;
+    }
+
+    /// Keep a reference to `arr` (the caller keeps its own). Evaluates it so
+    /// the entry pins only its own buffer, not the encoder graph.
+    fn put(self: *VisionEmbCache, allocator: std.mem.Allocator, key: u64, arr: mlx.mlx_array) void {
+        const budget = self.budgetBytes();
+        if (budget == 0) return;
+        if (mlx.mlx_array_eval(arr) != 0) return;
+        const bytes = mlx.mlx_array_size(arr) * mlx.mlx_array_itemsize(arr);
+        if (bytes > budget) return;
+        while (self.bytes + bytes > budget and self.entries.items.len > 0) {
+            var lru: usize = 0;
+            for (self.entries.items, 0..) |e, i| {
+                if (e.used < self.entries.items[lru].used) lru = i;
+            }
+            const victim = self.entries.swapRemove(lru);
+            _ = mlx.mlx_array_free(victim.arr);
+            self.bytes -= victim.bytes;
+        }
+        var ref = mlx.mlx_array_new();
+        if (mlx.mlx_array_set(&ref, arr) != 0) {
+            _ = mlx.mlx_array_free(ref);
+            return;
+        }
+        self.tick += 1;
+        self.entries.append(allocator, .{ .key = key, .arr = ref, .bytes = bytes, .used = self.tick }) catch {
+            _ = mlx.mlx_array_free(ref);
+            return;
+        };
+        self.bytes += bytes;
+    }
+};
+
+var vision_emb_cache: VisionEmbCache = .{};
+
 fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     const vision_enc = req.model.vision_encoder orelse {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
@@ -4845,9 +4957,13 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     }.f;
 
     var n_vision: usize = 0;
-    for (req.images) |img| {
+    for (req.images, 0..) |img, img_i| {
         var emb: mlx.mlx_array = undefined;
-        if (img.grid_h > 0) {
+        const emb_key = VisionEmbCache.imageKey(req.model, img);
+        const cached = vision_emb_cache.get(emb_key);
+        if (cached) |hit| {
+            emb = hit;
+        } else if (img.grid_h > 0) {
             // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
             // produces [1, N/merge², out_hidden].
             const n: usize = @as(usize, img.grid_h) * img.grid_w;
@@ -4870,8 +4986,12 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
                 return;
             };
         }
+        if (cached == null) vision_emb_cache.put(sch.allocator, emb_key, emb);
         const es = mlx.getShape(emb);
         n_vision += @intCast(es[1]);
+        if (req.image_token_counts) |counts| {
+            if (img_i < counts.len) counts[img_i] = @intCast(es[1]);
+        }
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
             failParts(sch, req, emb_parts.items, @errorName(err));
@@ -5229,7 +5349,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
-    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
+    @memcpy(total_tokens[0..slot.full_prompt.len], cacheTokens(slot));
     @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
@@ -5371,7 +5491,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
+    const st = hc.commitWithMediaState(&slot.cache, cacheTokens(slot)[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -6053,7 +6173,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.cache.entries,
         abs_kv_pos,
         slot.cache.config,
-        slot.full_prompt[0..abs_kv_pos],
+        cacheTokens(slot)[0..abs_kv_pos],
         slot.has_tools,
         if (cps.len > 0) cps else null,
         s,
@@ -6366,7 +6486,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
                 xfm_ptr.s,
-                slot.full_prompt,
+                cacheTokens(slot),
                 slot.has_tools,
                 slot.vision_key,
                 slot.media_start,
