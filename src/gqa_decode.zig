@@ -6,6 +6,7 @@
 //! slabs, folded into one (max, sum, O) partial. Pass 2 merges the chunks.
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
 
 const HEADER = "#include <metal_simdgroup_matrix>\n";
 
@@ -204,6 +205,7 @@ const NSG: c_int = 4;
 var k1_cache: ?mlx.mlx_fast_metal_kernel = null;
 var k2_cache: ?mlx.mlx_fast_metal_kernel = null;
 var env_enabled: ?bool = null;
+var engaged_logged = false;
 pub var enabled_override: ?bool = null; // test seam
 
 /// MLX_SERVE_GQA_DECODE=0 keeps every decode on the fused kernel.
@@ -313,6 +315,10 @@ pub fn attend(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, 
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k2_cache.?, v2, c2, s));
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, o2, 0));
+    if (!engaged_logged) {
+        engaged_logged = true;
+        log.info("[gqa-decode] engaged (G={d}, D {d}/{d}, {d} keys) — MLX_SERVE_GQA_DECODE=0 restores the fused kernel\n", .{ g, dk, dv, n });
+    }
     return out;
 }
 
