@@ -12,6 +12,7 @@ const mrope = @import("mrope.zig");
 const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
 const gdn_decode = @import("gdn_decode.zig");
+const gqa_decode = @import("gqa_decode.zig");
 const kv_quant = @import("kv_quant.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
@@ -26661,6 +26662,9 @@ pub const Transformer = struct {
                     const m = try self.createSlidingWindowDecodeMask(view_len, sw);
                     defer _ = mlx.mlx_array_free(m);
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q_i, view.k, view.v, attn_scale, "array", m, sinks, false, self.s));
+                } else if (if (is_full) try gqa_decode.attend(q_i, view.k, view.v, attn_scale, self.s) else null) |g| {
+                    _ = mlx.mlx_array_free(o);
+                    o = g;
                 } else {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q_i, view.k, view.v, attn_scale, "", none_mask, sinks, false, self.s));
                 }
@@ -26703,8 +26707,14 @@ pub const Transformer = struct {
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (is_full) {
-            const mode: [*:0]const u8 = if (is_prefill) "causal" else "";
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, mode, none_mask, sinks, false, self.s));
+            const grouped = if (seq_len == 1) try gqa_decode.attend(q_rope, full_k, full_v, attn_scale, self.s) else null;
+            if (grouped) |g| {
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = g;
+            } else {
+                const mode: [*:0]const u8 = if (is_prefill) "causal" else "";
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, mode, none_mask, sinks, false, self.s));
+            }
         } else {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = offset + seq_len;

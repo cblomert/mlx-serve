@@ -18,6 +18,7 @@ test {
     _ = @import("lfm2_vision.zig");
     _ = @import("mimo_vision.zig");
     _ = @import("mimo_audio.zig");
+    _ = @import("gqa_decode.zig");
     _ = @import("mrope.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
