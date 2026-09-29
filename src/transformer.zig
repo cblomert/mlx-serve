@@ -11328,7 +11328,11 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
     try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false));
+    moe_rows_verify_override = true;
+    defer moe_rows_verify_override = null;
+    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, 3, 10, false));
     moe_rows_fused_override = false;
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 3, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false));
@@ -29603,9 +29607,10 @@ pub const Transformer = struct {
         return true;
     }
 
-    /// The fused-rows MoE arm at decode (B >= 2). It runs ahead of the sorted
-    /// chain, which stays the fallback whenever this declines: a decline is never
-    /// a wrong answer, only the sorted chain's extra dispatches.
+    /// The fused-rows MoE arm: B*S rows (B >= 2 slots at S == 1, or one slot's
+    /// S-wide verify block). It runs ahead of the sorted chain, which stays the
+    /// fallback whenever this declines: a decline is never a wrong answer, only
+    /// the sorted chain's extra dispatches.
     fn moeDecodeGatherQmvRows(
         self: *Transformer,
         out: *mlx.mlx_array,
@@ -29620,20 +29625,22 @@ pub const Transformer = struct {
         D: c_int,
         K: c_int,
         B: c_int,
+        S: c_int,
     ) !bool {
         if (!gatherQmvDownReduceRowsEligible(self.config.hidden_act, gate_qp, up_qp, down_qp, D)) return false;
+        const rows = B * S;
         var inds_u32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(inds_u32);
         {
             var flat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(flat);
-            const kshape = [_]c_int{ B, K };
+            const kshape = [_]c_int{ rows, K };
             try mlx.check(mlx.mlx_reshape(&flat, inds, &kshape, 2, self.s));
             try mlx.check(mlx.mlx_astype(&inds_u32, flat, .uint32, self.s));
         }
         var x_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_2d);
-        const dshape = [_]c_int{ B, D };
+        const dshape = [_]c_int{ rows, D };
         try mlx.check(mlx.mlx_reshape(&x_2d, expert_x, &dshape, 2, self.s));
 
         const act_3d = (try gatherQmvGateUpRows(
@@ -29653,7 +29660,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(act_3d);
         var scores_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scores_2d);
-        const kshape2 = [_]c_int{ B, K };
+        const kshape2 = [_]c_int{ rows, K };
         try mlx.check(mlx.mlx_reshape(&scores_2d, norm_scores, &kshape2, 2, self.s));
         const sum_2d = (try gatherQmvDownReduceRows(
             self.s,
@@ -29669,7 +29676,7 @@ pub const Transformer = struct {
         )) orelse return false;
         defer _ = mlx.mlx_array_free(sum_2d);
         const hidden = mlx.getShape(sum_2d)[1];
-        const bsh_shape = [_]c_int{ B, 1, hidden };
+        const bsh_shape = [_]c_int{ B, S, hidden };
         try mlx.check(mlx.mlx_reshape(out, sum_2d, &bsh_shape, 3, self.s));
         reduced.* = true;
         return true;
@@ -29845,7 +29852,7 @@ pub const Transformer = struct {
 
         if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
-            try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B))
+            try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
             moe_rows_fused_layers +%= 1;
             cost_arm = 1;
@@ -37418,17 +37425,36 @@ fn moeRowsFusedEnabled() bool {
     return enabled;
 }
 
+pub var moe_rows_verify_override: ?bool = null;
+var moe_rows_verify_env: ?bool = null;
+
+/// One slot's verify block (B == 1, 2 <= S <= 8) on the fused rows kernels: every
+/// position is an independent token with its own top-k, so the S positions run as
+/// S batched decode rows. qwen4 M3 Ultra 16k, fwd-ubench S=3: the sorted chain is
+/// 2121 MoE ops against 1056 at S=1. MLX_SERVE_MOE_ROWS_VERIFY=0 restores the
+/// sorted chain.
+fn moeRowsVerifyEnabled() bool {
+    if (moe_rows_verify_override) |v| return v;
+    if (moe_rows_verify_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MOE_ROWS_VERIFY");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    moe_rows_verify_env = enabled;
+    return enabled;
+}
+
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
 
-/// ONE place decides the decode MoE arm: fused rows for S == 1 and
-/// 2 <= B <= 8 without expert bias; the single-row gatherQmv at B == 1; the
-/// sorted chain otherwise, and whenever a stand-in diagnostic wants the stock path.
+/// ONE place decides the decode MoE arm: fused rows for 2 <= B*S <= 8 rows
+/// without expert bias (S == 1 across slots, or one slot's verify block); the
+/// single-row gatherQmv at B == 1; the sorted chain otherwise, and whenever a
+/// stand-in diagnostic wants the stock path.
 fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool) MoeDecodeDispatchArm {
     const total_inds: c_int = B * S * K;
     const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias;
-    if (S == 1 and B >= 2 and B <= 8 and moeRowsFusedEnabled() and !has_expert_bias and
-        !qwen4Standin().moe_gateup and !qwen4Standin().moe_down)
-        return .rows;
+    const rows_ok = moeRowsFusedEnabled() and !has_expert_bias and
+        !qwen4Standin().moe_gateup and !qwen4Standin().moe_down;
+    if (rows_ok and S == 1 and B >= 2 and B <= 8) return .rows;
+    if (rows_ok and B == 1 and S >= 2 and S <= 8 and moeRowsVerifyEnabled()) return .rows;
     if (do_sort) return .sorted;
     return .gather_qmv;
 }
@@ -44319,10 +44345,26 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false));
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, true));
     try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false));
+    // One slot's verify block: rows up to 8 positions, sorted past it, with a
+    // bias, or with the verify arm switched off.
+    moe_rows_verify_override = true;
+    defer moe_rows_verify_override = null;
+    var sv: c_int = 2;
+    while (sv <= 8) : (sv += 1) {
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, sv, K, false));
+    }
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 3, K, true));
+    moe_rows_verify_override = false;
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 3, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(3, 1, K, false));
+    moe_rows_verify_override = true;
     qwen4_standin_override = .{ .moe_gateup = true };
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 3, K, false));
     qwen4_standin_override = .{ .moe_down = true };
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 3, K, false));
     qwen4_standin_override = .{};
 }
 
