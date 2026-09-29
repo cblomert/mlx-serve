@@ -29840,6 +29840,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&flat, inds, &kshape, 2, self.s));
             try mlx.check(mlx.mlx_astype(&inds_u32, flat, .uint32, self.s));
         }
+        if (rows >= 2 and moeOverlapEnabled()) moeOverlapNote(inds_u32, rows, K);
         var x_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_2d);
         const dshape = [_]c_int{ rows, D };
@@ -36175,12 +36176,62 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
 /// Extra per-MoE-layer elementwise dispatches injected by the sizing probe
 /// (`MLX_SERVE_DISPATCH_PROBE`). 0 = off, which is every non-diagnostic run.
 var dispatch_probe_cached: ?usize = null;
+
 pub fn dispatchProbeCount() usize {
     if (dispatch_probe_cached) |v| return v;
     const raw = std.c.getenv("MLX_SERVE_DISPATCH_PROBE");
     const n: usize = if (raw) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
     dispatch_probe_cached = n;
     return n;
+}
+
+// DIAGNOSTIC (MLX_SERVE_MOE_OVERLAP=1): how many distinct experts a multi-row MoE block (a
+// verify block, or batched slots) routes to, against rows * top-k. Syncs on the indices every
+// layer, so timing under it is meaningless. One line per 480 blocks. Qwen3.8 greedy verify
+// (2026-09): 26-27% of a 3-row block's (row, slot) pairs repeat an expert, 44-47% at 7 rows.
+// Reading each such expert once (bit-exact dedup kernels, tools/moe_dedup.py) was SLOWER: the
+// SLC already serves the repeats, and the rows kernels' cost is per pair (loads + dequant ALU).
+var moe_overlap_cached: ?bool = null;
+const MoeOverlapStats = struct { calls: u64 = 0, pairs: u64 = 0, unique: u64 = 0, adj_shared: u64 = 0 };
+/// Per row count (2..8): verify blocks, history re-appends and batched ticks interleave.
+var moe_overlap: [9]MoeOverlapStats = @splat(.{});
+fn moeOverlapEnabled() bool {
+    if (moe_overlap_cached) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_MOE_OVERLAP")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    moe_overlap_cached = v;
+    return v;
+}
+fn moeOverlapNote(inds_u32: mlx.mlx_array, rows: c_int, K: c_int) void {
+    if (mlx.mlx_array_eval(inds_u32) != 0) return;
+    const data = mlx.mlx_array_data_uint32(inds_u32) orelse return;
+    const r: usize = @intCast(rows);
+    const k: usize = @intCast(K);
+    if (r * k > 256) return;
+    var seen: [256]u32 = undefined;
+    var n_unique: usize = 0;
+    for (data[0 .. r * k]) |e| {
+        if (std.mem.indexOfScalar(u32, seen[0..n_unique], e) == null) {
+            seen[n_unique] = e;
+            n_unique += 1;
+        }
+    }
+    var adj: u64 = 0;
+    for (1..r) |i| {
+        for (data[i * k .. (i + 1) * k]) |e| {
+            if (std.mem.indexOfScalar(u32, data[(i - 1) * k .. i * k], e) != null) adj += 1;
+        }
+    }
+    if (r >= moe_overlap.len) return;
+    const m = &moe_overlap[r];
+    m.calls += 1;
+    m.pairs += r * k;
+    m.unique += n_unique;
+    m.adj_shared += adj;
+    if (m.calls % 480 == 0) {
+        const repeats = 100.0 * (1.0 - @as(f64, @floatFromInt(m.unique)) / @as(f64, @floatFromInt(m.pairs)));
+        const adj_share = @as(f64, @floatFromInt(m.adj_shared)) / @as(f64, @floatFromInt(m.calls * (r - 1)));
+        log.info("[moe-overlap] rows={d} blocks={d}: {d} distinct of {d} row-experts ({d:.1}% repeats); adjacent rows share {d:.2} of {d}\n", .{ rows, m.calls, m.unique, m.pairs, repeats, adj_share, k });
+    }
 }
 
 pub fn decodeProfReport() void {
