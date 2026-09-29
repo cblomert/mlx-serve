@@ -3383,6 +3383,20 @@ test "modelDiskBytes bills only the shards the index names (issue #274)" {
 /// uniformly to startup loads AND later hot-loads — matching the env var
 /// (`MLX_SERVE_SKIP_MEM_PREFLIGHT`) it replaced.
 pub var skip_mem_preflight: bool = false;
+/// `--mtp-solo` (or MLX_SERVE_MTP_SOLO=1): MTP drafts only while its slot decodes
+/// alone on the model. With company, MTP slots ride the plain batched tick with
+/// their head detached and resumable (the crowd path's `mtp_plain_tick`), and
+/// drafting resumes when the slot is alone again: the PLD yield policy, for MTP.
+pub var mtp_solo_global: bool = false;
+var mtp_solo_env: ?bool = null;
+var mtp_solo_logged: bool = false;
+fn mtpSoloEnabled() bool {
+    if (mtp_solo_global) return true;
+    if (mtp_solo_env) |v| return v;
+    const on = if (std.c.getenv("MLX_SERVE_MTP_SOLO")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
+    mtp_solo_env = on;
+    return on;
+}
 
 /// Process-wide vision opt-out (`--no-vision` / the iPhone app, which has no
 /// image-input UI yet). A module global for the same reason as
@@ -7012,7 +7026,16 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         while (i < mtp_n) {
             var j = i + 1;
             while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
-            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
+            const crowded = j - i >= mtpCrowdThresholdFor(mtp_buf[i]);
+            // --mtp-solo: any company in this model's batched forward sends MTP plain.
+            var company: usize = j - i - 1;
+            for (batchable_buf[0..batchable_n]) |b| company += @intFromBool(b.model == mtp_buf[i].model);
+            const yield_solo = mtpSoloEnabled() and company > 0;
+            if (yield_solo and !crowded and !mtp_solo_logged) {
+                mtp_solo_logged = true;
+                log.info("[mtp] --mtp-solo: {d} slots share the decode, MTP rides the plain batched tick (drafting resumes when a slot decodes alone)\n", .{company + 1});
+            }
+            if ((crowded or yield_solo) and batchable_n + (j - i) <= batchable_buf.len) {
                 for (mtp_buf[i..j]) |slot| {
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {

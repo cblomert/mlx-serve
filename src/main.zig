@@ -203,6 +203,9 @@ fn printUsage(io: std.Io) void {
         \\                        a MoE checkpoint that ships a sidecar is
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
+        \\  --mtp-solo          --mtp, but a slot drafts only while it decodes alone:
+        \\                        with company it rides the plain batched tick and
+        \\                        resumes drafting once alone (MLX_SERVE_MTP_SOLO=1).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV).
@@ -730,6 +733,9 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--mtp-solo")) {
+            force_mtp = true;
+            scheduler_mod.mtp_solo_global = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
