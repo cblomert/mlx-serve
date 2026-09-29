@@ -5199,6 +5199,13 @@ const QSA_ATTN_MERGE_SOURCE =
 /// floor, so one flat constant. The un-split kernel (12 threadgroups at S=6) ran +15.6%.
 pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
 
+/// The `_dsplit` variant's count (M3 Ultra, 80 GPU cores, dense bf16 KV, fwd-ubench GPU per
+/// verify forward, 2026-09-29), NSPLIT 16 / 32 / 64: S=2 16k 21.64 / 20.91 / 20.89 ms, S=3
+/// 16k 25.08 / 25.01 / 24.67 (8: 26.20), S=3 64k 25.73 / 25.12 / 25.32. A verify block is
+/// S * h_kv * NSPLIT threadgroups, 64 at S=2 with 16 splits; the M5 Max quant sweep had 16 and
+/// 32 inside the noise, so 32 is not a regression there.
+pub const QSA_ATTN_NSPLIT_DENSE_DEFAULT: c_int = 32;
+
 /// Ceiling on the split count; past it the f32 partial buffer costs more traffic than it buys.
 pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
 
@@ -5252,13 +5259,19 @@ fn qsaSelectEnabledWarm() bool {
 }
 
 pub fn qsaAttnNSplit() c_int {
+    return qsaAttnNSplitFor(false);
+}
+
+/// `dense` = the `_dsplit` variant, which has its own measured default. The override and
+/// `MLX_SERVE_QSA_ATTN_NSPLIT` set both.
+pub fn qsaAttnNSplitFor(dense: bool) c_int {
     const forced = qsa_attn_nsplit_override orelse qsaAttnEnvInt(&qsa_attn_nsplit_env, "MLX_SERVE_QSA_ATTN_NSPLIT", 0);
     if (forced > 0) {
         var f: c_int = 1;
         while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
         return f;
     }
-    return QSA_ATTN_NSPLIT_DEFAULT;
+    return if (dense) QSA_ATTN_NSPLIT_DENSE_DEFAULT else QSA_ATTN_NSPLIT_DEFAULT;
 }
 
 /// Lowest query width the fused kernel serves. `MLX_SERVE_QSA_ATTN_MIN_S`.
@@ -5614,7 +5627,7 @@ pub fn qsaSparseAttn(
     const kernel = (if (dense) getQsaAttnDKernel() else getQsaAttnQKernel()) catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const nsplit = qsaAttnNSplit();
+    const nsplit = qsaAttnNSplitFor(dense);
     const bk = qsaAttnBk();
     const balanced = qsaAttnBalanced();
     const scl_data = [_]f32{attn_scale};
@@ -53445,8 +53458,11 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     qsa_attn_nsplit_override = null;
     try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
     try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_NSPLIT_DEFAULT);
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_DENSE_DEFAULT, qsaAttnNSplitFor(true));
+    try std.testing.expectEqual(@as(c_int, 32), QSA_ATTN_NSPLIT_DENSE_DEFAULT);
     qsa_attn_nsplit_override = 8;
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplitFor(true));
     qsa_attn_nsplit_override = 5;
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
     qsa_attn_nsplit_override = 1000;
