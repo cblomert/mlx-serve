@@ -2976,7 +2976,10 @@ pub fn qsaHistoryShareEnabled() bool {
 /// Virtual key index -> cache position for one query's block selection:
 /// the `sel_len` tokens of its sorted blocks, then its own incomplete tail.
 const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++
-    \\inline int msv_qsa_pos(const device int* blk, int vi, int sel_len, int tail_start, int ratio) {
+    \\// A template: MLX binds an input under 8 elements as `constant` (a tiny verify block's
+    \\// `blocks`), so the split kernels' `blk` can live in either address space.
+    \\template <typename P>
+    \\inline int msv_qsa_pos(P blk, int vi, int sel_len, int tail_start, int ratio) {
     \\  const int b = vi / ratio;
     \\  return (vi < sel_len) ? (blk[b] * ratio + (vi - b * ratio)) : (tail_start + (vi - sel_len));
     \\}
@@ -4853,27 +4856,39 @@ fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_
     return qsaSortWithInvisible(s, top_idx, vis3, all_vis);
 }
 
-// ── Fused sparse attention at verify widths (msv_attn_qsa256_q) ──
+// ── Fused sparse attention at verify widths (msv_attn_qsa256_q / _d) ──
 //
 // At 2 <= S < 16 the QSA path spent ~50 dependent ops per layer and attended a fixed union
 // of the S rows' selections under a mask (6x the MACs at S=6, plus a 12.6 MB slab). This is
 // one dispatch: `msv_attn_qsa256` verbatim with the device K/V reads replaced by an in-kernel
 // affine unpack (`qkv_attn_dec`'s dense packing). Each row sees its own blocks then its own
 // ragged tail, so causality is automatic and the INT_MAX sentinels are never read.
-const QSA_ATTN_Q_SOURCE =
+//
+// The two variants share every line but the tile loads: `_q` unpacks the packed affine
+// triples in-kernel, `_d` reads a bf16 cache view like `msv_attn_qsa256`. Each segment
+// ends in a newline, so the sources are plain concatenations.
+const QSA_ATTN_SPLIT_HEAD =
     \\constexpr int BD = 256;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = BD + 8;
     \\constexpr int NT = 32 * NSG;
     \\constexpr int KT = BK / 8;
-    \\constexpr int VPW = 32 / BITS;
-    \\constexpr int NW = 8 / VPW;
-    \\constexpr uint MASKB = (1u << BITS) - 1u;
     \\
     \\const int qL = q_shape[2];
-    \\const int kL = kq_shape[2];
     \\const int Hq = q_shape[1];
+    \\
+;
+const QSA_ATTN_SPLIT_Q_DIMS =
+    \\const int kL = kq_shape[2];
     \\const int Hk = kq_shape[1];
+    \\
+;
+const QSA_ATTN_SPLIT_D_DIMS =
+    \\const int kL = k_shape[2];
+    \\const int Hk = k_shape[1];
+    \\
+;
+const QSA_ATTN_SPLIT_RANGE =
     \\const int gqa = Hq / Hk;
     \\const int KB = blocks_shape[2];
     \\
@@ -4926,13 +4941,27 @@ const QSA_ATTN_Q_SOURCE =
     \\  t_hi = metal::min(L, t_lo + tiles_per * BK);
     \\}
     \\
-    \\const device int* blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
+    \\const auto blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
+    \\
+;
+const QSA_ATTN_SPLIT_Q_BASES =
+    \\constexpr int VPW = 32 / BITS;
+    \\constexpr int NW = 8 / VPW;
+    \\constexpr uint MASKB = (1u << BITS) - 1u;
     \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
     \\const long ksc_base = (long)bb * ksc_strides[0] + (long)hk * ksc_strides[1];
     \\const long kbi_base = (long)bb * kbi_strides[0] + (long)hk * kbi_strides[1];
     \\const long vq_base  = (long)bb * vq_strides[0]  + (long)hk * vq_strides[1];
     \\const long vsc_base = (long)bb * vsc_strides[0] + (long)hk * vsc_strides[1];
     \\const long vbi_base = (long)bb * vbi_strides[0] + (long)hk * vbi_strides[1];
+    \\
+;
+const QSA_ATTN_SPLIT_D_BASES =
+    \\const device T* Kp = k + (long)bb * k_strides[0] + (long)hk * k_strides[1];
+    \\const device T* Vp = v + (long)bb * v_strides[0] + (long)hk * v_strides[1];
+    \\
+;
+const QSA_ATTN_SPLIT_STAGE =
     \\
     \\threadgroup T KVs[LDK * BD];
     \\threadgroup T* Ks = KVs;
@@ -4965,6 +4994,9 @@ const QSA_ATTN_Q_SOURCE =
     \\for (int t0 = t_lo; t0 < t_hi; t0 += BK) {
     \\  const int rows_k = metal::min(BK, t_hi - t0);
     \\
+    \\
+;
+const QSA_ATTN_SPLIT_Q_KTILE =
     \\  // K tile: dequantize into the SAME transposed staging the dense
     \\  // kernel fills, so the fragment math below is untouched. The 8 dims of
     \\  // one chunk share a quant group (GS is a multiple of 8), so the
@@ -4992,6 +5024,27 @@ const QSA_ATTN_Q_SOURCE =
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\
+;
+const QSA_ATTN_SPLIT_D_KTILE =
+    \\  // K tile: `msv_attn_qsa256`'s 16-byte reads into the same transposed staging.
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = *((const device uint4*)(Kp + (long)pos * k_strides[2]) + c8);
+    \\    }
+    \\    thread T* e = (thread T*)&w;
+    \\    const int cb = c8 * 8;
+    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+;
+const QSA_ATTN_SPLIT_SCORE =
+    \\
     \\  float2 Sfrag[KT];
     \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
     \\  for (int dd = 0; dd < BD / 8; ++dd) {
@@ -5010,6 +5063,9 @@ const QSA_ATTN_Q_SOURCE =
     \\    }
     \\  }
     \\
+    \\
+;
+const QSA_ATTN_SPLIT_Q_VTILE =
     \\  // V tile: dequantize straight into the row-major staging.
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
@@ -5032,6 +5088,24 @@ const QSA_ATTN_Q_SOURCE =
     \\    }
     \\    for (int j = 0; j < 8; ++j) Vs[r * LDV + cb + j] = ev[j];
     \\  }
+    \\
+;
+const QSA_ATTN_SPLIT_D_VTILE =
+    \\  // V tile: straight into the row-major staging.
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = *((const device uint4*)(Vp + (long)pos * v_strides[2]) + c8);
+    \\    }
+    \\    *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;
+    \\  }
+    \\
+;
+const QSA_ATTN_SPLIT_TAIL =
     \\
     \\  float new_max = max_score;
     \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, msv_row_max(Sfrag[kt]));
@@ -5079,7 +5153,15 @@ const QSA_ATTN_Q_SOURCE =
     \\    pml[pidx * 2 + 1] = empty ? 0.0f : sum_score;
     \\  }
     \\}
+    \\
 ;
+const QSA_ATTN_Q_SOURCE = QSA_ATTN_SPLIT_HEAD ++ QSA_ATTN_SPLIT_Q_DIMS ++ QSA_ATTN_SPLIT_RANGE ++
+    QSA_ATTN_SPLIT_Q_BASES ++ QSA_ATTN_SPLIT_STAGE ++ QSA_ATTN_SPLIT_Q_KTILE ++ QSA_ATTN_SPLIT_SCORE ++
+    QSA_ATTN_SPLIT_Q_VTILE ++ QSA_ATTN_SPLIT_TAIL;
+/// msv_attn_qsa256_dsplit: the same split pass over a dense bf16 cache (`--kv-quant off`).
+const QSA_ATTN_D_SOURCE = QSA_ATTN_SPLIT_HEAD ++ QSA_ATTN_SPLIT_D_DIMS ++ QSA_ATTN_SPLIT_RANGE ++
+    QSA_ATTN_SPLIT_D_BASES ++ QSA_ATTN_SPLIT_STAGE ++ QSA_ATTN_SPLIT_D_KTILE ++ QSA_ATTN_SPLIT_SCORE ++
+    QSA_ATTN_SPLIT_D_VTILE ++ QSA_ATTN_SPLIT_TAIL;
 
 /// msv_attn_qsa256_qmerge: the split-K reduction, one threadgroup per (q head, query row).
 /// Standard flash-decoding merge in the log2 domain; `l_j == 0` marks an empty split and is
@@ -5157,6 +5239,7 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaSelectSplitEnabled();
     _ = qsaSelectTg();
     _ = qsaAttnKernelEnabled();
+    _ = qsaAttnDenseEnabled();
     _ = qsaAttnNSplit();
     _ = qsaAttnMinS();
     _ = qsaAttnBk();
@@ -5184,12 +5267,59 @@ pub fn qsaAttnMinS() c_int {
     return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
 }
 
-/// Does the fused sparse-attention kernel serve this call? There is no fused dense arm:
-/// `--kv-quant off` used to fall into `gatherQsa256`, the prefill kernel, whose grid starves
-/// at a verify width (16k fp16: 77.7 vs 93.6 tok/s). Dense KV takes `qsaVerifyGatherAttn`.
+/// Does the fused sparse-attention kernel serve this call? `--kv-quant off` used to fall into
+/// `gatherQsa256`, the prefill kernel, whose grid starves at a verify width (16k fp16: 77.7 vs
+/// 93.6 tok/s). A dense cache now takes the split kernel's `_d` variant; with
+/// `MLX_SERVE_QSA_ATTN_DENSE=0` it declines to `qsaVerifyGatherAttn` (and, below that arm's
+/// floor, the dense mask).
 pub fn qsaSparseAttnServes(has_quant_triple: bool, seq_len: c_int, min_s: c_int) bool {
     if (seq_len < min_s or seq_len >= FUSED256_MIN_Q_LEN) return false;
-    return has_quant_triple;
+    return has_quant_triple or qsaAttnDenseEnabled();
+}
+
+/// Does a verify-width block want the indexer's block selection instead of the dense mask?
+/// On a dense cache the `_dsplit` kernel reads it at any kv. Otherwise only the union gather
+/// does, past its kv floor (fixed-size union). A quantized cache keeps that floor: `_qsplit`
+/// was swept at 62k, and below 16k its mask arm was never measured against it.
+pub fn qsaVerifyWantsBlocks(seq_len: c_int, kv: c_int, quantized: bool) bool {
+    if (seq_len < 2 or seq_len >= FUSED256_MIN_Q_LEN) return false;
+    if (!quantized and qsaAttnKernelEnabled() and qsaSparseAttnServes(false, seq_len, qsaAttnMinS())) return true;
+    return qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(quantized);
+}
+
+test "qsa verify blocks: a dense cache selects at any kv while its split kernel serves; quant keeps the floor" {
+    defer qsa_attn_dense_override = null;
+    defer qsa_attn_min_s_override = null;
+    qsa_attn_min_s_override = null;
+    qsa_attn_dense_override = true;
+    for ([_]c_int{ 2, 3, 7, FUSED256_MIN_Q_LEN - 1 }) |sq| {
+        try std.testing.expect(qsaVerifyWantsBlocks(sq, 9000, false));
+        try std.testing.expectEqual(qsaVerifyGatherEnabled() and 9000 > qsaVerifyGatherMinKvFor(true), qsaVerifyWantsBlocks(sq, 9000, true));
+    }
+    try std.testing.expect(!qsaVerifyWantsBlocks(1, 9000, false));
+    try std.testing.expect(!qsaVerifyWantsBlocks(FUSED256_MIN_Q_LEN, 9000, false));
+    // Off (or below its width floor): back to the union gather's floor.
+    qsa_attn_dense_override = false;
+    try std.testing.expectEqual(qsaVerifyGatherEnabled() and 9000 > qsaVerifyGatherMinKvFor(false), qsaVerifyWantsBlocks(3, 9000, false));
+    qsa_attn_dense_override = true;
+    qsa_attn_min_s_override = 6;
+    try std.testing.expectEqual(qsaVerifyGatherEnabled() and 9000 > qsaVerifyGatherMinKvFor(false), qsaVerifyWantsBlocks(3, 9000, false));
+    try std.testing.expect(qsaVerifyWantsBlocks(6, 9000, false));
+}
+
+pub var qsa_attn_dense_override: ?bool = null;
+var qsa_attn_dense_env: ?bool = null;
+
+/// The split kernel over a dense bf16 cache (default on). `MLX_SERVE_QSA_ATTN_DENSE=0`.
+pub fn qsaAttnDenseEnabled() bool {
+    if (qsa_attn_dense_override) |v| return v;
+    if (qsa_attn_dense_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_ATTN_DENSE") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_attn_dense_env = v;
+    return v;
 }
 
 var qsa_attn_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -5265,6 +5395,30 @@ fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
     );
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     qsa_attn_q_kernel_cached = kernel;
+    return kernel;
+}
+
+var qsa_attn_d_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQsaAttnDKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_attn_d_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "q", "scl", "blocks", "k", "v" };
+    const output_names = [_][*:0]const u8{ "pacc", "pml" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_attn_qsa256_dsplit",
+        in_vec,
+        out_vec,
+        QSA_ATTN_D_SOURCE,
+        ATTN_QSA256_KERNEL_HEADER,
+        false, // K/V are cache views, as for msv_attn_qsa256
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_attn_d_kernel_cached = kernel;
     return kernel;
 }
 
@@ -5364,9 +5518,61 @@ pub fn qsaAttnCfgBuilds() usize {
 }
 var qsa_attn_engaged_bits: OneShotBits = .{};
 
+const QsaSparseAttnGeom = struct { h_kv: c_int, kv: c_int };
+
+/// The packed triples `msv_attn_qsa256_qsplit` reads: `[1, h_kv, kv, 256 / (32 / bits)]` words
+/// plus `[1, h_kv, kv, 256 / gs]` scales and biases, innermost axes unit-stride.
+fn qsaSparseAttnQuantGeom(kv_view: *const DenseKVView, seq_len: c_int) ?QsaSparseAttnGeom {
+    if (kv_view.bits != 4 and kv_view.bits != 8) return null;
+    if (kv_view.group_size == 0 or @rem(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size))) != 0) return null;
+    // One quant group per 8-dim staging chunk.
+    if (kv_view.group_size % 8 != 0) return null;
+    // `has_quant_triple` promises all six handles; a null ctx would fault, so check.
+    const arrs = [_]mlx.mlx_array{
+        kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases,
+        kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases,
+    };
+    for (arrs) |a| if (a.ctx == null) return null;
+    if (mlx.mlx_array_ndim(kv_view.k_triple_q) != 4 or mlx.mlx_array_ndim(kv_view.v_triple_q) != 4) return null;
+    const ks = mlx.getShape(kv_view.k_triple_q);
+    const vs = mlx.getShape(kv_view.v_triple_q);
+    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, kv_view.bits));
+    if (ks.len != 4 or vs.len != 4 or ks[0] != 1 or vs[0] != 1) return null;
+    if (ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
+    const h_kv = ks[1];
+    const kv = ks[2];
+    if (h_kv <= 0 or kv < seq_len or vs[1] != h_kv or vs[2] != kv) return null;
+    const groups: c_int = @divExact(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size)));
+    const ksc_sh = mlx.getShape(kv_view.k_triple_scales);
+    const vsc_sh = mlx.getShape(kv_view.v_triple_scales);
+    if (ksc_sh.len != 4 or vsc_sh.len != 4 or ksc_sh[3] != groups or vsc_sh[3] != groups) return null;
+    if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
+    for (arrs) |a| if (mlx.mlx_array_strides(a)[3] != 1) return null;
+    return .{ .h_kv = h_kv, .kv = kv };
+}
+
+/// The bf16 cache view `msv_attn_qsa256_dsplit` reads: `[1, h_kv, kv, 256]`, rows read as
+/// 16-byte words, so the head and row strides must keep them aligned.
+fn qsaSparseAttnDenseGeom(kv_view: *const DenseKVView, seq_len: c_int) ?QsaSparseAttnGeom {
+    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
+    if (mlx.mlx_array_ndim(kv_view.k) != 4 or mlx.mlx_array_ndim(kv_view.v) != 4) return null;
+    if (mlx.mlx_array_dtype(kv_view.k) != .bfloat16 or mlx.mlx_array_dtype(kv_view.v) != .bfloat16) return null;
+    const ks = mlx.getShape(kv_view.k);
+    const vs = mlx.getShape(kv_view.v);
+    if (ks[0] != 1 or vs[0] != 1 or ks[3] != 256 or vs[3] != 256) return null;
+    const h_kv = ks[1];
+    const kv = ks[2];
+    if (h_kv <= 0 or kv < seq_len or vs[1] != h_kv or vs[2] != kv) return null;
+    for ([_]mlx.mlx_array{ kv_view.k, kv_view.v }) |a| {
+        const st = mlx.mlx_array_strides(a);
+        if (st[3] != 1 or @rem(st[2], 8) != 0 or @rem(st[1], 8) != 0) return null;
+    }
+    return .{ .h_kv = h_kv, .kv = kv };
+}
+
 /// One fused sparse-attention dispatch for a verify-width block: each row indexes its own
-/// selected blocks plus its own tail, reading the packed KV triples in-kernel. Null =
-/// declined. Quantized KV only (`qsaSparseAttnServes`).
+/// selected blocks plus its own tail, reading the packed KV triples (`_qsplit`) or the dense
+/// bf16 cache view (`_dsplit`) in-kernel. Null = declined.
 pub fn qsaSparseAttn(
     s: mlx.mlx_stream,
     q_rope: mlx.mlx_array, // [1, Hq, S, 256] bf16, post-RoPE
@@ -5381,7 +5587,7 @@ pub fn qsaSparseAttn(
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
     // Decode width keeps `qsaDecodeGatherAttn` (excluded by `qsaAttnMinS`, not a literal);
-    // prefill keeps `gatherQsa256`; a dense cache declines (`qsaSparseAttnServes`).
+    // prefill keeps `gatherQsa256`; `MLX_SERVE_QSA_ATTN_DENSE=0` declines a dense cache.
     if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, qsaAttnMinS())) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
@@ -5392,47 +5598,20 @@ pub fn qsaSparseAttn(
     _ = bs[2];
     if (ratio <= 0) return null;
 
-    if (kv_view.bits != 4 and kv_view.bits != 8) return null;
-    if (kv_view.group_size == 0 or @rem(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size))) != 0) return null;
-    // One quant group per 8-dim staging chunk.
-    if (kv_view.group_size % 8 != 0) return null;
-    // `has_quant_triple` promises all six handles; a null ctx would fault, so check.
-    if (kv_view.k_triple_q.ctx == null or kv_view.k_triple_scales.ctx == null or kv_view.k_triple_biases.ctx == null or
-        kv_view.v_triple_q.ctx == null or kv_view.v_triple_scales.ctx == null or kv_view.v_triple_biases.ctx == null) return null;
-    if (mlx.mlx_array_ndim(kv_view.k_triple_q) != 4 or mlx.mlx_array_ndim(kv_view.v_triple_q) != 4) return null;
-    const ks = mlx.getShape(kv_view.k_triple_q);
-    const vs = mlx.getShape(kv_view.v_triple_q);
-    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, kv_view.bits));
-    if (ks.len != 4 or vs.len != 4 or ks[0] != 1 or vs[0] != 1) return null;
-    if (ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
-    const h_kv = ks[1];
-    const kv = ks[2];
-    if (h_kv <= 0 or kv < seq_len or vs[1] != h_kv or vs[2] != kv) return null;
+    const dense = !kv_view.has_quant_triple;
+    const geom = (if (dense) qsaSparseAttnDenseGeom(kv_view, seq_len) else qsaSparseAttnQuantGeom(kv_view, seq_len)) orelse return null;
+    const h_kv = geom.h_kv;
+    const kv = geom.kv;
     if (@rem(qs[1], h_kv) != 0) return null;
     const gqa = @divExact(qs[1], h_kv);
     if (gqa <= 0 or gqa > 64) return null;
-    const groups: c_int = @divExact(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size)));
-    const ksc_sh = mlx.getShape(kv_view.k_triple_scales);
-    const vsc_sh = mlx.getShape(kv_view.v_triple_scales);
-    if (ksc_sh.len != 4 or vsc_sh.len != 4 or ksc_sh[3] != groups or vsc_sh[3] != groups) return null;
-    if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
 
-    // `ensure_row_contiguous = false` (the packed triples are cache views), so the kernel
-    // indexes every innermost axis with unit stride; decline anything else.
-    const innermost_unit = blk: {
-        if (mlx.mlx_array_strides(q_rope)[3] != 1) break :blk false;
-        if (mlx.mlx_array_strides(blocks)[2] != 1) break :blk false;
-        for ([_]mlx.mlx_array{
-            kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases,
-            kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases,
-        }) |a| {
-            if (mlx.mlx_array_strides(a)[3] != 1) break :blk false;
-        }
-        break :blk true;
-    };
-    if (!innermost_unit) return null;
+    // `ensure_row_contiguous = false` (the cache arrays are views), so the kernel indexes every
+    // innermost axis with unit stride; decline anything else.
+    if (mlx.mlx_array_strides(q_rope)[3] != 1) return null;
+    if (mlx.mlx_array_strides(blocks)[2] != 1) return null;
 
-    const kernel = getQsaAttnQKernel() catch return null;
+    const kernel = (if (dense) getQsaAttnDKernel() else getQsaAttnQKernel()) catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
     const nsg: c_int = @divTrunc(gqa + 7, 8);
     const nsplit = qsaAttnNSplit();
@@ -5446,8 +5625,9 @@ pub fn qsaSparseAttn(
     const key = QsaAttnCfgKey{
         .q_shape = ShapeKey.from(qs),
         .h_kv = h_kv,
-        .bits = kv_view.bits,
-        .gs = kv_view.group_size,
+        // 0/0 keys the dense variant (its config has no BITS/GS).
+        .bits = if (dense) 0 else kv_view.bits,
+        .gs = if (dense) 0 else kv_view.group_size,
         .nsg = nsg,
         .nsplit = nsplit,
         .bk = bk,
@@ -5469,8 +5649,10 @@ pub fn qsaSparseAttn(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", bk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(kv_view.bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kv_view.group_size)));
+        if (!dense) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(kv_view.bits)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kv_view.group_size)));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSPLIT", nsplit));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", if (balanced) 1 else 0));
 
@@ -5487,7 +5669,7 @@ pub fn qsaSparseAttn(
         break :blk .{ config, mconfig };
     };
 
-    const inputs_arr = [_]mlx.mlx_array{
+    const quant_in = [_]mlx.mlx_array{
         q_rope,
         scl,
         blocks,
@@ -5498,7 +5680,9 @@ pub fn qsaSparseAttn(
         kv_view.v_triple_scales,
         kv_view.v_triple_biases,
     };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    const dense_in = [_]mlx.mlx_array{ q_rope, scl, blocks, kv_view.k, kv_view.v };
+    const inputs: []const mlx.mlx_array = if (dense) &dense_in else &quant_in;
+    const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var parts_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts_vec);
@@ -5521,10 +5705,17 @@ pub fn qsaSparseAttn(
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len))) {
-        log.info(
-            "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
-            .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, bk, nsplit, seq_len * h_kv * nsplit },
-        );
+        if (dense) {
+            log.info(
+                "[qsa-attn] engaged (S={d} kv={d} dense bf16 gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_DENSE=0 restores the union gather / dense mask\n",
+                .{ seq_len, kv, gqa, bk, nsplit, seq_len * h_kv * nsplit },
+            );
+        } else {
+            log.info(
+                "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
+                .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, bk, nsplit, seq_len * h_kv * nsplit },
+            );
+        }
     }
     return out;
 }
@@ -22017,12 +22208,10 @@ pub const Transformer = struct {
         // own history; `qsaMaskBatched` expands per-slot selections back to
         // masks because the stacked path has no per-slot gather.
         // Verify widths (2 .. FUSED256_MIN_Q_LEN-1, an MTP/DFlash block) take
-        // the selection too: `qsaVerifyGatherAttn` reads the UNION of the
-        // rows' selections instead of the whole cache. Its own kv floor is
-        // higher than the prefill/decode one — the union is fixed-size.
+        // the selection too when an arm reads it (`qsaVerifyWantsBlocks`).
         const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
-                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(ctx.cache.config.scheme == .affine)));
+                qsaVerifyWantsBlocks(seq_len, kv, ctx.cache.config.scheme == .affine));
         if (want_blocks) {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same
@@ -52468,6 +52657,11 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
 
 test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 matches per-slot solos" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const soloVerify = struct {
+        fn f(dense_on: bool, st: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, blk: mlx.mlx_array, r: c_int, sc: f32) !?mlx.mlx_array {
+            return if (dense_on) qsaSparseAttn(st, q, view, blk, r, sc) else qsaVerifyGatherAttn(st, q, view, blk, r, sc);
+        }
+    }.f;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     qsa_verify_gather_override = true;
@@ -52486,7 +52680,10 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
     const scale: f32 = 1.0 / 16.0;
     const kL0: c_int = 96;
     const kL1: c_int = 80;
-    for ([_]c_int{ 2, 4 }) |seq| {
+    // Dense on: each slot takes the `_dsplit` kernel, as a solo verify does; off: the union gather.
+    defer qsa_attn_dense_override = null;
+    for ([_]bool{ false, true }) |dense_on| for ([_]c_int{ 2, 4 }) |seq| {
+        qsa_attn_dense_override = dense_on;
         const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, seq, hd }, s);
         defer _ = mlx.mlx_array_free(q0);
         const q1 = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, seq, hd }, s);
@@ -52505,7 +52702,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         defer fx1.deinit();
         const view0 = DenseKVView{ .k = k0, .v = v0, .owned = false };
         const view1 = DenseKVView{ .k = k1, .v = v1, .owned = false };
-        const solo0 = (try qsaVerifyGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
+        const solo0 = (try soloVerify(dense_on, s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(solo0);
         const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale, &.{});
         defer _ = mlx.mlx_array_free(bat1);
@@ -52521,7 +52718,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
         const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale, &.{});
         defer _ = mlx.mlx_array_free(bat2);
-        const solo1 = (try qsaVerifyGatherAttn(s, q1, &view1, fx1.blocks, ratio, scale)) orelse return error.GatherDeclined;
+        const solo1 = (try soloVerify(dense_on, s, q1, &view1, fx1.blocks, ratio, scale)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(solo1);
         var want = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want);
@@ -52530,7 +52727,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         defer _ = mlx.mlx_vector_array_free(wvec);
         try mlx.check(mlx.mlx_concatenate_axis(&want, wvec, 0, s));
         try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat2, want, s));
-    }
+    };
 }
 
 test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
@@ -53063,7 +53260,7 @@ fn qsaAttnCacheFixture(
     return try cache.update(0, k1, v1, s, 0);
 }
 
-test "qsa sparse attn: one fused dispatch equals the union gather at verify widths (affine-8 strided cache; dense declines)" {
+test "qsa sparse attn: one fused dispatch equals the union gather at verify widths (affine-8 and dense strided caches)" {
     // The bar is two bf16 ulps at the reference's own scale (an ulp is relative, so a constant
     // bar only works at one output scale), plus cosine against a wrong key set.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -53114,11 +53311,35 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
         defer _ = mlx.mlx_array_free(mask);
         const scale: f32 = 1.0 / 16.0;
 
-        // Dense arm: `qsaSparseAttn` declines a dense cache, so the parity bar is `qsaVerifyGatherAttn`.
+        // Dense arm: `MLX_SERVE_QSA_ATTN_DENSE=0` declines a dense cache to `qsaVerifyGatherAttn`.
         var dview = DenseKVView{ .k = k_dense, .v = v_dense, .owned = false };
-        try std.testing.expect((try qsaSparseAttn(s, q, &dview, blocks, ratio, scale)) == null);
+        qsa_attn_dense_override = false;
+        const declined = try qsaSparseAttn(s, q, &dview, blocks, ratio, scale);
+        qsa_attn_dense_override = null;
+        try std.testing.expect(declined == null);
         const ref_d = try attn256Reference(q, k_dense, v_dense, scale, "array", mask, s);
         defer _ = mlx.mlx_array_free(ref_d);
+        {
+            // The `_dsplit` variant, on a whole array and on a strided dense cache view.
+            const got_dk = (try qsaSparseAttn(s, q, &dview, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
+            defer _ = mlx.mlx_array_free(got_dk);
+            var dcache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.dense);
+            defer dcache.deinit();
+            var sview = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.dense, &dcache);
+            defer sview.deinit();
+            try std.testing.expect(!sview.has_quant_triple);
+            try std.testing.expectEqual(c.kv, mlx.getShape(sview.k)[2]);
+            const got_ds = (try qsaSparseAttn(s, q, &sview, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
+            defer _ = mlx.mlx_array_free(got_ds);
+            const d_bar = try attn256UlpBar(ref_d, s);
+            for ([_]mlx.mlx_array{ got_dk, got_ds }, [_][]const u8{ "whole", "strided" }) |got, what| {
+                const dd = try attn256MaxDiff(got, ref_d, s);
+                const dc = try attn256Cosine(got, ref_d, s);
+                std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} dense {s}: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), what, dd, dc, d_bar });
+                try std.testing.expect(dc > 0.99999);
+                try std.testing.expect(dd <= d_bar);
+            }
+        }
         if (try qsaVerifyGatherAttn(s, q, &dview, blocks, ratio, scale)) |got_d| {
             defer _ = mlx.mlx_array_free(got_d);
             const dd = try attn256MaxDiff(got_d, ref_d, s);
@@ -53288,21 +53509,25 @@ test "qsa dispatch: each arm's width floor is its own (MIN_S never moves the uni
     for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(true, sq, off));
 }
 
-test "qsa dispatch: a DENSE KV cache at a verify width takes the union gather, never the prefill kernel" {
+test "qsa dispatch: a DENSE KV cache at a verify width takes the split kernel (or the union gather), never the prefill kernel" {
     // `--kv-quant off` at 16k decoded 77.7 tok/s against 93.6 at the same acceptance: on a
     // dense cache `qsaSparseAttn`'s arm was `gatherQsa256`, the prefill kernel (8 threadgroups
     // at S=4). Hermetic: the arm choice is a pure predicate.
+    defer qsa_attn_dense_override = null;
     const min_s = QSA_ATTN_MIN_S_DEFAULT;
-    for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |sq| {
-        try std.testing.expect(qsaSparseAttnServes(true, sq, min_s));
-        try std.testing.expect(!qsaSparseAttnServes(false, sq, min_s));
+    for ([_]bool{ true, false }) |dense_on| {
+        qsa_attn_dense_override = dense_on;
+        for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |sq| {
+            try std.testing.expect(qsaSparseAttnServes(true, sq, min_s));
+            try std.testing.expectEqual(dense_on, qsaSparseAttnServes(false, sq, min_s));
+        }
+        try std.testing.expect(!qsaSparseAttnServes(true, 1, min_s));
+        try std.testing.expect(!qsaSparseAttnServes(true, FUSED256_MIN_Q_LEN, min_s));
+        try std.testing.expect(!qsaSparseAttnServes(false, 1, min_s));
+        try std.testing.expect(!qsaSparseAttnServes(false, FUSED256_MIN_Q_LEN, min_s));
+        try std.testing.expect(qsaSparseAttnServes(true, 1, 1));
+        try std.testing.expectEqual(dense_on, qsaSparseAttnServes(false, 1, 1));
     }
-    try std.testing.expect(!qsaSparseAttnServes(true, 1, min_s));
-    try std.testing.expect(!qsaSparseAttnServes(true, FUSED256_MIN_Q_LEN, min_s));
-    try std.testing.expect(!qsaSparseAttnServes(false, 1, min_s));
-    try std.testing.expect(!qsaSparseAttnServes(false, FUSED256_MIN_Q_LEN, min_s));
-    try std.testing.expect(qsaSparseAttnServes(true, 1, 1));
-    try std.testing.expect(!qsaSparseAttnServes(false, 1, 1));
 }
 
 test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q heads equals 12 serving one each" {
@@ -53471,10 +53696,22 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
             defer qsa_attn_kernel_override = null;
             try std.testing.expect((try qsaSparseAttn(s, q6, &dv, bl6, ratio, 1.0)) == null);
         }
-        // The same width on a dense cache declines with the kernel fully enabled.
+        // The same width on a dense cache takes the `_dsplit` variant; its own switch and the
+        // master switch each decline it.
         var dense_view = DenseKVView{ .k = kd, .v = vd, .owned = false };
         try std.testing.expect(!dense_view.has_quant_triple);
-        try std.testing.expect((try qsaSparseAttn(s, q6, &dense_view, bl6, ratio, 1.0)) == null);
+        const okd = (try qsaSparseAttn(s, q6, &dense_view, bl6, ratio, 1.0)) orelse return error.SparseAttnDeclined;
+        _ = mlx.mlx_array_free(okd);
+        {
+            qsa_attn_dense_override = false;
+            defer qsa_attn_dense_override = null;
+            try std.testing.expect((try qsaSparseAttn(s, q6, &dense_view, bl6, ratio, 1.0)) == null);
+        }
+        {
+            qsa_attn_kernel_override = false;
+            defer qsa_attn_kernel_override = null;
+            try std.testing.expect((try qsaSparseAttn(s, q6, &dense_view, bl6, ratio, 1.0)) == null);
+        }
     }
     // A dense cache past the verify floor (16384): `qsaVerifyGatherAttn` serves.
     {
@@ -53490,6 +53727,9 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
         const bl4 = mlx.mlx_array_new_data(b4.ptr, &[_]c_int{ 1, 4, 128 }, 3, .int32);
         defer _ = mlx.mlx_array_free(bl4);
         var big_dense = DenseKVView{ .k = kbig, .v = vbig, .owned = false };
+        // With the `_dsplit` variant off.
+        qsa_attn_dense_override = false;
+        defer qsa_attn_dense_override = null;
         try std.testing.expect((try qsaSparseAttn(s, q4, &big_dense, bl4, ratio, 1.0)) == null);
         const via_gather = (try qsaVerifyGatherAttn(s, q4, &big_dense, bl4, ratio, 1.0)) orelse return error.VerifyGatherDeclined;
         _ = mlx.mlx_array_free(via_gather);
@@ -53571,10 +53811,18 @@ test "qsa verify gather: the S=2..15 branch is reachable from the selection arm"
     const at = std.mem.indexOf(u8, src, want_mark) orelse return error.MissingWantBlocks;
     const stmt_end = std.mem.indexOfPos(u8, src, at, ";") orelse src.len;
     const stmt = src[at..stmt_end];
+    // The verify term lives in `qsaVerifyWantsBlocks`: the statement calls it, and its body
+    // keeps the union gather's switch and floor.
+    const helper_call = "qsaVerify" ++ "WantsBlocks(";
+    if (std.mem.indexOf(u8, stmt, helper_call) == null) return error.SelectionArmMissesVerifyWidths;
+    const helper_mark = "pub fn qsaVerify" ++ "WantsBlocks(";
+    const hat = std.mem.indexOf(u8, src, helper_mark) orelse return error.SelectionArmMissesVerifyWidths;
+    const hend = std.mem.indexOfPos(u8, src, hat, "\n}\n") orelse src.len;
+    const helper = src[hat..hend];
     const verify_gate = "qsaVerify" ++ "GatherEnabled()";
     const verify_min = "qsaVerify" ++ "GatherMinKvFor(";
-    if (std.mem.indexOf(u8, stmt, verify_gate) == null) return error.SelectionArmMissesVerifyWidths;
-    if (std.mem.indexOf(u8, stmt, verify_min) == null) return error.SelectionArmMissesVerifyFloor;
+    if (std.mem.indexOf(u8, helper, verify_gate) == null) return error.SelectionArmMissesVerifyWidths;
+    if (std.mem.indexOf(u8, helper, verify_min) == null) return error.SelectionArmMissesVerifyFloor;
 
     const disp_mark = "fn gated" ++ "FullAttnWith(";
     const dat = std.mem.indexOf(u8, src, disp_mark) orelse return error.MissingDispatch;
