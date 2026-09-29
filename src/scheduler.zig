@@ -8318,6 +8318,19 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         probe = false;
         recovering = false;
     }
+    // --mtp-solo: with company every row goes plain, with no verify, probe or calibration
+    // rounds (55-93 ms per 2-3 row round against ~25-30 ms for a plain tick measured on
+    // qwen4). Width-0 rows skip the hidden capture and mark it stale; once a slot decodes
+    // alone again, one prime tick recaptures it and drafting resumes.
+    if (active.len > 1 and mtpSoloEnabled()) {
+        for (decision.widths[0..active.len]) |*w| w.* = 0;
+        probe = false;
+        recovering = false;
+        if (!mtp_solo_logged) {
+            mtp_solo_logged = true;
+            log.info("[mtp] --mtp-solo: {d} slots share the decode, the planner runs them plain (drafting resumes when a slot decodes alone)\n", .{active.len});
+        }
+    }
     var stale: [Planner.MAX_ROWS]bool = undefined;
     for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;
     const execution = Planner.execution(decision.widths[0..active.len], stale[0..active.len]);
