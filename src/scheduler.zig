@@ -4003,6 +4003,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             ctx.skip_lm_head = false;
             log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
             xfm_ptr.diagProjBench(20, &ctx);
+            if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_B")) |rb| {
+                const nb = std.fmt.parseInt(usize, std.mem.sliceTo(rb, 0), 10) catch 0;
+                if (nb >= 1 and xfm_ptr.supportsBatchedGdnDecode()) {
+                    fwdUbenchSlots(sch.allocator, xfm_ptr, nb, n, @max(kv_pre, 64)) catch |e|
+                        log.info("[fwd-ubench] slots={d} failed: {s}\n", .{ nb, @errorName(e) });
+                }
+            }
             log.info("[fwd-ubench] done\n", .{});
             xfm_ptr.resetCache() catch {};
         }
@@ -6937,6 +6944,120 @@ fn sumInflightGeneratedTokens(active: anytype) u64 {
         inflight += @as(u64, s.completion_tokens);
     }
     return inflight;
+}
+
+/// DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH_B=<slots>, next to MLX_SERVE_DECODE_FWD_UBENCH=N):
+/// the batched decode step the scheduler runs when <slots> agents decode together. Each slot
+/// gets its own KV cache and GDN/QSA state, prefilled with `pre_len` distinct tokens, then N
+/// `forwardMoeBatchedDecode` steps are timed like the single-slot meter (CPU graph build vs
+/// GPU eval). Slots, caches and the persistent group state are released afterwards.
+fn fwdUbenchSlots(allocator: std.mem.Allocator, xfm: *Transformer, nb: usize, n: usize, pre_len: usize) !void {
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const layers = xfm.config.num_hidden_layers;
+    const caches = try allocator.alloc(KVCache, nb);
+    defer allocator.free(caches);
+    const entries = try allocator.alloc([]SSMCacheEntry, nb);
+    defer allocator.free(entries);
+    const offs = try allocator.alloc(usize, nb);
+    defer allocator.free(offs);
+    const ctx_store = try allocator.alloc(ForwardCtx, nb);
+    defer allocator.free(ctx_store);
+    const ctxs = try allocator.alloc(*ForwardCtx, nb);
+    defer allocator.free(ctxs);
+    var made: usize = 0;
+    defer {
+        for (0..made) |i| {
+            xfm.ssmGroupDrop(entries[i]);
+            for (entries[i]) |*e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+                transformer_mod.ssmFreeQsaState(e);
+            }
+            allocator.free(entries[i]);
+            caches[i].deinit();
+        }
+    }
+    for (0..nb) |i| {
+        caches[i] = try KVCache.init(allocator, layers);
+        entries[i] = allocator.alloc(SSMCacheEntry, layers) catch |e| {
+            caches[i].deinit();
+            return e;
+        };
+        for (entries[i]) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        made += 1;
+        offs[i] = 0;
+        ctx_store[i] = .{ .cache = &caches[i], .moe_seq_offset = &offs[i], .ssm_entries = entries[i], .capture_hidden = null, .vision_embeddings = null };
+        ctxs[i] = &ctx_store[i];
+    }
+
+    // Prefill: distinct token streams per slot, so the slots route to different experts.
+    const buf = try allocator.alloc(i32, 2048);
+    defer allocator.free(buf);
+    for (0..nb) |i| {
+        var done: usize = 0;
+        while (done < pre_len) {
+            const c = @min(2048, pre_len - done);
+            for (buf[0..c], 0..) |*v, j| v.* = @intCast(1 + ((done + j) * 31 + i * 7919) % 50000);
+            const sh = [_]c_int{ 1, @intCast(c) };
+            const ti = mlx.mlx_array_new_data(buf.ptr, &sh, 2, .int32);
+            defer _ = mlx.mlx_array_free(ti);
+            const lg = try xfm.forwardWith(ctxs[i], ti);
+            _ = mlx.mlx_array_eval(lg);
+            _ = mlx.mlx_array_free(lg);
+            done += c;
+        }
+    }
+    if (!xfm.batchedGdnReady(ctxs)) {
+        log.info("[fwd-ubench] slots={d}: batchedGdnReady is false after prefill\n", .{nb});
+        return;
+    }
+
+    const toks = try allocator.alloc(u32, nb);
+    defer allocator.free(toks);
+    const ropes = try allocator.alloc(u32, nb);
+    defer allocator.free(ropes);
+    var build_ns: u64 = 0;
+    var eval_ns: u64 = 0;
+    var ops: u64 = 0;
+    var timed: usize = 0;
+    var sw_all = io_util.Stopwatch.init(tio);
+    for (0..3 + n) |step| {
+        if (step == 3) sw_all = io_util.Stopwatch.init(tio); // first 3 steps warm the batched kernels
+        for (0..nb) |i| {
+            toks[i] = @intCast(1 + (step * 131 + i * 7919) % 50000);
+            ropes[i] = @intCast(offs[i]);
+        }
+        const ops_before = mlx.op_count.load(.monotonic);
+        var swb = io_util.Stopwatch.init(tio);
+        const lgs = try xfm.forwardMoeBatchedDecode(toks, ctxs, ropes, null);
+        const b = swb.read();
+        const o = mlx.op_count.load(.monotonic) - ops_before;
+        var swe = io_util.Stopwatch.init(tio);
+        for (lgs) |a| _ = mlx.mlx_array_eval(a);
+        const e = swe.read();
+        for (lgs) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(lgs);
+        // The scheduler moves each slot's position after the batched forward.
+        for (offs) |*p| p.* += 1;
+        if (step >= 3) {
+            build_ns += b;
+            eval_ns += e;
+            ops += o;
+            timed += 1;
+        }
+    }
+    const dn: f64 = @floatFromInt(@max(timed, 1));
+    const ms = @as(f64, @floatFromInt(sw_all.read())) / 1.0e6 / dn;
+    log.info("[fwd-ubench] slots={d} kv={d}: {d} batched steps, {d:.3} ms/step (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/step) => {d:.3} ms per token\n", .{
+        nb,
+        pre_len,
+        timed,
+        ms,
+        @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
+        @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+        @as(f64, @floatFromInt(ops)) / dn,
+        ms / @as(f64, @floatFromInt(nb)),
+    });
 }
 
 fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {

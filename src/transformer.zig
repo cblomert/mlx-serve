@@ -22032,7 +22032,16 @@ pub const Transformer = struct {
             // Free before assign: a `defer` registered below a fallible call leaked a handle per tick.
             if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
             ctx.qsa_blocks = .{ .ctx = null };
-            ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, entry.qsa_pooled, offset, seq_len, nb, block_topk, fused);
+            if (seq_len == 1 and qwen4Standin().qsa_select) {
+                // Stand-in: the newest `kb` blocks, ascending, in place of scoring + top-k.
+                const kb: c_int = @min(nb, block_topk);
+                var ar = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(ar);
+                try mlx.check(mlx.mlx_arange(&ar, @floatFromInt(nb - kb), @floatFromInt(nb), 1.0, .int32, self.s));
+                var blk = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&blk, ar, &[_]c_int{ 1, 1, kb }, 3, self.s));
+                ctx.qsa_blocks = blk;
+            } else ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, entry.qsa_pooled, offset, seq_len, nb, block_topk, fused);
             if (ctx.qsa_blocks.ctx != null) {
                 const kb_dim: c_int = if (mlx.mlx_array_ndim(ctx.qsa_blocks) == 3) mlx.getShape(ctx.qsa_blocks)[2] else block_topk;
                 qsaDumpQsaBlocks(layer, offset, seq_len, kb_dim, ctx.qsa_blocks);
@@ -33424,10 +33433,11 @@ var decode_prof_enabled: ?bool = null;
 
 // Self-contained monotonic lap timer (this Zig nightly has no std.time.Timer;
 // the repo times via std.Io). `lap()` returns ns since the previous lap.
-/// QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa,hc,moe_shared,moe_router,moe_gateup,moe_down — replace a block
+/// QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa,hc,moe_shared,moe_router,moe_gateup,moe_down,qsa_select — replace a block
 /// with a free stand-in (a +1 ref of its input / a cached ones array) so the
-/// in-situ fwd-ubench reports what that block costs. Diagnostic only.
-pub const Standin = packed struct(u16) { gdn: bool = false, attn: bool = false, mlp: bool = false, gdn_recur: bool = false, gdn_proj: bool = false, attn_qsa: bool = false, attn_sdpa: bool = false, hc: bool = false, moe_shared: bool = false, moe_router: bool = false, moe_gateup: bool = false, moe_down: bool = false, _pad: u4 = 0 };
+/// in-situ fwd-ubench reports what that block costs. `qsa_select` keeps the decode
+/// gather but picks the newest blocks instead of scoring (index-query prep + score + top-k). Diagnostic only.
+pub const Standin = packed struct(u16) { gdn: bool = false, attn: bool = false, mlp: bool = false, gdn_recur: bool = false, gdn_proj: bool = false, attn_qsa: bool = false, attn_sdpa: bool = false, hc: bool = false, moe_shared: bool = false, moe_router: bool = false, moe_gateup: bool = false, moe_down: bool = false, qsa_select: bool = false, _pad: u3 = 0 };
 var standin_cached: ?Standin = null;
 pub var qwen4_standin_override: ?Standin = null;
 pub fn qwen4Standin() Standin {
@@ -33449,6 +33459,7 @@ pub fn qwen4Standin() Standin {
             if (std.mem.eql(u8, tok, "moe_router")) v.moe_router = true;
             if (std.mem.eql(u8, tok, "moe_gateup")) v.moe_gateup = true;
             if (std.mem.eql(u8, tok, "moe_down")) v.moe_down = true;
+            if (std.mem.eql(u8, tok, "qsa_select")) v.qsa_select = true;
         }
     }
     standin_cached = v;
