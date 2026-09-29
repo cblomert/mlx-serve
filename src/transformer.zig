@@ -36936,7 +36936,9 @@ const HC_FUSED_U3_SOURCE =
 
 const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
 var hc_fused_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
-var hc_fused_cfgs: [5]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+/// N, D, U, ND, U3, then D without its inject rows (N/D/U3); HC_CFG_KERNEL maps each to its kernel.
+var hc_fused_cfgs: [6]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+const HC_CFG_KERNEL = [6]usize{ 0, 1, 2, 3, 4, 1 };
 /// Output rows per ND row threadgroup (they share one on-the-fly normalization):
 /// 2 measured fastest of 1/2/4 at hc 4 x hidden 2560, lowrank 320.
 const HC_ND_RPT: c_int = 2;
@@ -36944,10 +36946,31 @@ var hc_fused_key: HcFusedKey = std.mem.zeroes(HcFusedKey);
 var hc_fused_eps: ?mlx.mlx_array = null;
 var hc_fused_eps_val: f32 = 0;
 var hc_fused_engaged = false;
+var hc_ndu3_engaged = false;
 var hc_fused_env: ?bool = null;
 pub var hc_fused_override: ?bool = null;
 var hc_nd_env: ?bool = null;
 pub var hc_nd_override: ?bool = null;
+var hc_ndu3_env: ?bool = null;
+pub var hc_ndu3_override: ?bool = null;
+
+/// Verify widths read N -> D -> U3 instead of ND -> U3: ND's row threadgroups each recompute the
+/// stream stats and xn, work that grows with rows while the dispatch it saves does not. N/D/U3
+/// reads them once and keeps U3's up-front loads. Standalone (tools/hc_path.py, 97 chained sites,
+/// us per site, ND+U3 -> N/D/U3): rows 1 29.5 -> 34.0, rows 2 42.1 -> 41.4, rows 3 53.5 -> 48.9,
+/// rows 4 63.9 -> 55.6, rows 7 94.1 -> 77.9. Qwen3.8 fwd-ubench GPU ms: S=3 16k 24.75 -> 24.39,
+/// 64k 25.40 -> 24.77; S=2 16k 20.95 -> 20.99, and the extra dispatch per site costs graph-build
+/// CPU, so 2 rows stay on ND+U3. Bit-identical outputs.
+const HC_NDU3_MIN_ROWS: c_int = 3;
+
+fn hcNdu3Enabled() bool {
+    if (hc_ndu3_override) |v| return v;
+    if (hc_ndu3_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_HC_NDU3");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    hc_ndu3_env = enabled;
+    return enabled;
+}
 
 fn hcFusedEnabled() bool {
     if (hc_fused_override) |v| return v;
@@ -37346,6 +37369,19 @@ pub fn hcReadFused(
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "R", R));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "INJ", inj));
             hc_fused_cfgs[4] = cu3;
+            // N/D/U3's D: the row threadgroups only (U3 reduces the inject gates).
+            const cd3 = mlx.mlx_fast_metal_kernel_config_new();
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd3, &act_shape, 1, xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd3, &hc_shape, 1, xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cd3, 256, R, rows));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cd3, 256, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cd3, "T", xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd3, "GS", gsi));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd3, "BITS", @intCast(bits)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd3, "HC", hc));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd3, "H", hidden));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd3, "R", R));
+            hc_fused_cfgs[5] = cd3;
         }
         hc_fused_key = key;
     }
@@ -37363,7 +37399,7 @@ pub fn hcReadFused(
             defer _ = mlx.mlx_vector_array_free(vec);
             var res = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(res);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(which), vec, hc_fused_cfgs[which].?, st));
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(HC_CFG_KERNEL[which]), vec, hc_fused_cfgs[which].?, st));
             if (mlx.mlx_vector_array_size(res) != n_out) return error.MetalKernelBadOutputCount;
             var got: usize = 0;
             errdefer {
@@ -37379,8 +37415,11 @@ pub fn hcReadFused(
 
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
-    const two_kernel = hcNdEnabled() and hc_fused_cfgs[3] != null;
+    const nd_ready = hcNdEnabled() and hc_fused_cfgs[3] != null;
+    const n_d_u3 = nd_ready and rows >= HC_NDU3_MIN_ROWS and hcNdu3Enabled();
+    const two_kernel = nd_ready and !n_d_u3;
     // ND+U3: [act, xn, xs, ipart] then [mixed, inj]. N/D/U: [xn, ipart, xs], [act, inj], [mixed].
+    // N/D/U3: N's [xn, ipart, xs], D's [act, (unwritten inj)], then U3's [mixed, inj].
     var first: [4]mlx.mlx_array = undefined;
     if (two_kernel) {
         try apply(s, 3, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi, dw, ds, db }, 4, &first);
@@ -37418,6 +37457,16 @@ pub fn hcReadFused(
         try apply(s, 4, &.{ xn, nd_act, uw, us, ub, ipart }, 2, &u_out);
         mixed_flat = u_out[0];
         inj_flat = u_out[1];
+    } else if (n_d_u3) {
+        var d_out: [2]mlx.mlx_array = undefined;
+        try apply(s, 5, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
+        const act = d_out[0];
+        defer _ = mlx.mlx_array_free(act);
+        _ = mlx.mlx_array_free(d_out[1]);
+        var u_out: [2]mlx.mlx_array = undefined;
+        try apply(s, 4, &.{ xn, act, uw, us, ub, ipart }, 2, &u_out);
+        mixed_flat = u_out[0];
+        inj_flat = u_out[1];
     } else {
         var d_out: [2]mlx.mlx_array = undefined;
         try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
@@ -37445,6 +37494,10 @@ pub fn hcReadFused(
     if (!hc_fused_engaged) {
         hc_fused_engaged = true;
         log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d}, {s} (MLX_SERVE_HC_ND=0 restores N/D/U; MLX_SERVE_HC_FUSED=0 the chain)\n", .{ hc, hidden, R, bits, group_size, if (two_kernel) "2 kernels (ND+U3)" else "3 kernels" });
+    }
+    if (n_d_u3 and !hc_ndu3_engaged) {
+        hc_ndu3_engaged = true;
+        log.info("[qwen4] hyper-connection read at {d} rows: N/D/U3 (MLX_SERVE_HC_NDU3=0 keeps ND+U3)\n", .{rows});
     }
     return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
 }
@@ -44017,9 +44070,9 @@ test "fused residual+RMSNorm declines what it cannot reproduce" {
     try testing.expect((try fusedAddRmsNorm(s, a, small, w, eps)) == null);
 }
 
-test "fused hyper-connection read: two-kernel ND+U3 is bit-identical to N/D/U" {
+test "fused hyper-connection read: ND+U3 and the verify-width N/D/U3 are bit-identical to N/D/U" {
     // Same rounding sites, lane mappings and accumulation orders by construction,
-    // so every output element must match exactly: 4/8-bit, 1 and 3 rows, with and
+    // so every output element must match exactly: 4/8-bit, 1-4 rows, with and
     // without a pending write, inject and mixer (no inject) sites.
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -44028,6 +44081,7 @@ test "fused hyper-connection read: two-kernel ND+U3 is bit-identical to N/D/U" {
     hc_fused_override = true;
     defer hc_fused_override = null;
     defer hc_nd_override = null;
+    defer hc_ndu3_override = null;
 
     const HC: c_int = 4;
     const H: c_int = 512;
@@ -44080,7 +44134,7 @@ test "fused hyper-connection read: two-kernel ND+U3 is bit-identical to N/D/U" {
             try testReadF32(got, gh, st);
             var bad: usize = 0;
             for (wh, gh) |w, g| bad += @intFromBool(@as(u32, @bitCast(w)) != @as(u32, @bitCast(g)));
-            if (bad != 0) std.debug.print("hc ND+U3 vs N/D/U: {d}/{d} elements differ\n", .{ bad, n });
+            if (bad != 0) std.debug.print("hc ND+U3 or N/D/U3 vs N/D/U: {d}/{d} elements differ\n", .{ bad, n });
             try testing.expectEqual(@as(usize, 0), bad);
         }
     }.f;
@@ -44098,7 +44152,7 @@ test "fused hyper-connection read: two-kernel ND+U3 is bit-identical to N/D/U" {
         defer inline for (.{ "w", "sc", "bi" }) |f| {
             _ = mlx.mlx_array_free(@field(up, f));
         };
-        for ([_]c_int{ 1, 3 }) |rows| {
+        for ([_]c_int{ 1, 2, 3, 4 }) |rows| {
             const x = try bf16Random(allocator, rnd, s, &.{ rows, 1, K }, 4.0, 0.0);
             defer _ = mlx.mlx_array_free(x);
             const wo = try bf16Random(allocator, rnd, s, &.{ rows, 1, H }, 2.0, 0.0);
@@ -44108,19 +44162,25 @@ test "fused hyper-connection read: two-kernel ND+U3 is bit-identical to N/D/U" {
             for ([_]bool{ false, true }) |with_pend| for ([_]bool{ true, false }) |with_inj| {
                 const pend: ?HcPending = if (with_pend) .{ .out = wo, .inj = wi } else null;
                 const iw_arg: mlx.mlx_array = if (with_inj) iw else .{ .ctx = null };
-                var outs: [2]HcFusedOut = undefined;
-                for ([_]bool{ false, true }, 0..) |nd, i| {
-                    hc_nd_override = nd;
-                    outs[i] = (try hcReadFused(s, x, rows, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw_arg, eps, HC, H, bits, gs, pend)) orelse return error.HcFusedDeclined;
-                }
-                defer for (outs) |o| inline for (.{ "mixed", "inj", "stream" }) |f| {
+                // N/D/U, ND+U3, then N/D/U3 (rows >= HC_NDU3_MIN_ROWS; ND+U3 again below)
+                var outs: [3]HcFusedOut = undefined;
+                var made: usize = 0;
+                defer for (outs[0..made]) |o| inline for (.{ "mixed", "inj", "stream" }) |f| {
                     if (@field(o, f).ctx != null) _ = mlx.mlx_array_free(@field(o, f));
                 };
-                try expectSame(allocator, s, outs[0].mixed, outs[1].mixed);
-                try testing.expectEqual(outs[0].inj.ctx != null, outs[1].inj.ctx != null);
-                if (with_inj) try expectSame(allocator, s, outs[0].inj, outs[1].inj);
-                try testing.expectEqual(outs[0].stream.ctx != null, outs[1].stream.ctx != null);
-                if (with_pend) try expectSame(allocator, s, outs[0].stream, outs[1].stream);
+                for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ true, true } }) |path| {
+                    hc_nd_override = path[0];
+                    hc_ndu3_override = path[1];
+                    outs[made] = (try hcReadFused(s, x, rows, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw_arg, eps, HC, H, bits, gs, pend)) orelse return error.HcFusedDeclined;
+                    made += 1;
+                }
+                for (outs[1..]) |o| {
+                    try expectSame(allocator, s, outs[0].mixed, o.mixed);
+                    try testing.expectEqual(outs[0].inj.ctx != null, o.inj.ctx != null);
+                    if (with_inj) try expectSame(allocator, s, outs[0].inj, o.inj);
+                    try testing.expectEqual(outs[0].stream.ctx != null, o.stream.ctx != null);
+                    if (with_pend) try expectSame(allocator, s, outs[0].stream, o.stream);
+                }
             };
         }
     }
