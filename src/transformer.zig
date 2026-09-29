@@ -36453,15 +36453,230 @@ const HC_FUSED_U_SOURCE =
     \\if (lane == 0) mixed[j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
 ;
 
+// Two-kernel read (default; MLX_SERVE_HC_ND=0 restores N/D/U). ND folds N into
+// the down matvec: its first HC threadgroups do N's per-stream work (pending
+// write -> xs, xn for U, inject partials); every row threadgroup recomputes the
+// HC stream RMS stats in N's exact order and normalizes on the fly, then runs
+// D's dot for HC_ND_RPT rows with D's lane->word mapping. U3 is U with every
+// load issued up front plus D's inject-gate rows. Rounding sites, mappings and
+// accumulation orders are N/D/U's, so the outputs are bit-identical to the
+// three-kernel read. Measured standalone (97 chained sites, real shapes, 8-bit
+// g64): 34.4 -> 28.5 us per read site; one dispatch fewer per site.
+const HC_FUSED_ND_SOURCE =
+    \\uint tid = thread_index_in_threadgroup;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint n = threadgroup_position_in_grid.y;
+    \\uint row = threadgroup_position_in_grid.z;
+    \\threadgroup float tgs[HC * 8];
+    \\threadgroup float tgi[8 * HC];
+    \\threadgroup float part[8 * RPT];
+    \\const int K = HC * H;
+    \\const int PER = H / 256;
+    \\const device T* x = x_in + (size_t)row * (size_t)K;
+    \\const device T* wo = wo_in + (size_t)row * (size_t)H;
+    \\if (n >= uint(HC)) {
+    \\  uint nr = n - uint(HC);
+    \\  const int VPW = 32 / BITS;
+    \\  const int K_by_p = K / VPW;
+    \\  const int K_by_gs = K / GS;
+    \\  const int SLICE = K_by_p / 8;
+    \\  const int ITERS = SLICE / 32;
+    \\  uint mask = (1u << BITS) - 1u;
+    \\  int p0 = int(sg) * SLICE + int(lane);
+    \\  uint32_t pw[RPT][ITERS];
+    \\  for (int r = 0; r < RPT; ++r)
+    \\    for (int i = 0; i < ITERS; ++i) pw[r][i] = dw_q[(size_t)(int(nr) * RPT + r) * (size_t)K_by_p + (size_t)(p0 + 32 * i)];
+    \\  // N's stats, N's order: bit-identical rsh per stream.
+    \\  for (int h = 0; h < HC; ++h) {
+    \\    float g = WR ? float(wi_in[(size_t)row * (size_t)HC + h]) : 0.0f;
+    \\    float a = 0.0f;
+    \\    for (int i = 0; i < PER; ++i) {
+    \\      int k = h * H + int(tid) + 256 * i;
+    \\      float v = WR ? float(T(float(x[k]) + float(T(float(wo[k - h * H]) * g)))) : float(x[k]);
+    \\      a += v * v;
+    \\    }
+    \\    a = simd_sum(a);
+    \\    if (lane == 0) tgs[h * 8 + sg] = a;
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  float rsh[HC];
+    \\  for (int h = 0; h < HC; ++h) {
+    \\    float t = 0.0f;
+    \\    for (int g = 0; g < 8; ++g) t += tgs[h * 8 + g];
+    \\    rsh[h] = rsqrt(t / float(H) + eps[0]);
+    \\  }
+    \\  float a0[RPT], a1[RPT], a2[RPT], a3[RPT];
+    \\  for (int r = 0; r < RPT; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; a2[r] = 0.0f; a3[r] = 0.0f; }
+    \\  for (int i = 0; i < ITERS; ++i) {
+    \\    int k_base = (p0 + 32 * i) * VPW;
+    \\    int gi = k_base / GS;
+    \\    int h = k_base / H;
+    \\    float g = WR ? float(wi_in[(size_t)row * (size_t)HC + h]) : 0.0f;
+    \\    float sjr[RPT], bjr[RPT];
+    \\    for (int r = 0; r < RPT; ++r) {
+    \\      size_t gb = (size_t)(int(nr) * RPT + r) * (size_t)K_by_gs + (size_t)gi;
+    \\      sjr[r] = float(dw_s[gb]); bjr[r] = float(dw_b[gb]);
+    \\    }
+    \\    for (int ki = 0; ki < VPW; ki += 4) {
+    \\      int k = k_base + ki;
+    \\      float xn4[4];
+    \\      for (int e = 0; e < 4; ++e) {
+    \\        float xv = WR ? float(T(float(x[k + e]) + float(T(float(wo[k + e - h * H]) * g)))) : float(x[k + e]);
+    \\        xn4[e] = float(T(float(T(xv * rsh[h])) * float(nw[k + e])));
+    \\      }
+    \\      for (int r = 0; r < RPT; ++r) {
+    \\        uint32_t q = pw[r][i] >> (ki * BITS);
+    \\        a0[r] += xn4[0] * (float((q >> (0 * BITS)) & mask) * sjr[r] + bjr[r]);
+    \\        a1[r] += xn4[1] * (float((q >> (1 * BITS)) & mask) * sjr[r] + bjr[r]);
+    \\        a2[r] += xn4[2] * (float((q >> (2 * BITS)) & mask) * sjr[r] + bjr[r]);
+    \\        a3[r] += xn4[3] * (float((q >> (3 * BITS)) & mask) * sjr[r] + bjr[r]);
+    \\      }
+    \\    }
+    \\  }
+    \\  for (int r = 0; r < RPT; ++r) {
+    \\    float acc = simd_sum((a0[r] + a1[r]) + (a2[r] + a3[r]));
+    \\    if (lane == 0) part[r * 8 + sg] = acc;
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (tid < uint(RPT)) {
+    \\    float t = 0.0f;
+    \\    for (int g = 0; g < 8; ++g) t += part[tid * 8 + g];
+    \\    T v = T(t);
+    \\    T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
+    \\    act_out[(size_t)row * (size_t)R + (size_t)(int(nr) * RPT + int(tid))] = v * sig;
+    \\  }
+    \\} else {
+    \\  // Aux threadgroup = stock N for stream h (first in the grid: starts before the rows).
+    \\  uint h = n;
+    \\  const int base = int(h) * H;
+    \\  device T* xn = xn_out + (size_t)row * (size_t)K;
+    \\  device T* xs = xs_out + (WR ? (size_t)row * (size_t)K : 0);
+    \\  device float* ipart = ipart_out + (size_t)row * (size_t)(HC * HC);
+    \\  float xv[PER];
+    \\  if (WR) {
+    \\    float g = float(wi_in[(size_t)row * (size_t)HC + h]);
+    \\    for (int i = 0; i < PER; ++i) {
+    \\      int k = base + int(tid) + 256 * i;
+    \\      T v = T(float(x[k]) + float(T(float(wo[k - base]) * g)));
+    \\      xs[k] = v;
+    \\      xv[i] = float(v);
+    \\    }
+    \\  } else {
+    \\    for (int i = 0; i < PER; ++i) xv[i] = float(x[base + int(tid) + 256 * i]);
+    \\  }
+    \\  float a = 0.0f;
+    \\  for (int i = 0; i < PER; ++i) a += xv[i] * xv[i];
+    \\  a = simd_sum(a);
+    \\  if (lane == 0) tgs[sg] = a;
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  float t = 0.0f;
+    \\  for (int g = 0; g < 8; ++g) t += tgs[g];
+    \\  float rs = rsqrt(t / float(H) + eps[0]);
+    \\  float ip[HC];
+    \\  for (int c = 0; c < HC; ++c) ip[c] = 0.0f;
+    \\  for (int i = 0; i < PER; ++i) {
+    \\    int k = base + int(tid) + 256 * i;
+    \\    T v = T(float(T(xv[i] * rs)) * float(nw[k]));
+    \\    xn[k] = v;
+    \\    if (INJ) { for (int c = 0; c < HC; ++c) ip[c] += float(v) * float(iw[(size_t)k * (size_t)HC + (size_t)c]); }
+    \\  }
+    \\  if (INJ) {
+    \\    for (int c = 0; c < HC; ++c) { float pa = simd_sum(ip[c]); if (lane == 0) tgi[sg * HC + c] = pa; }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (tid < uint(HC)) {
+    \\      float tt = 0.0f;
+    \\      for (int g = 0; g < 8; ++g) tt += tgi[g * HC + tid];
+    \\      ipart[h * HC + tid] = tt;
+    \\    }
+    \\  }
+    \\}
+;
+
+const HC_FUSED_U3_SOURCE =
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint j = thread_position_in_grid.y;
+    \\uint row = thread_position_in_grid.z;
+    \\if (j >= uint(H)) {
+    \\  // Stock D's inject rows: gates from N's partials.
+    \\  if (INJ && j == uint(H) && lane < uint(HC)) {
+    \\    const device float* ipart = ipart_in + (size_t)row * (size_t)(HC * HC);
+    \\    int c = int(lane);
+    \\    float t = 0.0f;
+    \\    for (int hh = 0; hh < HC; ++hh) t += ipart[hh * HC + c];
+    \\    T v = T(t);
+    \\    T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
+    \\    inj_out[(size_t)row * (size_t)HC + (size_t)c] = sig * T(2.0f);
+    \\  }
+    \\  return;
+    \\}
+    \\
+    \\const device T* xn = xn_in + (size_t)row * (size_t)(HC * H);
+    \\const device T* act = act_in + (size_t)row * (size_t)R;
+    \\device T* mixed = mixed_out + (size_t)row * (size_t)H;
+    \\const int VPW = 32 / BITS;
+    \\const int R_by_p = R / VPW;
+    \\const int R_by_gs = R / GS;
+    \\const int RIT = (R_by_p + 31) / 32;
+    \\uint mask = (1u << BITS) - 1u;
+    \\uint32_t pw[HC][RIT];
+    \\float sj[HC][RIT], bj[HC][RIT];
+    \\float av[RIT][VPW];
+    \\float xm[HC];
+    \\for (int h = 0; h < HC; ++h) {
+    \\  size_t rw = (size_t)h * (size_t)H + (size_t)j;
+    \\  xm[h] = float(xn[rw]);
+    \\  for (int i = 0; i < RIT; ++i) {
+    \\    int pack = int(lane) + 32 * i;
+    \\    if (pack < R_by_p) {
+    \\      pw[h][i] = uw_q[rw * (size_t)R_by_p + (size_t)pack];
+    \\      int gi = (pack * VPW) / GS;
+    \\      sj[h][i] = float(uw_s[rw * (size_t)R_by_gs + (size_t)gi]);
+    \\      bj[h][i] = float(uw_b[rw * (size_t)R_by_gs + (size_t)gi]);
+    \\    }
+    \\  }
+    \\}
+    \\for (int i = 0; i < RIT; ++i) {
+    \\  int pack = int(lane) + 32 * i;
+    \\  if (pack < R_by_p) { for (int e = 0; e < VPW; ++e) av[i][e] = float(act[pack * VPW + e]); }
+    \\}
+    \\float sum = 0.0f;
+    \\for (int h = 0; h < HC; ++h) {
+    \\  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    \\  for (int i = 0; i < RIT; ++i) {
+    \\    int pack = int(lane) + 32 * i;
+    \\    if (pack < R_by_p) {
+    \\      for (int ki = 0; ki < VPW; ki += 4) {
+    \\        uint32_t q = pw[h][i] >> (ki * BITS);
+    \\        a0 += av[i][ki + 0] * (float((q >> (0 * BITS)) & mask) * sj[h][i] + bj[h][i]);
+    \\        a1 += av[i][ki + 1] * (float((q >> (1 * BITS)) & mask) * sj[h][i] + bj[h][i]);
+    \\        a2 += av[i][ki + 2] * (float((q >> (2 * BITS)) & mask) * sj[h][i] + bj[h][i]);
+    \\        a3 += av[i][ki + 3] * (float((q >> (3 * BITS)) & mask) * sj[h][i] + bj[h][i]);
+    \\      }
+    \\    }
+    \\  }
+    \\  float acc = simd_sum((a0 + a1) + (a2 + a3));
+    \\  T u = T(acc);
+    \\  T sg = T(1.0f / (1.0f + metal::exp(-float(u))));
+    \\  sum += float(T(float(sg) * xm[h]));
+    \\}
+    \\if (lane == 0) mixed[j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
+;
+
 const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
-var hc_fused_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
-var hc_fused_cfgs: [3]?mlx.mlx_fast_metal_kernel_config = .{ null, null, null };
+var hc_fused_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
+var hc_fused_cfgs: [5]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+/// Output rows per ND row threadgroup (they share one on-the-fly normalization):
+/// 2 measured fastest of 1/2/4 at hc 4 x hidden 2560, lowrank 320.
+const HC_ND_RPT: c_int = 2;
 var hc_fused_key: HcFusedKey = std.mem.zeroes(HcFusedKey);
 var hc_fused_eps: ?mlx.mlx_array = null;
 var hc_fused_eps_val: f32 = 0;
 var hc_fused_engaged = false;
 var hc_fused_env: ?bool = null;
 pub var hc_fused_override: ?bool = null;
+var hc_nd_env: ?bool = null;
+pub var hc_nd_override: ?bool = null;
 
 fn hcFusedEnabled() bool {
     if (hc_fused_override) |v| return v;
@@ -36469,6 +36684,15 @@ fn hcFusedEnabled() bool {
     const raw = std.c.getenv("MLX_SERVE_HC_FUSED");
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     hc_fused_env = enabled;
+    return enabled;
+}
+
+fn hcNdEnabled() bool {
+    if (hc_nd_override) |v| return v;
+    if (hc_nd_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_HC_ND");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    hc_nd_env = enabled;
     return enabled;
 }
 
@@ -36480,15 +36704,23 @@ fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     const d_outputs = [_][*:0]const u8{ "act_out", "inj_out" };
     const u_inputs = [_][*:0]const u8{ "xn_in", "act_in", "uw_q", "uw_s", "uw_b" };
     const u_outputs = [_][*:0]const u8{"mixed_out"};
+    const nd_inputs = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "dw_q", "dw_s", "dw_b" };
+    const nd_outputs = [_][*:0]const u8{ "act_out", "xn_out", "xs_out", "ipart_out" };
+    const u3_inputs = [_][*:0]const u8{ "xn_in", "act_in", "uw_q", "uw_s", "uw_b", "ipart_in" };
+    const u3_outputs = [_][*:0]const u8{ "mixed_out", "inj_out" };
     const inputs: []const [*:0]const u8 = switch (which) {
         0 => &n_inputs,
         1 => &d_inputs,
-        else => &u_inputs,
+        2 => &u_inputs,
+        3 => &nd_inputs,
+        else => &u3_inputs,
     };
     const outputs: []const [*:0]const u8 = switch (which) {
         0 => &n_outputs,
         1 => &d_outputs,
-        else => &u_outputs,
+        2 => &u_outputs,
+        3 => &nd_outputs,
+        else => &u3_outputs,
     };
     const in_vec = mlx.mlx_vector_string_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -36498,14 +36730,18 @@ fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
         switch (which) {
             0 => "mlxserve_hc_read_n",
             1 => "mlxserve_hc_read_d",
-            else => "mlxserve_hc_read_u",
+            2 => "mlxserve_hc_read_u",
+            3 => "mlxserve_hc_read_nd",
+            else => "mlxserve_hc_read_u3",
         },
         in_vec,
         out_vec,
         switch (which) {
             0 => HC_FUSED_N_SOURCE,
             1 => HC_FUSED_D_SOURCE,
-            else => HC_FUSED_U_SOURCE,
+            2 => HC_FUSED_U_SOURCE,
+            3 => HC_FUSED_ND_SOURCE,
+            else => HC_FUSED_U3_SOURCE,
         },
         "",
         true,
@@ -36805,6 +37041,41 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "R", R));
         hc_fused_cfgs[2] = cu;
+        if (@rem(R, HC_ND_RPT) == 0) {
+            const cnd = mlx.mlx_fast_metal_kernel_config_new();
+            const xn_shape = [_]c_int{rows * K};
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cnd, &act_shape, 1, xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cnd, &xn_shape, 1, xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cnd, &xs_shape, 1, xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cnd, &hchc_shape, 1, .float32));
+            // The first HC threadgroups are N's per-stream work (they start before the rows).
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cnd, 256, @divExact(R, HC_ND_RPT) + hc, rows));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cnd, 256, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cnd, "T", xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "HC", hc));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "H", hidden));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "R", R));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "GS", gsi));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "BITS", @intCast(bits)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "INJ", inj));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "WR", wr));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cnd, "RPT", HC_ND_RPT));
+            hc_fused_cfgs[3] = cnd;
+            const cu3 = mlx.mlx_fast_metal_kernel_config_new();
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cu3, &mixed_shape, 1, xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cu3, &hc_shape, 1, xd));
+            // One extra threadgroup past the hidden columns reduces the inject gates.
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cu3, 32, hidden + 8, rows));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cu3, 32, 8, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cu3, "T", xd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "GS", gsi));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "BITS", @intCast(bits)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "HC", hc));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "H", hidden));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "R", R));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu3, "INJ", inj));
+            hc_fused_cfgs[4] = cu3;
+        }
         hc_fused_key = key;
     }
     if (hc_fused_eps == null or hc_fused_eps_val != eps) {
@@ -36835,15 +37106,26 @@ pub fn hcReadFused(
         }
     }.f;
 
-    var n_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
-    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
-    const xn = n_out[0];
+    const two_kernel = hcNdEnabled() and hc_fused_cfgs[3] != null;
+    // ND+U3: [act, xn, xs, ipart] then [mixed, inj]. N/D/U: [xn, ipart, xs], [act, inj], [mixed].
+    var first: [4]mlx.mlx_array = undefined;
+    if (two_kernel) {
+        try apply(s, 3, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi, dw, ds, db }, 4, &first);
+    } else {
+        try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, first[0..3]);
+        first[3] = .{ .ctx = null };
+    }
+    const xn = if (two_kernel) first[1] else first[0];
     defer _ = mlx.mlx_array_free(xn);
-    const ipart = n_out[1];
+    const ipart = if (two_kernel) first[3] else first[1];
     defer _ = mlx.mlx_array_free(ipart);
-    var stream_out = n_out[2];
+    const nd_act = if (two_kernel) first[0] else mlx.mlx_array{ .ctx = null };
+    defer if (nd_act.ctx != null) {
+        _ = mlx.mlx_array_free(nd_act);
+    };
+    var stream_out = first[2];
     errdefer if (stream_out.ctx != null) {
         _ = mlx.mlx_array_free(stream_out);
     };
@@ -36858,16 +37140,26 @@ pub fn hcReadFused(
         _ = mlx.mlx_array_free(stream_out);
         stream_out = shaped;
     }
-    var d_out: [2]mlx.mlx_array = undefined;
-    try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
-    const act = d_out[0];
-    defer _ = mlx.mlx_array_free(act);
-    const inj_flat = d_out[1];
-    defer _ = mlx.mlx_array_free(inj_flat);
-    var u_out: [1]mlx.mlx_array = undefined;
-    try apply(s, 2, &.{ xn, act, uw, us, ub }, 1, &u_out);
-    const mixed_flat = u_out[0];
+    var mixed_flat: mlx.mlx_array = undefined;
+    var inj_flat: mlx.mlx_array = undefined;
+    if (two_kernel) {
+        var u_out: [2]mlx.mlx_array = undefined;
+        try apply(s, 4, &.{ xn, nd_act, uw, us, ub, ipart }, 2, &u_out);
+        mixed_flat = u_out[0];
+        inj_flat = u_out[1];
+    } else {
+        var d_out: [2]mlx.mlx_array = undefined;
+        try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
+        const act = d_out[0];
+        defer _ = mlx.mlx_array_free(act);
+        inj_flat = d_out[1];
+        errdefer _ = mlx.mlx_array_free(inj_flat);
+        var u_out: [1]mlx.mlx_array = undefined;
+        try apply(s, 2, &.{ xn, act, uw, us, ub }, 1, &u_out);
+        mixed_flat = u_out[0];
+    }
     defer _ = mlx.mlx_array_free(mixed_flat);
+    defer _ = mlx.mlx_array_free(inj_flat);
 
     const mshape = [_]c_int{ batch, seq, hidden };
     var mixed = mlx.mlx_array_new();
@@ -36881,7 +37173,7 @@ pub fn hcReadFused(
     }
     if (!hc_fused_engaged) {
         hc_fused_engaged = true;
-        log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_FUSED=0 restores the chain)\n", .{ hc, hidden, R, bits, group_size });
+        log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d}, {s} (MLX_SERVE_HC_ND=0 restores N/D/U; MLX_SERVE_HC_FUSED=0 the chain)\n", .{ hc, hidden, R, bits, group_size, if (two_kernel) "2 kernels (ND+U3)" else "3 kernels" });
     }
     return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
 }
@@ -43433,6 +43725,115 @@ test "fused residual+RMSNorm declines what it cannot reproduce" {
     const small = mlx.mlx_array_new_data(&buf, &s2, 2, .float32);
     defer _ = mlx.mlx_array_free(small);
     try testing.expect((try fusedAddRmsNorm(s, a, small, w, eps)) == null);
+}
+
+test "fused hyper-connection read: two-kernel ND+U3 is bit-identical to N/D/U" {
+    // Same rounding sites, lane mappings and accumulation orders by construction,
+    // so every output element must match exactly: 4/8-bit, 1 and 3 rows, with and
+    // without a pending write, inject and mixer (no inject) sites.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x2C0FFEE);
+    const rnd = prng.random();
+    hc_fused_override = true;
+    defer hc_fused_override = null;
+    defer hc_nd_override = null;
+
+    const HC: c_int = 4;
+    const H: c_int = 512;
+    const K: c_int = HC * H;
+    const R: c_int = 64;
+    const gs: u32 = 64;
+    const eps: f32 = 1e-6;
+
+    const bf16Random = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32, offset: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale + offset;
+            const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            return out;
+        }
+    }.f;
+    const Q = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array };
+    const quant = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, rows: c_int, cols: c_int, bits: u32) !Q {
+            const wb = try bf16Random(a, r, st, &.{ rows, cols }, 0.2, 0.0);
+            defer _ = mlx.mlx_array_free(wb);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, st));
+            var q: Q = undefined;
+            q.w = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&q.w, triple, 0));
+            q.sc = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&q.sc, triple, 1));
+            q.bi = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&q.bi, triple, 2));
+            return q;
+        }
+    }.f;
+    const expectSame = struct {
+        fn f(a: std.mem.Allocator, st: mlx.mlx_stream, want: mlx.mlx_array, got: mlx.mlx_array) !void {
+            const n = mlx.mlx_array_size(want);
+            try testing.expectEqual(n, mlx.mlx_array_size(got));
+            const wh = try a.alloc(f32, n);
+            defer a.free(wh);
+            const gh = try a.alloc(f32, n);
+            defer a.free(gh);
+            try testReadF32(want, wh, st);
+            try testReadF32(got, gh, st);
+            var bad: usize = 0;
+            for (wh, gh) |w, g| bad += @intFromBool(@as(u32, @bitCast(w)) != @as(u32, @bitCast(g)));
+            if (bad != 0) std.debug.print("hc ND+U3 vs N/D/U: {d}/{d} elements differ\n", .{ bad, n });
+            try testing.expectEqual(@as(usize, 0), bad);
+        }
+    }.f;
+
+    const nw = try bf16Random(allocator, rnd, s, &.{ HC, H }, 1.0, 1.0);
+    defer _ = mlx.mlx_array_free(nw);
+    const iw = try bf16Random(allocator, rnd, s, &.{ K, HC }, 0.1, 0.0);
+    defer _ = mlx.mlx_array_free(iw);
+    for ([_]u32{ 4, 8 }) |bits| {
+        const down = try quant(allocator, rnd, s, R, K, bits);
+        defer inline for (.{ "w", "sc", "bi" }) |f| {
+            _ = mlx.mlx_array_free(@field(down, f));
+        };
+        const up = try quant(allocator, rnd, s, K, R, bits);
+        defer inline for (.{ "w", "sc", "bi" }) |f| {
+            _ = mlx.mlx_array_free(@field(up, f));
+        };
+        for ([_]c_int{ 1, 3 }) |rows| {
+            const x = try bf16Random(allocator, rnd, s, &.{ rows, 1, K }, 4.0, 0.0);
+            defer _ = mlx.mlx_array_free(x);
+            const wo = try bf16Random(allocator, rnd, s, &.{ rows, 1, H }, 2.0, 0.0);
+            defer _ = mlx.mlx_array_free(wo);
+            const wi = try bf16Random(allocator, rnd, s, &.{ rows, 1, HC, 1 }, 1.0, 1.0);
+            defer _ = mlx.mlx_array_free(wi);
+            for ([_]bool{ false, true }) |with_pend| for ([_]bool{ true, false }) |with_inj| {
+                const pend: ?HcPending = if (with_pend) .{ .out = wo, .inj = wi } else null;
+                const iw_arg: mlx.mlx_array = if (with_inj) iw else .{ .ctx = null };
+                var outs: [2]HcFusedOut = undefined;
+                for ([_]bool{ false, true }, 0..) |nd, i| {
+                    hc_nd_override = nd;
+                    outs[i] = (try hcReadFused(s, x, rows, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw_arg, eps, HC, H, bits, gs, pend)) orelse return error.HcFusedDeclined;
+                }
+                defer for (outs) |o| inline for (.{ "mixed", "inj", "stream" }) |f| {
+                    if (@field(o, f).ctx != null) _ = mlx.mlx_array_free(@field(o, f));
+                };
+                try expectSame(allocator, s, outs[0].mixed, outs[1].mixed);
+                try testing.expectEqual(outs[0].inj.ctx != null, outs[1].inj.ctx != null);
+                if (with_inj) try expectSame(allocator, s, outs[0].inj, outs[1].inj);
+                try testing.expectEqual(outs[0].stream.ctx != null, outs[1].stream.ctx != null);
+                if (with_pend) try expectSame(allocator, s, outs[0].stream, outs[1].stream);
+            };
+        }
+    }
 }
 
 test "fused hyper-connection read matches the op chain per element" {
