@@ -3497,7 +3497,7 @@ pub const Generator = struct {
             // A forced-depth run never consulted the EV plan, so its surface
             // is not one the controller chose — publishing it would hand a
             // later ordinary request a diagnostic's numbers.
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
+            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and !mtpForcedAny() and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8 and
                 (!group_planner.enabled() or !self.mtp_planner_owned))
             {
@@ -7012,7 +7012,7 @@ pub const Generator = struct {
         // exactly n and the controller never plans, so a seed must not be
         // applied (nor, at deinit, published).
         if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
+            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and !mtpForcedAny() and
             (!group_planner.enabled() or !self.mtp_planner_owned))
         {
             if (head.evSeed()) |seed| {
@@ -9213,6 +9213,7 @@ pub const Generator = struct {
     /// reverts to the fixed-depth windowed controller for same-boot A/Bs.
     var mtp_adaptive_cache: ?bool = null;
     var mtp_force_depth_cache: ??u32 = null;
+    var mtp_force_plan_cache: ??MtpRoundPlan = null;
 
     pub fn mtpAdaptiveEnabled() bool {
         if (mtp_adaptive_cache) |v| return v;
@@ -9683,6 +9684,34 @@ pub const Generator = struct {
         const v: ?u32 = if (n == 0) null else @intCast(@min(n, mtp_mod.MAX_DEPTH));
         mtp_force_depth_cache = v;
         return v;
+    }
+
+    /// DIAGNOSTIC (MLX_SERVE_MTP_FORCE_PLAN=lo,hi,p): every round drafts `lo`, then extends to
+    /// `hi` iff the chunk's chain confidence clears `p` (a draft-confidence cutoff: `1,2,0.75`
+    /// drafts the second token only when the head gave the first >= 0.75). Like FORCE_DEPTH,
+    /// the controllers never plan, demote or disable; FORCE_DEPTH wins when both are set.
+    pub fn mtpForcedPlan() ?MtpRoundPlan {
+        if (mtp_force_plan_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_FORCE_PLAN")) |r| std.mem.span(r) else null;
+        const v = mtpForcedPlanFrom(raw);
+        mtp_force_plan_cache = v;
+        return v;
+    }
+
+    pub fn mtpForcedPlanFrom(raw_in: ?[]const u8) ?MtpRoundPlan {
+        const raw = raw_in orelse return null;
+        var it = std.mem.splitScalar(u8, raw, ',');
+        const lo = std.fmt.parseInt(u32, std.mem.trim(u8, it.next() orelse return null, " "), 10) catch return null;
+        const hi = std.fmt.parseInt(u32, std.mem.trim(u8, it.next() orelse return null, " "), 10) catch return null;
+        const p = std.fmt.parseFloat(f32, std.mem.trim(u8, it.next() orelse return null, " ")) catch return null;
+        if (it.next() != null) return null;
+        if (lo < 1 or hi < lo or hi > mtp_mod.MAX_DEPTH or !(p > 0.0 and p <= 1.0)) return null;
+        return .{ .m_lo = lo, .m_hi = hi, .tau_ln = @log(p) };
+    }
+
+    /// Either measurement mode: the controllers never plan, seed, demote or disable.
+    pub fn mtpForcedAny() bool {
+        return mtpForcedDepth() != null or mtpForcedPlan() != null;
     }
 
     // Adaptive serial: the EV controller picks the best depth but never compares a round with
@@ -10201,6 +10230,10 @@ pub const Generator = struct {
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
+        if (mtpForcedPlan()) |fp| {
+            self.mtp_ev_m_lo_prev = fp.m_lo;
+            return fp;
+        }
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
         const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
         var cap: u32 = cap_row;
@@ -10398,7 +10431,7 @@ pub const Generator = struct {
     fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         mtpEvObserve(&self.mtp_ev_accept, drafted, accepted, MTP_EV_EMA_BETA);
         self.mtp_ev_rounds += 1;
-        if (mtpForcedDepth() != null) return;
+        if (mtpForcedAny()) return;
         if (self.mtp_ev_rounds <= MTP_EV_WARMUP_ROUNDS) {
             self.updateMtpDepth(drafted, accepted);
             // Warmup may evaluate several depths. None of that mixed evidence
@@ -19877,4 +19910,18 @@ fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usiz
     const ids = try samplerTestReadFlat(allocator, masked.lazy(), rows, s);
     defer allocator.free(ids);
     for (ids, 0..) |id, r| try testing.expectEqual(@as(f32, @floatFromInt(100 + r)), id);
+}
+
+test "mtpForcedPlanFrom: lo,hi,p parses to a two-chunk plan with tau = ln p; anything else is off" {
+    const G = Generator;
+    const p = G.mtpForcedPlanFrom("1,2,0.75").?;
+    try testing.expectEqual(@as(u32, 1), p.m_lo);
+    try testing.expectEqual(@as(u32, 2), p.m_hi);
+    try testing.expectApproxEqAbs(@log(@as(f32, 0.75)), p.tau_ln, 1e-6);
+    try testing.expect(!p.width_trial);
+    try testing.expectEqual(@as(u32, 3), G.mtpForcedPlanFrom(" 3 , 3 , 1 ").?.m_hi);
+    for ([_][]const u8{ "", "1,2", "0,2,0.5", "2,1,0.5", "1,99,0.5", "1,2,0", "1,2,1.5", "1,2,x", "1,2,0.5,4" }) |bad| {
+        try testing.expect(G.mtpForcedPlanFrom(bad) == null);
+    }
+    try testing.expect(G.mtpForcedPlanFrom(null) == null);
 }
