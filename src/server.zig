@@ -14137,6 +14137,15 @@ pub const MropeData = struct {
     delta: i32 = 0,
 };
 
+/// Does this Qwen vision request run on scalar RoPE? /v1/messages and /v1/responses take
+/// M-RoPE like /v1/chat/completions; MLX_SERVE_MROPE_MESSAGES=0 puts those two back on
+/// scalar positions (their media pseudo-ids then salted, see `encodeHistoryMedia`).
+fn mropeScalarSurface(config: *const model_mod.ModelConfig) bool {
+    if (!config.qwen_vision) return false;
+    const v = std.c.getenv("MLX_SERVE_MROPE_MESSAGES") orelse return false;
+    return v[0] == '0';
+}
+
 /// Compute the interleaved-M-RoPE table from the FINAL prompt_ids (after image-pad
 /// expansion) + the active media message's image grids. Returns an empty bundle when the
 /// model isn't Qwen-vision or there are no images. Caller owns `pos`.
@@ -14395,9 +14404,11 @@ fn placeHistoryMedia(
 
         seg.clearRetainingCapacity();
         if (t.n_image > 0) {
-            try seg.append(allocator, config.vision_start_token_id);
-            try seg.appendNTimes(allocator, config.image_token_id, t.n_image);
-            try seg.append(allocator, config.vision_end_token_id);
+            if (!(config.qwen_vision and try appendQwenImageBlocks(allocator, &seg, config, t.info.message, t.n_image))) {
+                try seg.append(allocator, config.vision_start_token_id);
+                try seg.appendNTimes(allocator, config.image_token_id, t.n_image);
+                try seg.append(allocator, config.vision_end_token_id);
+            }
         }
         if (t.n_video > 0) {
             if (config.mimo_vision) {
@@ -14451,9 +14462,9 @@ fn encodeHistoryMedia(
     prompt_ids: []const u32,
     config: *const model_mod.ModelConfig,
     /// The prompt runs on scalar RoPE although the tower expects M-RoPE (Qwen on
-    /// /v1/messages): its media pseudo-ids are salted so the prefix cache never
-    /// hands KV computed under the other position scheme across (the token ids
-    /// are identical, the positions after the first image are not).
+    /// /v1/messages under MLX_SERVE_MROPE_MESSAGES=0): its media pseudo-ids are salted so
+    /// the prefix cache never hands KV computed under the other position scheme across
+    /// (the token ids are identical, the positions after the first image are not).
     scalar_positions: bool,
 ) !?HistoryMedia {
     const sch = global_scheduler orelse return null;
@@ -14592,6 +14603,31 @@ fn encodeHistoryMedia(
     };
 }
 
+/// Qwen3-VL's template gives every image its own `<|vision_start|>` pads `<|vision_end|>`
+/// block, and `get_rope_index` lays one 3-D grid over each block: a turn's images in one
+/// run would leave every image after the first on text positions. Appends one block per
+/// image when the grids account for all `n_image` pads; false (nothing appended) otherwise.
+fn appendQwenImageBlocks(
+    allocator: std.mem.Allocator,
+    seg: *std.ArrayList(u32),
+    config: *const model_mod.ModelConfig,
+    msg: ?*const chat_mod.Message,
+    n_image: usize,
+) !bool {
+    const images = (msg orelse return false).images orelse return false;
+    if (images.len < 2) return false;
+    const merge: usize = @max(1, config.qv_merge);
+    var sum: usize = 0;
+    for (images) |im| sum += (im.grid_h / merge) * (im.grid_w / merge);
+    if (sum != n_image) return false;
+    for (images) |im| {
+        try seg.append(allocator, config.vision_start_token_id);
+        try seg.appendNTimes(allocator, config.image_token_id, (im.grid_h / merge) * (im.grid_w / merge));
+        try seg.append(allocator, config.vision_end_token_id);
+    }
+    return true;
+}
+
 fn insertMultimodalTokens(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
@@ -14627,6 +14663,8 @@ fn insertMultimodalTokens(
     if (want_image) {
         if (lfm2_seg) |ls| {
             try seg.appendSlice(allocator, ls);
+        } else if (config.qwen_vision and try appendQwenImageBlocks(allocator, &seg, config, if (active_media) |m| m.message else null, n_image)) {
+            // one block per image
         } else {
             if (boi > 0) try seg.append(allocator, boi);
             try seg.appendNTimes(allocator, image_token_id, n_image);
@@ -16340,14 +16378,17 @@ fn handleAnthropicMessages(
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
     defer clearPendingMediaCacheIds();
+    const scalar_positions = mropeScalarSurface(config);
+    var history_media_placed = false;
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config, config.qwen_vision) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config, scalar_positions) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
+        history_media_placed = hist != null;
         if (hist) |h| {
             local_ve = h.embeddings;
             vis_key = h.key;
@@ -16374,6 +16415,12 @@ fn handleAnthropicMessages(
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
+
+    // Qwen3-VL interleaved M-RoPE, as on /v1/chat/completions; the slot takes the table.
+    var local_mrope: MropeData = if (scalar_positions) .{} else computeQwenMrope(allocator, prompt_ids, messages.items, if (active_media) |selected| selected.message else null, history_media_placed, config) catch MropeData{};
+    defer {
+        if (local_mrope.pos) |p| allocator.free(p);
+    }
 
     // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
     if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
@@ -16461,16 +16508,18 @@ fn handleAnthropicMessages(
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
 
-    // Hand vision ownership to the sub-handler (slot takes it on submit).
+    // Hand vision and M-RoPE ownership to the sub-handler (slot takes them on submit).
     const sub_ve = local_ve;
     local_ve = null;
+    const sub_mrope = local_mrope;
+    local_mrope = .{};
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -16665,6 +16714,8 @@ fn handleAnthropicNonStreaming(
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64,
+    /// Qwen3-VL M-RoPE table; ownership transfers to the slot.
+    mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -16697,11 +16748,8 @@ fn handleAnthropicNonStreaming(
         ve_local = null;
         break :blk v;
     };
-    // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
-    // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
-    // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -16924,6 +16972,8 @@ fn handleAnthropicStreaming(
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64,
+    /// Qwen3-VL M-RoPE table; ownership transfers to the slot.
+    mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -16985,6 +17035,9 @@ fn handleAnthropicStreaming(
         .vision_embeddings = slot_ve_anth,
         .vision_key = vision_key,
         .cache_key = cache_key,
+        .mrope_pos = mrope.pos,
+        .mrope_total = mrope.total,
+        .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -18265,14 +18318,17 @@ fn handleResponsesInner(
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
     defer clearPendingMediaCacheIds();
+    const scalar_positions = mropeScalarSurface(config);
+    var history_media_placed = false;
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config, config.qwen_vision) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config, scalar_positions) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
+        history_media_placed = hist != null;
         if (hist) |h| {
             local_ve = h.embeddings;
             vis_key = h.key;
@@ -18298,6 +18354,12 @@ fn handleResponsesInner(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+
+    // Qwen3-VL interleaved M-RoPE, as on /v1/chat/completions; the slot takes the table.
+    var local_mrope: MropeData = if (scalar_positions) .{} else computeQwenMrope(allocator, prompt_ids, pi.messages.items, if (active_media) |selected| selected.message else null, history_media_placed, config) catch MropeData{};
+    defer {
+        if (local_mrope.pos) |p| allocator.free(p);
+    }
 
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
@@ -18517,9 +18579,11 @@ fn handleResponsesInner(
         var slot_handle: ?*scheduler_mod.Slot = null;
         defer if (slot_handle) |s| global_scheduler.?.complete(s);
 
-        // Transfer vision ownership into the slot.
+        // Transfer vision and M-RoPE ownership into the slot.
         const slot_ve_resp = local_ve;
         local_ve = null;
+        const slot_mrope = local_mrope;
+        local_mrope = .{};
         const sch = global_scheduler.?;
         slot_handle = try sch.submit(.{
             .model = lm,
@@ -18545,6 +18609,9 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .vision_key = vis_key,
             .cache_key = cache_key,
+            .mrope_pos = slot_mrope.pos,
+            .mrope_total = slot_mrope.total,
+            .mrope_delta = slot_mrope.delta,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
             .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
@@ -18861,8 +18928,10 @@ fn handleResponsesInner(
             local_ve = null;
             break :blk v;
         };
+        const slot_mrope_ns = local_mrope;
+        local_mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, slot_mrope_ns, 0, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -21412,6 +21481,45 @@ test "insertMultimodalTokens targets the media user before injected context" {
     defer testing.allocator.free(out);
 
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+}
+
+test "insertMultimodalTokens gives each Qwen image its own vision block and 3-D grid" {
+    var config = model_mod.ModelConfig{};
+    config.qwen_vision = true;
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.vision_start_token_id = 300;
+    config.vision_end_token_id = 301;
+    config.image_token_id = 999;
+    config.qv_merge = 2;
+    const images = [_]chat_mod.ImageData{
+        .{ .pixels = &.{}, .width = 1, .height = 1, .grid_h = 4, .grid_w = 4 },
+        .{ .pixels = &.{}, .width = 1, .height = 1, .grid_h = 2, .grid_w = 6 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "two images", .images = &images }};
+    const media = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    const prompt = [_]u32{ 1, 105, 11 };
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 7, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 999, 999, 999, 999, 301, 300, 999, 999, 999, 301, 11 }, out);
+
+    // The second image (a 1x3 merged grid at tokens 9..11) keeps its own grid:
+    // one row on h, three columns on w. In one shared run it fell to text positions.
+    const mr = try computeQwenMrope(testing.allocator, out, &msgs, &msgs[0], false, &config);
+    defer if (mr.pos) |p| testing.allocator.free(p);
+    const pos = mr.pos orelse return error.TestExpectedMrope;
+    const n = mr.total;
+    try testing.expectEqual(out.len, n);
+    try testing.expectEqualSlices(i32, &[_]i32{ 7, 7, 7 }, pos[n + 9 .. n + 12]);
+    try testing.expectEqualSlices(i32, &[_]i32{ 7, 8, 9 }, pos[2 * n + 9 .. 2 * n + 12]);
+    try testing.expectEqual(@as(i32, -2), mr.delta);
+
+    // A lone image keeps the single run (its prompt and cache keys are unchanged).
+    const one = [_]chat_mod.Message{.{ .role = "user", .content = "one image", .images = images[0..1] }};
+    const one_media = activeTurnMediaMessage(&one, false) orelse return error.TestExpectedMedia;
+    const one_out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 4, 777, 0, 888, 0, &config, one_media);
+    defer testing.allocator.free(one_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 999, 999, 999, 999, 301, 11 }, one_out);
 }
 
 test "insertMultimodalTokens counts a ChatML tool-response user marker" {
