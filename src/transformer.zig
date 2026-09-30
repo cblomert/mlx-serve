@@ -8833,9 +8833,11 @@ fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !bool
     }
     entry.qsa_hist_rows = keep;
     const keep_blocks: c_int = @divTrunc(keep, @max(entry.qsa_ratio, 1));
+    var pooled_resliced = false;
     if (entry.qsa_pooled_buf.ctx != null) {
         if (keep_blocks > 0 and mlx.getShape(entry.qsa_pooled_buf)[1] >= keep_blocks) {
             try capBufReslice(s, entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, 1, keep_blocks);
+            pooled_resliced = true;
         } else {
             if (entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled);
             entry.qsa_pooled = .{ .ctx = null };
@@ -8844,12 +8846,40 @@ fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !bool
     } else {
         try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s, false);
     }
-    if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
-    entry.qsa_score_bank = .{ .ctx = null };
-    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
-    entry.qsa_score_buf = .{ .ctx = null };
-    entry.qsa_score_blocks = 0;
+    // The score bank's columns are a pure function of the pooled blocks they were built from,
+    // and every block below `keep_blocks` survived the reslice above untouched: re-slice the
+    // bank over them too. Dropping it made the next forward rebuild the whole f32 transpose
+    // (into a fresh reserve-sized buffer) on every QSA layer after every MTP verify: O(context)
+    // per round, the growth of the solo MTP round from 128k to 300k.
+    const keep_score: c_int = @min(keep_blocks, entry.qsa_score_blocks);
+    if (pooled_resliced and qsaScoreResliceEnabled() and entry.qsa_score_buf.ctx != null and keep_score > 0) {
+        try capBufReslice(s, entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, 3, keep_score);
+        qsa_score_bank_reslices += 1;
+    } else {
+        if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
+        entry.qsa_score_bank = .{ .ctx = null };
+        if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
+        entry.qsa_score_buf = .{ .ctx = null };
+        entry.qsa_score_blocks = 0;
+    }
     return true;
+}
+
+/// Rollbacks that kept the f32 score bank (re-sliced to the kept blocks) instead of dropping it.
+pub var qsa_score_bank_reslices: usize = 0;
+pub var qsa_score_reslice_override: ?bool = null;
+var qsa_score_reslice_env: ?bool = null;
+
+/// `MLX_SERVE_QSA_SCORE_RESLICE=0` restores drop-and-rebuild of the score bank on rollback. Read once.
+pub fn qsaScoreResliceEnabled() bool {
+    if (qsa_score_reslice_override) |v| return v;
+    if (qsa_score_reslice_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_SCORE_RESLICE") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_score_reslice_env = v;
+    return v;
 }
 
 fn capBufReslice(s: mlx.mlx_stream, buf: mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, axis: usize, new_count: c_int) !void {
@@ -11249,6 +11279,8 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
 
     const buf_before = entry.qsa_key_buf.ctx;
     const pooled_buf_before = entry.qsa_pooled_buf.ctx;
+    const score_buf_before = entry.qsa_score_buf.ctx;
+    try t.expect(score_buf_before != null);
     try ssmRollbackFromCapture(&entry, accepted, @intCast(verify_len), s);
 
     try t.expect(entry.qsa_key_buf.ctx == buf_before);
@@ -11257,10 +11289,16 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try t.expect(entry.qsa_pooled_buf.ctx == pooled_buf_before);
     try t.expectEqual(keep_blocks, entry.qsa_pooled_blocks);
     try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.qsa_pooled, kept_pooled, s));
-    // The score bank is invalidated rather than truncated: its columns are a function of
-    // the pooled bank and the next completed block rebuilds them.
-    try t.expect(entry.qsa_score_bank.ctx == null);
-    try t.expectEqual(@as(c_int, 0), entry.qsa_score_blocks);
+    // The score bank is re-sliced over the kept blocks like the pooled bank it mirrors (their
+    // pooled rows are untouched), not dropped: the next forward appends only the blocks past them.
+    try t.expect(entry.qsa_score_buf.ctx == score_buf_before);
+    try t.expectEqual(keep_blocks, entry.qsa_score_blocks);
+    {
+        const k32 = try qsaScoreK32tFromPooled(s, kept_pooled);
+        defer _ = mlx.mlx_array_free(k32);
+        try t.expectEqual(keep_blocks, mlx.getShape(entry.qsa_score_bank)[3]);
+        try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.qsa_score_bank, k32, s));
+    }
 
     const tail = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, hd }, s);
     defer _ = mlx.mlx_array_free(tail);
@@ -11276,6 +11314,53 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try xfm.qsaAppendKeys(&entry, tail, keep);
     try t.expectEqual(keep + 2, mlx.getShape(entry.aux_state)[1]);
     try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, reference, s));
+
+    // A block completed after the rollback lands in the kept bank's buffer and the result is
+    // the from-scratch f32 operand of the pooled bank.
+    const appends_before = qsa_score_incremental_appends;
+    const block = try attn256RandBf16(rnd, &[_]c_int{ 1, 1, hd }, s);
+    defer _ = mlx.mlx_array_free(block);
+    try xfm.qsaAppendPooled(&entry, block, keep_blocks);
+    const bank = try xfm.qsaScoreBank(&entry, 1, keep_blocks + 1, hd);
+    try t.expectEqual(appends_before + 1, qsa_score_incremental_appends);
+    const k32 = try qsaScoreK32tFromPooled(s, entry.qsa_pooled);
+    defer _ = mlx.mlx_array_free(k32);
+    try t.expectEqual(keep_blocks + 1, mlx.getShape(bank)[3]);
+    try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(bank, k32, s));
+}
+
+test "qsa rollback: MLX_SERVE_QSA_SCORE_RESLICE=0 drops the score bank" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.rht = null;
+    xfm.s = s;
+    xfm.allocator = t.allocator;
+    xfm.qsa_score_bank_builds = 0;
+    const saved = qsa_score_reslice_override;
+    defer qsa_score_reslice_override = saved;
+    qsa_score_reslice_override = false;
+
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+    entry.qsa_ratio = 4;
+    entry.qsa_reserve_rows = 64;
+    var prng = std.Random.DefaultPrng.init(0x51A0_0FF5);
+    const rnd = prng.random();
+    const hd: c_int = 16;
+    const keys = try attn256RandBf16(rnd, &[_]c_int{ 1, 12, hd }, s);
+    defer _ = mlx.mlx_array_free(keys);
+    try xfm.qsaAppendKeys(&entry, keys, 0);
+    const blocks = try attn256RandBf16(rnd, &[_]c_int{ 1, 3, hd }, s);
+    defer _ = mlx.mlx_array_free(blocks);
+    try xfm.qsaAppendPooled(&entry, blocks, 0);
+    _ = try xfm.qsaScoreBank(&entry, 1, 3, hd);
+    try ssmRollbackFromCapture(&entry, 1, 4, s);
+    try t.expectEqual(@as(c_int, 2), entry.qsa_pooled_blocks);
+    try t.expect(entry.qsa_score_bank.ctx == null);
+    try t.expect(entry.qsa_score_buf.ctx == null);
+    try t.expectEqual(@as(c_int, 0), entry.qsa_score_blocks);
 }
 
 test "qsa rollback: a rollback that reaches past the ring is a named error, not a negative slice" {
