@@ -3949,6 +3949,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw = io_u.Stopwatch.init(tio);
             var build_ns: u64 = 0;
             var eval_ns: u64 = 0;
+            // Main-thread CPU time inside eval: MLX encodes the command buffers on this
+            // thread while the GPU runs, so eval CPU close to eval wall means the encoder,
+            // not the GPU, paces the forward.
+            var eval_cpu_ns: u64 = 0;
+            var build_cpu_ns: u64 = 0;
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
@@ -3957,12 +3962,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 defer _ = mlx.mlx_array_free(ti);
                 const ops_before = mlx.op_count.load(.monotonic);
                 var swb = io_u.Stopwatch.init(tio);
+                const cpu0 = threadCpuNs();
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 build_ns += swb.read();
+                const cpu1 = threadCpuNs();
+                build_cpu_ns += cpu1 - cpu0;
                 ops_total += mlx.op_count.load(.monotonic) - ops_before;
                 var swe = io_u.Stopwatch.init(tio);
                 _ = mlx.mlx_array_eval(lg);
                 eval_ns += swe.read();
+                eval_cpu_ns += threadCpuNs() - cpu1;
                 _ = mlx.mlx_array_free(lg);
                 done += 1;
             }
@@ -3975,6 +3984,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(ops_total)) / dn,
+            });
+            log.info("[fwd-ubench] main-thread CPU: build {d:.3} ms, eval {d:.3} ms of {d:.3} ms eval wall\n", .{
+                @as(f64, @floatFromInt(build_cpu_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_cpu_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
             });
 
             // Same forward with the vocab projection suppressed. lm_head is
@@ -10637,4 +10651,11 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
     const text_only = [_]u32{ 7, 8, image_id, 9 };
     try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
     try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
+}
+
+/// CPU time the calling thread has consumed (CLOCK_THREAD_CPUTIME_ID), for diagnostics.
+fn threadCpuNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }

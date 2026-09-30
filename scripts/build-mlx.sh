@@ -39,7 +39,11 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA target=$DEPLOYMENT_TARGET"
+# Local patches to the pinned mlx (applied below); their content is part of the stamp so
+# editing one rebuilds the stage.
+MLX_PATCHES=("$REPO_ROOT/patches/mlx-metal-kernel-source-cache.patch")
+PATCH_SHA="$(cat "${MLX_PATCHES[@]}" | shasum -a 256 | cut -c1-12)"
+WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA target=$DEPLOYMENT_TARGET patches=$PATCH_SHA"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
@@ -65,6 +69,18 @@ fi
 echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 
 NCPU="$(sysctl -n hw.ncpu)"
+
+# ── mlx patches (idempotent: skipped when already applied) ───────────────────
+# mlx-metal-kernel-source-cache: fast::metal_kernel writes a kernel's generated
+# source once per kernel name instead of on every call (about half of the graph
+# build CPU of a Qwen3.8 forward was that string work).
+for p in "${MLX_PATCHES[@]}"; do
+  if git -C "$MLX_SRC" apply --reverse --check "$p" 2>/dev/null; then
+    echo "[build-mlx] $(basename "$p"): already applied"
+  else
+    git -C "$MLX_SRC" apply "$p" || die "$(basename "$p") does not apply to mlx $MLX_SHA"
+  fi
+done
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
