@@ -6626,7 +6626,8 @@ pub const Generator = struct {
     // Serial blocks inside nextMtp. Leaving MTP is cheap; coming back needs `t1 NOT in cache`
     // and an `h_prev` for that position: `drainPipelineForSpec` lands the first, the capture
     // tick the second. The head's committed history does not grow across a serial block
-    // (a content gap that costs acceptance for a while); M-RoPE turns never come back.
+    // (a content gap that costs acceptance for a while). On an M-RoPE turn the gap is the
+    // same shift: the head's rows past the prompt are text on `absolute + delta`.
 
     /// Will this serial block be left behind? Only then is applying the deferred history stash worth a head forward.
     fn mtpSerialMayResume(self: *const Generator) bool {
@@ -10043,12 +10044,12 @@ pub const Generator = struct {
         };
     }
 
-    /// May this request resume MTP after a serial block? An M-RoPE turn ropes the head at an
-    /// absolute position where the content gap is a wrong answer, so vision turns never come back.
+    /// May this request resume MTP after a serial block? Not once the arm is sticky. An M-RoPE
+    /// turn may: the head ropes its history at absolute positions (`MropeContext.base`), so
+    /// every row it appends after the prompt is text on `absolute + delta`, the scalar case.
     fn mtpAdaptiveHeadMayResume(self: *const Generator) bool {
         // The one predicate all three round-start doors ask (re-entry, `apply_stash`, the probe).
-        if (self.mtp_adaptive.sticky_serial) return false;
-        return self.ctx.mrope_pos == null;
+        return !self.mtp_adaptive.sticky_serial;
     }
 
     /// Does a `to_serial` on this head make the arm sticky? Only a module-owned head.

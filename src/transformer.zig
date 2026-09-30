@@ -14279,6 +14279,10 @@ pub const ForwardCtx = struct {
     mrope_pos: ?[]const i32 = null,
     mrope_total: usize = 0,
     mrope_delta: i32 = 0,
+    /// Absolute position of cache row 0 for the table and the `+ delta` arm: 0 on the
+    /// trunk; the MTP head's first history row (`PositionContext.base`), whose own
+    /// offsets count from it.
+    mrope_base: usize = 0,
     mrope_cos_cur: ?mlx.mlx_array = null,
     mrope_sin_cur: ?mlx.mlx_array = null,
     /// qwen4_exp QSA: the bool `[B, 1, S, kv]` mask (indexer-selected blocks
@@ -14392,6 +14396,7 @@ const QsaPooledRope = struct {
     mrope_pos: ?[]const i32 = null,
     mrope_total: usize = 0,
     mrope_delta: i32 = 0,
+    mrope_base: usize = 0,
     cos: mlx.mlx_array = .{ .ctx = null },
     sin: mlx.mlx_array = .{ .ctx = null },
     /// Rebuild counter.
@@ -20915,7 +20920,7 @@ pub const Transformer = struct {
         var off_buf = try self.allocator.alloc(i32, rope_offsets.len);
         defer self.allocator.free(off_buf);
         for (rope_offsets, 0..) |o, i| {
-            const d: i32 = if (ctxs[i].mrope_pos != null) ctxs[i].mrope_delta else 0;
+            const d: i32 = mropeScalarShift(ctxs[i]);
             off_buf[i] = @as(i32, @intCast(o)) + d;
         }
         const off_shape = [_]c_int{N};
@@ -22290,7 +22295,8 @@ pub const Transformer = struct {
             c.base == base and c.step == step and c.n == n and
             c.dtype == dt and c.mrope == is_mrope and
             qsaPooledTableEq(c.mrope_pos, ctx.mrope_pos) and
-            c.mrope_total == ctx.mrope_total and c.mrope_delta == ctx.mrope_delta)
+            c.mrope_total == ctx.mrope_total and c.mrope_delta == ctx.mrope_delta and
+            c.mrope_base == ctx.mrope_base)
             return .{ .cos = c.cos, .sin = c.sin };
         c.deinit();
         const cs = if (is_mrope)
@@ -22307,6 +22313,7 @@ pub const Transformer = struct {
         c.mrope_pos = ctx.mrope_pos;
         c.mrope_total = ctx.mrope_total;
         c.mrope_delta = ctx.mrope_delta;
+        c.mrope_base = ctx.mrope_base;
         c.builds += 1;
         return cs;
     }
@@ -22534,7 +22541,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(q_rope);
             q_rope = try self.applyMrope(qt, cos, ctx.mrope_sin_cur.?, rope_dims);
         } else {
-            const eff_off: c_int = pos_base + offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            const eff_off: c_int = pos_base + offset + mropeScalarShift(ctx);
             // The SAME spectrum attention rotates with (scaled when the config
             // says YaRN): the index queries and keys are the only place the
             // model asks "how far apart are these two blocks", and a block
@@ -23678,6 +23685,7 @@ pub const Transformer = struct {
             ctx.mrope_pos = mc.pos;
             ctx.mrope_total = mc.total;
             ctx.mrope_delta = mc.delta;
+            ctx.mrope_base = mc.base;
         }
         try self.beginMropeChunk(&ctx, @intCast(live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))), @intCast(seq_len), mlx.mlx_array_dtype(h));
         defer endMropeChunk(&ctx);
@@ -25924,7 +25932,15 @@ pub const Transformer = struct {
     }
 
     fn mropeContext(ctx: *const ForwardCtx) mrope.PositionContext {
-        return .{ .pos = ctx.mrope_pos.?, .total = ctx.mrope_total, .delta = ctx.mrope_delta };
+        return .{ .pos = ctx.mrope_pos.?, .total = ctx.mrope_total, .delta = ctx.mrope_delta, .base = ctx.mrope_base };
+    }
+
+    /// The scalar arm's offset shift on an M-RoPE forward: text past the table sits at
+    /// `absolute + delta`, and a cache whose row 0 is not absolute position 0 (the MTP
+    /// head) adds its `mrope_base`. 0 without a table.
+    fn mropeScalarShift(ctx: *const ForwardCtx) c_int {
+        if (ctx.mrope_pos == null) return 0;
+        return ctx.mrope_delta + @as(c_int, @intCast(ctx.mrope_base));
     }
 
     /// Per-prefill-chunk M-RoPE cos/sin on `ctx.mrope_cos/sin_cur`, built once
@@ -25932,7 +25948,9 @@ pub const Transformer = struct {
     /// position table (decode, multi-token spec verify) leave them null and
     /// take the scalar `offset + delta` path.
     fn beginMropeChunk(self: *Transformer, ctx: *ForwardCtx, offset: usize, seq_len: usize, dtype: mlx.mlx_dtype) !void {
-        if (ctx.mrope_pos == null or seq_len <= 1 or offset + seq_len > ctx.mrope_total) return;
+        // A chunk that starts inside the table takes it (`axisPosition` carries rows past the
+        // end on `+ delta`); one wholly past it is plain text on the scalar arm.
+        if (ctx.mrope_pos == null or seq_len <= 1 or ctx.mrope_base + offset >= ctx.mrope_total) return;
         const cs = try self.mropeCosSinAt(mropeContext(ctx), offset, 1, seq_len, dtype);
         ctx.mrope_cos_cur = cs.cos;
         ctx.mrope_sin_cur = cs.sin;
@@ -26247,7 +26265,7 @@ pub const Transformer = struct {
             fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
-            const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            const eff_off: c_int = offset + mropeScalarShift(ctx);
             const angles = self.qkAngleFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
             const ms: ?mlx.mlx_array = if (use_yarn)
                 try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(queries), &self.yarn_mscale_cast, self.s)
@@ -26268,7 +26286,7 @@ pub const Transformer = struct {
             fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
-            const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            const eff_off: c_int = offset + mropeScalarShift(ctx);
             // The kernel has no mscale slot: YaRN's factor is uniform across the
             // rotated slice, so folding it into the angle rows scales exactly the
             // rotation and nothing else (the pass-through dims never appear).
@@ -26316,7 +26334,7 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
                 if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);
             } else {
-                const eff_offset: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+                const eff_offset: c_int = offset + mropeScalarShift(ctx);
                 try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
                 try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
                 if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);

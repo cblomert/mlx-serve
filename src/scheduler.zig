@@ -8250,7 +8250,6 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     for (active, 0..) |slot, i| {
         if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
         const gen = if (slot.legacy_gen) |*g| g else return false;
-        if (gen.ctx.mrope_pos != null) return false;
         pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
         pending_draft = pending_draft or gen.mtp_pre_draft != null;
         const why = sch.batchVerdict(slot);
