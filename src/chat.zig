@@ -94,21 +94,65 @@ pub fn canonicalRole(role: []const u8) []const u8 {
     return if (std.mem.eql(u8, role, "developer")) "system" else role;
 }
 
-/// Fold every `system` message past index 0 into the leading one (created
-/// when absent). Templates we serve raise on a system turn that is not first
-/// and the raise is a silent generic fallback. Returns the joined buffer the
-/// caller owns, null when nothing moved.
-pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !?[]const u8 {
+/// Templates we serve raise on a system turn that is not first, and the raise is a silent
+/// generic fallback, so no `system` message may survive past index 0:
+///   - one BEFORE the first assistant turn (the conversation's opening context, e.g. Claude
+///     Code's environment block or SessionStart hook output) folds into the leading system
+///     message (created when absent);
+///   - one AFTER it is attached, as a `<system-reminder>`, to the user/tool message right
+///     before it (a user message in its place when there is none).
+/// A later turn never rewrites an earlier message, so turn N's render is a prefix of turn
+/// N+1's. Folding late ones into the head broke that: Claude Code appends a
+/// `<total_tokens>` note every turn, the head (after ~11k tokens of tool schemas) changed
+/// every request, and the prefix cache re-prefilled the whole conversation each message.
+/// Every buffer allocated here is appended to `owned`.
+pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message), owned: *std.ArrayList([]const u8)) !void {
+    var first_assistant: usize = messages.items.len;
+    for (messages.items, 0..) |m, idx| {
+        if (std.mem.eql(u8, m.role, "assistant")) {
+            first_assistant = idx;
+            break;
+        }
+    }
+
+    // Late system messages: in place, walking forward so a run of them lands on one message.
+    var i: usize = first_assistant;
+    while (i < messages.items.len) {
+        if (!std.mem.eql(u8, messages.items[i].role, "system")) {
+            i += 1;
+            continue;
+        }
+        const note = try std.fmt.allocPrint(allocator, "<system-reminder>\n{s}\n</system-reminder>", .{messages.items[i].content});
+        const prev_ok = i > 0 and (std.mem.eql(u8, messages.items[i - 1].role, "user") or
+            std.mem.eql(u8, messages.items[i - 1].role, "tool"));
+        if (prev_ok) {
+            defer allocator.free(note);
+            const prev = &messages.items[i - 1];
+            const joined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ prev.content, note });
+            errdefer allocator.free(joined);
+            try owned.append(allocator, joined);
+            prev.content = joined;
+            _ = messages.orderedRemove(i);
+        } else {
+            errdefer allocator.free(note);
+            try owned.append(allocator, note);
+            messages.items[i].role = "user";
+            messages.items[i].content = note;
+            i += 1;
+        }
+    }
+
+    // Opening-context system messages past index 0: fold into the leading one.
     var extra: usize = 0;
     for (messages.items[@min(messages.items.len, 1)..]) |m| {
         if (std.mem.eql(u8, m.role, "system")) extra += 1;
     }
-    if (extra == 0) return null;
+    if (extra == 0) return;
     const lead_is_system = messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system");
     var joined = std.ArrayList(u8).empty;
     errdefer joined.deinit(allocator);
     if (lead_is_system) try joined.appendSlice(allocator, messages.items[0].content);
-    var i: usize = if (lead_is_system) 1 else 0;
+    i = if (lead_is_system) 1 else 0;
     while (i < messages.items.len) {
         if (!std.mem.eql(u8, messages.items[i].role, "system")) {
             i += 1;
@@ -119,12 +163,13 @@ pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList
         _ = messages.orderedRemove(i);
     }
     const text = try joined.toOwnedSlice(allocator);
+    errdefer allocator.free(text);
+    try owned.append(allocator, text);
     if (lead_is_system) {
         messages.items[0].content = text;
     } else {
         try messages.insert(allocator, 0, .{ .role = "system", .content = text });
     }
-    return text;
 }
 
 pub const Message = struct {
@@ -14539,31 +14584,48 @@ test "K2-Horizon: assistant history always carries a thinking field, and the eff
     try testing.expect(std.mem.indexOf(u8, extra, "\"reasoning_effort\":\"high\"") != null);
 }
 
-test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
+test "foldSystemMessages: opening context joins the leading system message, later notes stay in place" {
     // Live 2026-09-15: Claude Code carries SessionStart hook output as a
     // `system`-role message INSIDE `messages`, after the top-level system
     // prompt. Qwen's template raises on a system turn that is not first, and
     // the raise is a silent generic fallback (the model loses its stop token).
     const al = std.testing.allocator;
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |o| al.free(o);
+        owned.deinit(al);
+    }
     var msgs = std.ArrayList(Message).empty;
     defer msgs.deinit(al);
     try msgs.append(al, .{ .role = "system", .content = "You are S." });
     try msgs.append(al, .{ .role = "system", .content = "hook output" });
     try msgs.append(al, .{ .role = "user", .content = "hi" });
+    try msgs.append(al, .{ .role = "system", .content = "env block" });
+    try msgs.append(al, .{ .role = "assistant", .content = "calling a tool" });
+    try msgs.append(al, .{ .role = "tool", .content = "tool out" });
     try msgs.append(al, .{ .role = "system", .content = "late note" });
-    const owned = try foldSystemMessages(al, &msgs);
-    defer if (owned) |o| al.free(o);
-    try std.testing.expectEqual(@as(usize, 2), msgs.items.len);
-    try std.testing.expectEqualStrings("You are S.\n\nhook output\n\nlate note", msgs.items[0].content);
+    try msgs.append(al, .{ .role = "system", .content = "second note" });
+    try msgs.append(al, .{ .role = "assistant", .content = "done" });
+    try msgs.append(al, .{ .role = "system", .content = "after assistant" });
+    try foldSystemMessages(al, &msgs, &owned);
+    try std.testing.expectEqual(@as(usize, 6), msgs.items.len);
+    try std.testing.expectEqualStrings("You are S.\n\nhook output\n\nenv block", msgs.items[0].content);
     try std.testing.expectEqualStrings("user", msgs.items[1].role);
+    try std.testing.expectEqualStrings("assistant", msgs.items[2].role);
+    try std.testing.expectEqualStrings("tool", msgs.items[3].role);
+    try std.testing.expectEqualStrings("tool out\n\n<system-reminder>\nlate note\n</system-reminder>\n\n<system-reminder>\nsecond note\n</system-reminder>", msgs.items[3].content);
+    try std.testing.expectEqualStrings("assistant", msgs.items[4].role);
+    // No user/tool message before it: a user turn in its place.
+    try std.testing.expectEqualStrings("user", msgs.items[5].role);
+    try std.testing.expectEqualStrings("<system-reminder>\nafter assistant\n</system-reminder>", msgs.items[5].content);
+    for (msgs.items[1..]) |m| try std.testing.expect(!std.mem.eql(u8, m.role, "system"));
 
     // No leading system: the fold creates one at index 0.
     var lone = std.ArrayList(Message).empty;
     defer lone.deinit(al);
     try lone.append(al, .{ .role = "user", .content = "hi" });
     try lone.append(al, .{ .role = "system", .content = "hook output" });
-    const owned2 = try foldSystemMessages(al, &lone);
-    defer if (owned2) |o| al.free(o);
+    try foldSystemMessages(al, &lone, &owned);
     try std.testing.expectEqualStrings("system", lone.items[0].role);
     try std.testing.expectEqualStrings("hook output", lone.items[0].content);
     try std.testing.expectEqual(@as(usize, 2), lone.items.len);
@@ -14573,6 +14635,42 @@ test "foldSystemMessages: a system turn past index 0 joins the leading system me
     defer plain.deinit(al);
     try plain.append(al, .{ .role = "system", .content = "You are S." });
     try plain.append(al, .{ .role = "user", .content = "hi" });
-    try std.testing.expect((try foldSystemMessages(al, &plain)) == null);
+    const before = owned.items.len;
+    try foldSystemMessages(al, &plain, &owned);
+    try std.testing.expectEqual(before, owned.items.len);
     try std.testing.expectEqual(@as(usize, 2), plain.items.len);
+}
+
+test "foldSystemMessages: a later turn renders the earlier turn's messages unchanged (prefix-cache stable)" {
+    // Claude Code 2.1.285 over /v1/messages: [user, system(env), ...] then a fresh
+    // `<total_tokens>` system note at the end of every later request.
+    const al = std.testing.allocator;
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |o| al.free(o);
+        owned.deinit(al);
+    }
+    const turns = [_][]const Message{
+        &.{ .{ .role = "system", .content = "S" }, .{ .role = "user", .content = "q" }, .{ .role = "system", .content = "env" } },
+        &.{ .{ .role = "system", .content = "S" }, .{ .role = "user", .content = "q" }, .{ .role = "system", .content = "env" }, .{ .role = "assistant", .content = "a1" }, .{ .role = "tool", .content = "r1" }, .{ .role = "system", .content = "<total_tokens>900</total_tokens>" } },
+        &.{ .{ .role = "system", .content = "S" }, .{ .role = "user", .content = "q" }, .{ .role = "system", .content = "env" }, .{ .role = "assistant", .content = "a1" }, .{ .role = "tool", .content = "r1" }, .{ .role = "system", .content = "<total_tokens>900</total_tokens>" }, .{ .role = "assistant", .content = "a2" }, .{ .role = "user", .content = "q2" }, .{ .role = "system", .content = "<total_tokens>800</total_tokens>" } },
+    };
+    var prev: ?std.ArrayList(Message) = null;
+    defer if (prev) |*p| p.deinit(al);
+    for (turns) |t| {
+        var msgs = std.ArrayList(Message).empty;
+        errdefer msgs.deinit(al);
+        try msgs.appendSlice(al, t);
+        try foldSystemMessages(al, &msgs, &owned);
+        if (prev) |*p| {
+            // Every message of the earlier render reappears verbatim, in order.
+            try std.testing.expect(msgs.items.len >= p.items.len);
+            for (p.items, 0..) |m, k| {
+                try std.testing.expectEqualStrings(m.role, msgs.items[k].role);
+                try std.testing.expectEqualStrings(m.content, msgs.items[k].content);
+            }
+            p.deinit(al);
+        }
+        prev = msgs;
+    }
 }

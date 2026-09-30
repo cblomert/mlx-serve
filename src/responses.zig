@@ -420,13 +420,10 @@ pub fn parseInput(
         else => {},
     }
 
-    // Templates we serve require the system turn first; fold any system past
-    // index 0 into the leading one — the same unconditional fold /v1/messages
-    // applies — so the native template renders a multi-system Responses input.
-    if (try chat_mod.foldSystemMessages(allocator, &pi.messages)) |joined| {
-        errdefer allocator.free(joined);
-        try pi.owned_strings.append(allocator, joined);
-    }
+    // Templates we serve require the system turn first; the same fold /v1/messages
+    // applies (opening context into the leading system message, later ones attached in
+    // place) so the native template renders a multi-system Responses input.
+    try chat_mod.foldSystemMessages(allocator, &pi.messages, &pi.owned_strings);
 
     return pi;
 }
