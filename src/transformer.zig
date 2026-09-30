@@ -4733,10 +4733,258 @@ fn qsaScoreFusedRunProbe() bool {
 
 pub fn qsaScoreFused(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array) !?mlx.mlx_array {
     qsaScoreFusedArm();
-    if (!qsaScoreFusedEligibleFrom(q, pooled)) return null;
     if (!mlx.streamIsGpu(s)) return null;
     if (!qsaPooledRowContiguous(pooled)) return null;
-    return try qsaScoreFusedDispatch(s, q, pooled);
+    if (qsaScoreFusedEligibleFrom(q, pooled)) return try qsaScoreFusedDispatch(s, q, pooled);
+    if (qsaScoreColEligibleFrom(q, pooled)) {
+        const out = try qsaScoreColDispatch(s, q, pooled);
+        if (diagEnvOnCached(&qsa_score_col_check_env, "MLX_SERVE_QSA_SCORE_COL_CHECK")) qsaScoreColCheck(s, q, pooled, out);
+        return out;
+    }
+    return null;
+}
+
+var qsa_score_col_check_env: ?bool = null;
+var qsa_score_col_checks: usize = 0;
+var qsa_score_col_check_mismatches: usize = 0;
+
+/// DIAGNOSTIC (MLX_SERVE_QSA_SCORE_COL_CHECK=1): score every live col dispatch through the
+/// composed chain too (f32 bank rebuilt from the pooled blocks) and compare bit for bit. Syncs
+/// per call; for parity runs only.
+fn qsaScoreColCheck(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array, got: mlx.mlx_array) void {
+    const k32t = qsaScoreK32tFromPooled(s, pooled) catch return;
+    defer _ = mlx.mlx_array_free(k32t);
+    const want = qsaScoreSheetComposed(s, q, k32t) catch return;
+    defer _ = mlx.mlx_array_free(want);
+    qsa_score_col_checks += 1;
+    if (!qsaProbeBitEqual(s, got, want)) {
+        qsa_score_col_check_mismatches += 1;
+        if (qsa_score_col_check_mismatches <= 8)
+            log.info("[qsa-score] col CHECK MISMATCH S={d} nb={d}\n", .{ mlx.getShape(q)[2], mlx.getShape(pooled)[1] });
+    }
+    if (qsa_score_col_checks % 2000 == 0)
+        log.info("[qsa-score] col check: {d} dispatches, {d} mismatches\n", .{ qsa_score_col_checks, qsa_score_col_check_mismatches });
+}
+
+/// Either one-read score arm serves `q` against `pooled` (the NAX tile kernel, or the column
+/// kernel at decode/verify widths). Both skip the f32 bank and return `[1, rows, nb]` f32.
+fn qsaScoreOneReadEligibleFrom(q: mlx.mlx_array, pooled: mlx.mlx_array) bool {
+    return qsaScoreFusedEligibleFrom(q, pooled) or qsaScoreColEligibleFrom(q, pooled);
+}
+
+// ── One-read column score kernel (msv_qsa_score_col) ──
+//
+// The composed chain's matmul is a steel GEMM (the broadcast heads fold into M = 4*S), whose
+// per-element result is k ascending from a zero accumulator. Every product is a bf16 x bf16
+// product, exact in f32, so an ordinary k-ascending sum reproduces it bit for bit (checked
+// against the chain at S 1..16 up to 75k blocks, and by the arm-time probe below); relu per
+// head, then the heads summed ascending from 0, as `mlx_sum_axis` does. One thread per bank
+// column reads the bf16 pooled row once: no f32 transposed bank, half the bytes, one dispatch
+// instead of four. `tools/qsa_score_mma.py` (COL=1): per layer at S=1 18.4 / 21.5 / 28.3 /
+// 42.7 us vs 32.7 / 38.6 / 52.8 / 82.7 for the chain at 4k / 16k / 32k / 75k blocks; S=3
+// 20.4 / 26.3 / 34.2 / 54.2 vs 29.8 / 41.1 / 54.2 / 96.3.
+const QSA_SCORE_COL_HEADER =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\
+;
+
+/// Up to SC query rows x 4 heads per pass (SC accumulators per head in registers), the pass's
+/// q rows staged as f32 in threadgroup memory (every lane reads the same address: broadcast).
+const QSA_SCORE_COL_SOURCE =
+    \\constexpr uint SC = (uint)SCV;
+    \\threadgroup float qs[4u * SC * 128u];
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint TGN = threads_per_threadgroup.x;
+    \\const uint n = thread_position_in_grid.x;
+    \\const uint nb = (uint)POOL_shape[1];
+    \\const uint S = (uint)Q_shape[2];
+    \\const device bfloat4* col = (const device bfloat4*)(POOL + (ulong)metal::min(n, nb - 1u) * 128ul);
+    \\for (uint s0 = 0; s0 < S; s0 += SC) {
+    \\  const uint sc = metal::min(SC, S - s0);
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (uint i = tid; i < 4u * SC * 128u; i += TGN) {
+    \\    const uint h = i / (SC * 128u), rem = i % (SC * 128u), s = rem / 128u, k = rem % 128u;
+    \\    qs[i] = (s < sc) ? float(Q[(h * S + s0 + s) * 128u + k]) : 0.0f;
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  float acc[4][SC];
+    \\  for (uint h = 0; h < 4u; ++h) for (uint s = 0; s < SC; ++s) acc[h][s] = 0.0f;
+    \\  for (uint k4 = 0; k4 < 32u; ++k4) {
+    \\    const float4 b = float4(col[k4]);
+    \\    for (uint j = 0; j < 4u; ++j)
+    \\      for (uint h = 0; h < 4u; ++h)
+    \\        for (uint s = 0; s < SC; ++s)
+    \\          acc[h][s] = metal::fma(qs[(h * SC + s) * 128u + k4 * 4u + j], b[j], acc[h][s]);
+    \\  }
+    \\  if (n < nb) {
+    \\    for (uint s = 0; s < sc; ++s) {
+    \\      float v = 0.0f;
+    \\      for (uint h = 0; h < 4u; ++h) v += metal::max(acc[h][s], 0.0f);
+    \\      OUT[(ulong)(s0 + s) * (ulong)nb + (ulong)n] = v;
+    \\    }
+    \\  }
+    \\}
+    \\
+;
+
+/// Decode + verify widths (1 .. FUSED256_MIN_Q_LEN-1); prefill chunks keep the composed chain.
+pub const QSA_SCORE_COL_MAX_ROWS: c_int = FUSED256_MIN_Q_LEN - 1;
+pub const QSA_SCORE_COL_MIN_NB: c_int = 129;
+const QSA_SCORE_COL_TG: c_int = 128;
+const QSA_SCORE_COL_SC_MAX: c_int = 4;
+
+pub var qsa_score_col_override: ?bool = null;
+var qsa_score_col_env: ?bool = null;
+var qsa_score_col_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+/// 0 = not probed, 1 = probe failed (arm off), 2 = bit-identical on this device.
+var qsa_score_col_probe_state: std.atomic.Value(u8) = .init(0);
+var qsa_score_col_engaged_bits: OneShotBits = .{};
+pub var qsa_score_col_dispatches: usize = 0;
+
+const QsaScoreColCfgKey = struct { rows: c_int, nb: c_int, sc: c_int };
+var qsa_score_col_cfgs = QsaCfgCache(QsaScoreColCfgKey, 1){};
+
+/// `MLX_SERVE_QSA_SCORE_COL=0` restores the composed chain at decode/verify widths. Read once.
+pub fn qsaScoreColEnabled() bool {
+    if (qsa_score_col_override) |v| return v;
+    if (qsa_score_col_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_SCORE_COL") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_score_col_env = v;
+    return v;
+}
+
+pub fn qsaScoreColActive() bool {
+    return qsaScoreColEnabled() and qsa_score_col_probe_state.load(.acquire) == 2;
+}
+
+pub fn qsaScoreColProbeReset() void {
+    qsa_score_col_probe_state.store(0, .release);
+}
+
+/// Probe once per process: bit-equality against the composed chain at every row-pass shape
+/// (one pass, a partial pass, several passes) and a ragged last threadgroup.
+pub fn qsaScoreColArm() void {
+    if (qsa_score_col_probe_state.load(.acquire) != 0) return;
+    if (!qsaScoreColEnabled()) return;
+    const ok = qsaScoreColRunProbe();
+    qsa_score_col_probe_state.store(if (ok) 2 else 1, .release);
+}
+
+fn qsaScoreColRunProbe() bool {
+    if (mlx.noGpuBackend()) return false;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return false;
+    _ = getQsaScoreColKernel() catch |e| {
+        log.info("[qsa-score] col disabled: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    const shapes = [_][2]c_int{ .{ 1, 700 }, .{ 3, 700 }, .{ 2, 4099 }, .{ 7, 333 }, .{ QSA_SCORE_COL_MAX_ROWS, 129 } };
+    // The probe's own dispatches stay quiet: "engaged" is for live widths.
+    qsa_score_col_engaged_bits.seen = std.math.maxInt(u32);
+    defer qsa_score_col_engaged_bits.reset();
+    for (shapes) |sh| {
+        if (!qsaScoreColProbeShape(s, sh[0], sh[1])) {
+            log.info("[qsa-score] col disabled: probe mismatch (S={d} nb={d}) — the composed chain stays\n", .{ sh[0], sh[1] });
+            return false;
+        }
+    }
+    // The meters count live dispatches, not the probe's.
+    qsa_score_col_dispatches = 0;
+    return true;
+}
+
+fn qsaScoreColProbeShape(s: mlx.mlx_stream, rows: c_int, nb: c_int) bool {
+    const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, rows, 128 }, 0x5C01_0001 +% @as(u32, @intCast(rows))) orelse return false;
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = qsaProbeLcgBf16(s, &[_]c_int{ 1, nb, 128 }, 0x5C01_A5A5 +% @as(u32, @intCast(nb))) orelse return false;
+    defer _ = mlx.mlx_array_free(pooled);
+    const k32t = qsaScoreK32tFromPooled(s, pooled) catch return false;
+    defer _ = mlx.mlx_array_free(k32t);
+    const want = qsaScoreSheetComposed(s, q, k32t) catch return false;
+    defer _ = mlx.mlx_array_free(want);
+    const got = qsaScoreColDispatch(s, q, pooled) catch return false;
+    defer _ = mlx.mlx_array_free(got);
+    if (mlx.mlx_array_eval(got) != 0 or mlx.mlx_array_eval(want) != 0) return false;
+    return qsaProbeBitEqual(s, got, want);
+}
+
+fn qsaScoreColEligibleFrom(q: mlx.mlx_array, pooled: mlx.mlx_array) bool {
+    if (!qsaScoreColActive()) return false;
+    if (q.ctx == null or pooled.ctx == null) return false;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(pooled) != 3) return false;
+    const qs = mlx.getShape(q);
+    const ps = mlx.getShape(pooled);
+    if (qs[0] != 1 or qs[1] != 4 or qs[3] != 128) return false;
+    if (qs[2] < 1 or qs[2] > QSA_SCORE_COL_MAX_ROWS) return false;
+    // At N <= 128 blocks MLX runs the chain's matmul through another kernel with its own
+    // order (N = 1 is a gemv): the arm starts where the steel order holds. Selection engages
+    // past the 2048-row budget (512 blocks), so live widths are always above it.
+    if (ps[0] != 1 or ps[1] < QSA_SCORE_COL_MIN_NB or ps[2] != 128) return false;
+    // bf16 x bf16 products are what make the plain k-ascending sum exact.
+    return mlx.mlx_array_dtype(q) == .bfloat16 and mlx.mlx_array_dtype(pooled) == .bfloat16;
+}
+
+fn getQsaScoreColKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_score_col_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "Q", "POOL" };
+    const output_names = [_][*:0]const u8{"OUT"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_qsa_score_col",
+        in_vec,
+        out_vec,
+        QSA_SCORE_COL_SOURCE,
+        QSA_SCORE_COL_HEADER,
+        // q arrives as an axis-2 slice of the roped index queries: the copy is what makes
+        // Q_shape[2] the physical row stride. The pooled view over its capacity buffer is
+        // already row-contiguous, so it passes through uncopied.
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_score_col_kernel_cached = kernel;
+    return kernel;
+}
+
+fn qsaScoreColDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array) !mlx.mlx_array {
+    const rows = mlx.getShape(q)[2];
+    const nb = mlx.getShape(pooled)[1];
+    const sc: c_int = @min(rows, QSA_SCORE_COL_SC_MAX);
+    const kernel = try getQsaScoreColKernel();
+    const key = QsaScoreColCfgKey{ .rows = rows, .nb = nb, .sc = sc };
+    const cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_score_col_cfgs.get(key) orelse blk: {
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const o_shape = [_]c_int{ 1, rows, nb };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 3, .float32));
+        const ntg: c_int = @divTrunc(nb + QSA_SCORE_COL_TG - 1, QSA_SCORE_COL_TG);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, ntg * QSA_SCORE_COL_TG, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, QSA_SCORE_COL_TG, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SCV", sc));
+        qsa_score_col_cfgs.put(key, .{config});
+        break :blk .{config};
+    };
+    const inputs_arr = [_]mlx.mlx_array{ q, pooled };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfgs[0], s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    qsa_score_col_dispatches += 1;
+    if (qsa_score_col_engaged_bits.take(qsaWidthBucket(rows))) {
+        log.info("[qsa-score] engaged (col S={d} nb={d} sc={d}) — MLX_SERVE_QSA_SCORE_COL=0 restores the composed chain\n", .{ rows, nb, sc });
+    }
+    return out;
 }
 
 pub fn qsaScoreSheet(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array, k32t: mlx.mlx_array, fused: bool) !mlx.mlx_array {
@@ -8856,13 +9104,17 @@ fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !bool
         try capBufReslice(s, entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, 3, keep_score);
         qsa_score_bank_reslices += 1;
     } else {
-        if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
-        entry.qsa_score_bank = .{ .ctx = null };
-        if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
-        entry.qsa_score_buf = .{ .ctx = null };
-        entry.qsa_score_blocks = 0;
+        qsaScoreBankDrop(entry);
     }
     return true;
+}
+
+fn qsaScoreBankDrop(entry: *SSMCacheEntry) void {
+    if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
+    entry.qsa_score_bank = .{ .ctx = null };
+    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
+    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_blocks = 0;
 }
 
 /// Rollbacks that kept the f32 score bank (re-sliced to the kept blocks) instead of dropping it.
@@ -15697,6 +15949,7 @@ pub const Transformer = struct {
         const s = mlx.gpuStream();
         if (config.indexer_budget != 0) {
             qsaScoreFusedArm();
+            qsaScoreColArm();
             qsaNaxArm();
         }
         const prefix = config.weight_prefix;
@@ -22018,7 +22271,13 @@ pub const Transformer = struct {
     }
 
     fn qsaScoreOperand(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int, fused: bool) !mlx.mlx_array {
-        if (fused) return .{ .ctx = null };
+        if (fused) {
+            // A one-read arm serves this width: a bank a composed prefill left behind is dead
+            // weight (4 bytes per pooled element, ~0.8 GB per 524k context), and the next
+            // composed forward rebuilds it from the pooled bank.
+            qsaScoreBankDrop(entry);
+            return .{ .ctx = null };
+        }
         return self.qsaScoreBank(entry, batch, nb, idx_hd);
     }
 
@@ -22300,7 +22559,7 @@ pub const Transformer = struct {
         }
         // scores[b, s, blk] = sum_h relu(q_h . k_blk) in f32 like the reference; the 1/sqrt(hd)
         // scale is dropped because it is monotone for the top-k. Borrowed from the entry.
-        const fused = qsaScoreFusedEligibleFrom(q_rope, entry.qsa_pooled) and
+        const fused = qsaScoreOneReadEligibleFrom(q_rope, entry.qsa_pooled) and
             qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsGpu(self.s);
         const k32 = try self.qsaScoreOperand(entry, batch, nb, idx_hd, fused);
 
@@ -61791,6 +62050,124 @@ test "qsa score fused: no bank is built under the fused arm" {
         _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, true);
         try testing.expect(entry.qsa_score_bank.ctx == null);
     }
+}
+
+test "qsa score col: bit-identical to the composed chain at decode and verify widths" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const saved = qsa_score_col_override;
+    defer qsa_score_col_override = saved;
+    qsa_score_col_override = true;
+    qsaScoreColArm();
+    try testing.expect(qsaScoreColActive());
+
+    const rows_list = [_]c_int{ 1, 2, 3, 4, 5, 8, QSA_SCORE_COL_MAX_ROWS };
+    const nbs = [_]c_int{ QSA_SCORE_COL_MIN_NB, 130, 255, 257, 2051, 20000 };
+    for (rows_list) |rows| {
+        for (nbs) |nb| {
+            const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, rows, 128 }, 0x0C01_0000 +% @as(u32, @intCast(rows * 7 + nb))).?;
+            defer _ = mlx.mlx_array_free(q);
+            const pooled = qsaProbeLcgBf16(s, &[_]c_int{ 1, nb, 128 }, 0x0C01_B000 +% @as(u32, @intCast(nb))).?;
+            defer _ = mlx.mlx_array_free(pooled);
+            try testing.expect(qsaScoreColEligibleFrom(q, pooled));
+            const k32t = try qsaScoreK32tFromPooled(s, pooled);
+            defer _ = mlx.mlx_array_free(k32t);
+            const want = try qsaScoreSheetComposed(s, q, k32t);
+            defer _ = mlx.mlx_array_free(want);
+            const got = try qsaScoreColDispatch(s, q, pooled);
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(rows, mlx.getShape(got)[1]);
+            try testing.expectEqual(nb, mlx.getShape(got)[2]);
+            try testing.expect(qsaProbeBitEqual(s, got, want));
+        }
+    }
+
+    // A verify chunk arrives as an axis-2 slice of the roped queries (strided heads).
+    const big = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, 9, 128 }, 0x0C01_5117).?;
+    defer _ = mlx.mlx_array_free(big);
+    var q_slice = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_slice);
+    try mlx.check(mlx.mlx_slice(&q_slice, big, &[_]c_int{ 0, 0, 2, 0 }, 4, &[_]c_int{ 1, 4, 5, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+    const pooled = qsaProbeLcgBf16(s, &[_]c_int{ 1, 3001, 128 }, 0x0C01_5118).?;
+    defer _ = mlx.mlx_array_free(pooled);
+    const k32t = try qsaScoreK32tFromPooled(s, pooled);
+    defer _ = mlx.mlx_array_free(k32t);
+    const want = try qsaScoreSheetComposed(s, q_slice, k32t);
+    defer _ = mlx.mlx_array_free(want);
+    const got = try qsaScoreColDispatch(s, q_slice, pooled);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expect(qsaProbeBitEqual(s, got, want));
+
+    // Prefill widths and other geometries keep the composed chain.
+    const wide = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, FUSED256_MIN_Q_LEN, 128 }, 0x0C01_0016).?;
+    defer _ = mlx.mlx_array_free(wide);
+    try testing.expect(!qsaScoreColEligibleFrom(wide, pooled));
+    const hd64 = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, 1, 64 }, 0x0C01_0064).?;
+    defer _ = mlx.mlx_array_free(hd64);
+    const pooled64 = qsaProbeLcgBf16(s, &[_]c_int{ 1, 300, 64 }, 0x0C01_0065).?;
+    defer _ = mlx.mlx_array_free(pooled64);
+    try testing.expect(!qsaScoreColEligibleFrom(hd64, pooled64));
+    const small = qsaProbeLcgBf16(s, &[_]c_int{ 1, QSA_SCORE_COL_MIN_NB - 1, 128 }, 0x0C01_0001).?;
+    defer _ = mlx.mlx_array_free(small);
+    try testing.expect(!qsaScoreColEligibleFrom(q_slice, small));
+    qsa_score_col_override = false;
+    try testing.expect(!qsaScoreColEligibleFrom(q_slice, pooled));
+}
+
+test "qsa score col: a one-read width drops the bank a composed prefill left, and selects the same blocks" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.rht = null;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    xfm.qsa_score_bank_builds = 0;
+    const saved = qsa_score_col_override;
+    defer qsa_score_col_override = saved;
+    qsa_score_col_override = true;
+    qsaScoreColArm();
+    try testing.expect(qsaScoreColActive());
+
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+    entry.qsa_ratio = 4;
+    entry.qsa_reserve_rows = 4096;
+    const nb: c_int = 777;
+    const blocks = qsaProbeLcgBf16(s, &[_]c_int{ 1, nb, 128 }, 0x0C01_BA4C).?;
+    defer _ = mlx.mlx_array_free(blocks);
+    try xfm.qsaAppendPooled(&entry, blocks, 0);
+
+    const bank = try xfm.qsaScoreOperand(&entry, 1, nb, 128, false);
+    try testing.expect(bank.ctx != null and entry.qsa_score_blocks == nb);
+    const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 4, 3, 128 }, 0x0C01_BA4D).?;
+    defer _ = mlx.mlx_array_free(q);
+    const want = try qsaScoreSheet(s, q, entry.qsa_pooled, bank, false);
+    defer _ = mlx.mlx_array_free(want);
+    try testing.expect(mlx.mlx_array_eval(want) == 0);
+
+    const fused = qsaScoreOneReadEligibleFrom(q, entry.qsa_pooled) and qsaPooledRowContiguous(entry.qsa_pooled);
+    try testing.expect(fused);
+    const none = try xfm.qsaScoreOperand(&entry, 1, nb, 128, fused);
+    try testing.expect(none.ctx == null);
+    try testing.expect(entry.qsa_score_bank.ctx == null and entry.qsa_score_buf.ctx == null);
+    try testing.expectEqual(@as(c_int, 0), entry.qsa_score_blocks);
+    const got = try qsaScoreSheet(s, q, entry.qsa_pooled, none, fused);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expect(qsaProbeBitEqual(s, got, want));
+
+    // The same top-k blocks come out of the fused select either way.
+    const bounds_host = [_]i32{ nb, nb, nb };
+    const bounds = mlx.mlx_array_new_data(&bounds_host, &[_]c_int{3}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    const ids_want = (try qsaSelectTopBlocks(s, want, bounds, 512)).?;
+    defer _ = mlx.mlx_array_free(ids_want);
+    const ids_got = (try qsaSelectTopBlocks(s, got, bounds, 512)).?;
+    defer _ = mlx.mlx_array_free(ids_got);
+    try testing.expect(qsaProbeBitEqual(s, ids_got, ids_want));
+
+    // The next composed forward rebuilds the bank from the pooled blocks.
+    const rebuilt = try xfm.qsaScoreOperand(&entry, 1, nb, 128, false);
+    try testing.expect(rebuilt.ctx != null and entry.qsa_score_blocks == nb);
 }
 
 test "qsa score fused: unsupported indexer geometry falls back to the composed chain" {
