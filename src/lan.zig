@@ -58,6 +58,8 @@ pub fn routeClass(method: []const u8, path: []const u8) RouteClass {
         for ([_][]const u8{
             "/v1/chat/completions",   "/v1/completions",
             "/v1/messages",           "/v1/responses",
+            "/v1/messages/count_tokens",
+            "/v1/messages/count_tokens",
             "/v1/embeddings",         "/v1/images/generations",
             "/v1/images/edits",       "/v1/audio/speech",
             "/v1/audio/music-generations",
@@ -886,7 +888,7 @@ const fd_t = std.c.fd_t;
 
 /// Non-blocking connect with a real deadline: a blocking connect to a
 /// powered-off host can hang for the kernel's full SYN-retry budget (~75 s).
-fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
+pub fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
     const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.PeerUnreachable;
     errdefer _ = std.c.close(fd);
@@ -917,7 +919,7 @@ fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
     return fd;
 }
 
-fn writeAllFd(fd: fd_t, data: []const u8) !void {
+pub fn writeAllFd(fd: fd_t, data: []const u8) !void {
     var off: usize = 0;
     while (off < data.len) {
         const n = std.c.write(fd, data.ptr + off, data.len - off);
@@ -927,7 +929,7 @@ fn writeAllFd(fd: fd_t, data: []const u8) !void {
 }
 
 /// Read once; 0 on EOF, error on failure/timeout.
-fn readFd(fd: fd_t, buf: []u8) !usize {
+pub fn readFd(fd: fd_t, buf: []u8) !usize {
     const n = std.c.read(fd, buf.ptr, buf.len);
     if (n < 0) return error.ReadFailed;
     return @intCast(n);

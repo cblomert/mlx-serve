@@ -190,6 +190,7 @@ const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
+const websearch_mod = @import("websearch.zig");
 const cli_mod = @import("cli.zig");
 const build_options = @import("build_options");
 const nowSecs = io_util.nowSecs;
@@ -322,6 +323,10 @@ pub const Conn = struct {
     /// output through `writer()` directly, bypassing this hook — same
     /// interception pattern as `ws_mode`. See src/ollama.zig.
     ollama_sink: ?*ollama_mod.Sink = null,
+    /// Non-null while the server-side web_search loop runs an inner
+    /// /v1/messages round: that round's writes are captured (src/websearch.zig)
+    /// and relayed from there. Same interception point as `ollama_sink`.
+    capture: ?*websearch_mod.Capture = null,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -330,6 +335,7 @@ pub const Conn = struct {
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.ollama_sink = null;
+        c.capture = null;
         c.sse_headers_sent = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
@@ -350,6 +356,7 @@ pub const Conn = struct {
 
     pub fn writeAll(c: *Conn, data: []const u8) !void {
         c.heartbeat.noteWrite(nowMsMonotonic(c.io));
+        if (c.capture) |s| return s.feed(data);
         if (c.ollama_sink) |s| return s.feed(data);
         try c.writer().writeAll(data);
         try c.writer().flush();
@@ -357,13 +364,14 @@ pub const Conn = struct {
 
     pub fn writeAllNoFlush(c: *Conn, data: []const u8) !void {
         c.heartbeat.noteWrite(nowMsMonotonic(c.io));
+        if (c.capture) |s| return s.feed(data);
         if (c.ollama_sink) |s| return s.feed(data);
         try c.writer().writeAll(data);
     }
 
     pub fn flush(c: *Conn) !void {
         c.heartbeat.noteWrite(nowMsMonotonic(c.io));
-        if (c.ollama_sink != null) return;
+        if (c.ollama_sink != null or c.capture != null) return;
         try c.writer().flush();
     }
 
@@ -776,6 +784,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/images/generations",
     "/v1/load-model",
     "/v1/messages",
+    "/v1/messages/count_tokens",
     "/v1/models",
     "/v1/models/rescan",
     "/v1/providers",
@@ -1877,6 +1886,7 @@ pub fn serve(
     log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/decisions (Laya)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
+    log.info("  POST /v1/messages/count_tokens (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
     log.info("  GET  /v1/responses/{{id}}\n", .{});
@@ -2354,7 +2364,7 @@ fn handleConnection(
         };
         if (target) |t| {
             if (textGenRejectReason(t)) |reason| {
-                if (std.mem.eql(u8, path, "/v1/messages")) {
+                if (std.mem.eql(u8, path, "/v1/messages") or std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
                     try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
                 } else if (std.mem.startsWith(u8, path, "/api/")) {
                     try sendOllamaError(allocator, stream, "400 Bad Request", reason);
@@ -2508,7 +2518,15 @@ fn handleConnection(
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleAnthropicMessages(allocator, stream, body, lm);
+        try handleAnthropicMessages(allocator, stream, body, lm, .generate);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
+        if (text_gen_reject) |reason| {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            return;
+        }
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleAnthropicMessages(allocator, stream, body, lm, .count_tokens);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -6323,6 +6341,7 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
         const routes = [_][]const u8{
             "/v1/chat/completions", "/v1/completions", "/v1/messages",
             "/v1/responses",        "/api/chat",       "/api/generate",
+            "/v1/messages/count_tokens",
         };
         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
         return false;
@@ -15524,8 +15543,14 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
         if (i > 0) try buf.append(allocator, ',');
         if (tool_val != .object) continue;
         const tool = tool_val.object;
-        const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
-        const desc = if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
+        // Anthropic's `web_search_*` server tool has no schema: the model sees
+        // a plain web_search(query) function, answered by handleAnthropicWebSearch.
+        const web_search = websearch_mod.isServerTool(tool);
+        const given_name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
+        const name = if (web_search and given_name.len == 0) "web_search" else given_name;
+        const desc = if (web_search)
+            websearch_mod.TOOL_DESCRIPTION
+        else if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
         const esc_n = try jsonEscape(allocator, name);
         defer allocator.free(esc_n);
         const esc_d = try jsonEscape(allocator, desc);
@@ -15535,7 +15560,9 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
         try buf.appendSlice(allocator, ",\"description\":");
         try buf.appendSlice(allocator, esc_d);
         try buf.appendSlice(allocator, ",\"parameters\":");
-        if (tool.get("input_schema")) |schema_val| {
+        if (web_search) {
+            try buf.appendSlice(allocator, websearch_mod.TOOL_PARAMETERS);
+        } else if (tool.get("input_schema")) |schema_val| {
             try serializeJsonValue(allocator, &buf, schema_val);
         } else {
             try buf.appendSlice(allocator, "{}");
@@ -15546,11 +15573,37 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
     return try buf.toOwnedSlice(allocator);
 }
 
+test "buildOpenAIToolsJson: a web_search server tool renders as web_search(query); count_tokens is a route" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"web_search_20250305","name":"web_search","max_uses":8},{"name":"Read","description":"r","input_schema":{"type":"object"}}]
+    , .{});
+    defer parsed.deinit();
+    const out = try buildOpenAIToolsJson(a, parsed.value.array);
+    defer a.free(out);
+    const v = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer v.deinit();
+    const f0 = v.value.array.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("web_search", f0.get("name").?.string);
+    try std.testing.expectEqualStrings(websearch_mod.TOOL_DESCRIPTION, f0.get("description").?.string);
+    try std.testing.expect(f0.get("parameters").?.object.get("properties").?.object.get("query") != null);
+    try std.testing.expectEqualStrings("Read", v.value.array.items[1].object.get("function").?.object.get("name").?.string);
+    try std.testing.expect(routeExists("/v1/messages/count_tokens"));
+    try std.testing.expect(isTextGenRoute("POST", "/v1/messages/count_tokens"));
+    try std.testing.expectEqual(lan_mod.RouteClass.model_gated, lan_mod.routeClass("POST", "/v1/messages/count_tokens"));
+}
+
+/// What a /v1/messages body is for: a generation, or `POST
+/// /v1/messages/count_tokens` — the same parse and template render, answered
+/// with the prompt's token count.
+const AnthropicMode = enum { generate, count_tokens };
+
 fn handleAnthropicMessages(
     allocator: std.mem.Allocator,
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+    mode: AnthropicMode,
 ) !void {
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gate below uses `config.has_hybrid_layers`.
@@ -15570,6 +15623,19 @@ fn handleAnthropicMessages(
     }
     const root = parsed.value.object;
 
+    // A `web_search_*` server tool turns the request into the server-side
+    // search loop, which runs this handler again per round (with the Conn
+    // captured, so that inner call lands below).
+    if (mode == .generate and stream.capture == null) {
+        if (root.get("tools")) |tv| if (tv == .array) {
+            var ws_arena = std.heap.ArenaAllocator.init(allocator);
+            defer ws_arena.deinit();
+            if (try websearch_mod.findServerTool(ws_arena.allocator(), tv.array.items)) |cfg| {
+                return handleAnthropicWebSearch(allocator, ws_arena.allocator(), stream, root, lm, cfg);
+            }
+        };
+    }
+
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
     const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
@@ -15577,7 +15643,7 @@ fn handleAnthropicMessages(
     // For the request log line only. This surface 400s on a missing budget, so
     // the origin here is never `.auto`.
     const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
-    if (max_tokens == 0) {
+    if (max_tokens == 0 and mode == .generate) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
         return;
     }
@@ -16078,6 +16144,17 @@ fn handleAnthropicMessages(
     }
     const tokenize_ns = tokenize_sw.read();
 
+    if (mode == .count_tokens) {
+        // Media counts as its placeholder tokens: expanding it would mean
+        // running the vision/audio encoders just to count.
+        defer allocator.free(prompt_ids_raw);
+        var count_buf: [48]u8 = undefined;
+        const count_json = try std.fmt.bufPrint(&count_buf, "{{\"input_tokens\":{d}}}", .{prompt_ids_raw.len});
+        log.info("POST /v1/messages/count_tokens ({d} msgs, tools={d}b) -> {d} tokens\n", .{ messages.items.len, if (effective_tools_json) |tj| tj.len else 0, prompt_ids_raw.len });
+        try sendResponse(stream, "200 OK", "application/json", count_json);
+        return;
+    }
+
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     var system_chars: usize = 0;
     for (messages.items) |msg| {
@@ -16232,6 +16309,166 @@ fn handleAnthropicMessages(
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
+    }
+}
+
+/// The SSE head `sendSseHeaders` writes for /v1/messages, for the web-search
+/// relay, which writes past the Conn's capture hook.
+const SSE_HEAD_ANTHROPIC = "HTTP/1.1 200 OK\r\n" ++
+    "Content-Type: text/event-stream\r\n" ++
+    "Cache-Control: no-cache\r\n" ++
+    "Connection: close\r\n" ++
+    "Access-Control-Allow-Origin: *\r\n" ++
+    "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+    "Access-Control-Allow-Headers: " ++ SSE_ALLOW_HEADERS_ANTHROPIC ++ "\r\n\r\n";
+
+/// Web-search relay output: straight to the socket, past `Conn.capture`.
+fn webSearchRelayOut(impl: *anyopaque, data: []const u8) anyerror!void {
+    const c: *Conn = @ptrCast(@alignCast(impl));
+    c.heartbeat.noteWrite(nowMsMonotonic(c.io));
+    try c.writer().writeAll(data);
+    try c.writer().flush();
+}
+
+/// Anthropic `web_search_*` server tool (src/websearch.zig). The request runs
+/// as inner streaming /v1/messages rounds with their output captured; every
+/// `web_search` call the model makes is answered from SearXNG and fed back,
+/// until the model answers without searching (or `max_uses` + 2 rounds). The
+/// client gets ONE message: each round's blocks, with a `server_tool_use` +
+/// `web_search_tool_result` pair in place of every call — relayed live when it
+/// asked for a stream. Each round re-sends the previous round's prompt plus
+/// its output, so the prefix cache carries the conversation forward.
+fn handleAnthropicWebSearch(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    stream: *Conn,
+    root: std.json.ObjectMap,
+    lm: *LoadedModel,
+    cfg: websearch_mod.ToolConfig,
+) !void {
+    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const default_model = lm.config.?.model_type;
+    const model_name = if (root.get("model")) |v| (if (v == .string) v.string else default_model) else default_model;
+    const endpoint = websearch_mod.endpointFromEnv();
+    const msg_id = try std.fmt.allocPrint(arena, "msg_{d}", .{nowMs(stream.io)});
+    var relay = websearch_mod.Relay{
+        .gpa = allocator,
+        .out_ctx = stream,
+        .outFn = webSearchRelayOut,
+        .sse_head = SSE_HEAD_ANTHROPIC,
+        .model = model_name,
+        .msg_id = msg_id,
+    };
+    log.info("[web_search] POST /v1/messages with {s} (max_uses={d}, stream={}, searxng={s})\n", .{ cfg.name, cfg.max_uses, is_stream, if (endpoint != null) "on" else "unset" });
+
+    var extra = std.ArrayList([]const u8).empty;
+    var blocks = std.ArrayList([]const u8).empty;
+    var usage = websearch_mod.Usage{};
+    var stop_reason: []const u8 = "end_turn";
+    var stop_seq: []const u8 = "null";
+    const max_rounds = cfg.max_uses + 2;
+    var round: u32 = 0;
+    while (true) : (round += 1) {
+        const body = try websearch_mod.innerBody(arena, root, extra.items, round > 0);
+        var cap = websearch_mod.Capture{
+            .gpa = allocator,
+            .arena = arena,
+            .search_name = cfg.name,
+            .relay = if (is_stream) &relay else null,
+        };
+        const outer_sse = stream.sse_headers_sent;
+        stream.sse_headers_sent = false;
+        stream.capture = &cap;
+        const inner = handleAnthropicMessages(allocator, stream, body, lm, .generate);
+        stream.capture = null;
+        stream.sse_headers_sent = outer_sse or relay.started;
+        try inner;
+
+        if (!cap.head_done or !cap.is_sse) {
+            // Refused before generating (context overflow, bad parameters…):
+            // the client gets that answer as it stands.
+            if (relay.started) {
+                try relay.event("error", if (cap.body.items.len > 0) cap.body.items else "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"web search round failed\"}}");
+            } else if (cap.head_done) {
+                try webSearchRelayOut(stream, cap.head);
+                try webSearchRelayOut(stream, cap.body.items);
+            } else {
+                try sendAnthropicError(allocator, stream, "api_error", "web search round produced no response", 500);
+            }
+            return;
+        }
+        if (cap.error_data) |ed| {
+            // A started relay already passed the error event on.
+            if (!relay.started) {
+                if (is_stream) {
+                    try relay.start(cap.input_tokens);
+                    try relay.event("error", ed);
+                } else {
+                    try sendResponse(stream, "500 Internal Server Error", "application/json", ed);
+                }
+            }
+            return;
+        }
+        if (!cap.saw_stop) return; // the client went away mid-round
+
+        usage.input_tokens += cap.input_tokens;
+        usage.output_tokens += cap.output_tokens;
+        usage.cache_read += cap.cache_read;
+        stop_reason = cap.stop_reason;
+        stop_seq = cap.stop_sequence_json;
+        for (cap.blocks.items) |*b| {
+            if (b.is_search) continue;
+            if (try b.json(arena)) |j| try blocks.append(arena, j);
+        }
+        if (cap.searchCount() == 0 or !std.mem.eql(u8, cap.stop_reason, "tool_use")) break;
+
+        var answers = std.ArrayList(websearch_mod.ToolAnswer).empty;
+        for (cap.blocks.items) |*b| {
+            if (b.kind != .tool_use or !b.is_search) continue;
+            const srv_id = try websearch_mod.serverToolId(arena, b.id);
+            const input = websearch_mod.objectOrEmpty(arena, b.body.items);
+            const query = websearch_mod.queryOf(arena, b.body.items);
+            try blocks.append(arena, try websearch_mod.serverToolUseJson(arena, srv_id, cfg.name, input));
+            if (relay.started) {
+                try relay.serverToolUse(srv_id, cfg.name, input);
+                try relay.ping();
+            }
+            const sw = Stopwatch.init(stream.io);
+            const outcome: websearch_mod.Outcome = if (query == null)
+                .{ .failed = .invalid_input }
+            else if (usage.searches >= cfg.max_uses)
+                .{ .failed = .max_uses_exceeded }
+            else if (endpoint) |ep| blk: {
+                usage.searches += 1;
+                break :blk websearch_mod.search(arena, ep, query.?, cfg);
+            } else .{ .failed = .unavailable };
+            switch (outcome) {
+                .results => |rs| log.info("[web_search] \"{s}\" -> {d} results ({d} ms)\n", .{ query.?, rs.len, sw.read() / std.time.ns_per_ms }),
+                .failed => |code| log.info("[web_search] \"{s}\" -> {s}\n", .{ query orelse "", @tagName(code) }),
+            }
+            const content = try websearch_mod.resultContentJson(arena, outcome);
+            try blocks.append(arena, try websearch_mod.resultBlockJson(arena, srv_id, content));
+            if (relay.started) try relay.searchResult(srv_id, content);
+            try answers.append(arena, .{ .tool_use_id = b.id, .text = try websearch_mod.modelText(arena, query orelse "", outcome) });
+        }
+        // Client tools called in the same turn end it: the client runs them
+        // (stop_reason stays tool_use) with the searches already answered.
+        if (cap.hasClientToolCall()) break;
+        if (round + 1 >= max_rounds) {
+            stop_reason = "end_turn";
+            break;
+        }
+        const msgs = try websearch_mod.roundMessages(arena, &cap, answers.items);
+        try extra.appendSlice(arena, &msgs);
+    }
+
+    log.info("[web_search] done: {d} round(s), {d} search(es), stop={s}, in={d} out={d} cached={d}\n", .{ round + 1, usage.searches, stop_reason, usage.input_tokens, usage.output_tokens, usage.cache_read });
+    if (is_stream) {
+        try relay.start(usage.input_tokens);
+        try relay.finish(stop_reason, stop_seq, usage);
+    } else {
+        const json = try websearch_mod.messageJson(arena, msg_id, model_name, blocks.items, stop_reason, stop_seq, usage);
+        try sendResponse(stream, "200 OK", "application/json", json);
     }
 }
 
