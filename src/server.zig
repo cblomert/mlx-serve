@@ -8142,23 +8142,169 @@ fn appendAnthropicAssistant(
 fn appendPdfPageImages(allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), b64: []const u8, vp: chat_mod.VisionPreproc) !void {
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
+    const key = PdfPageCache.keyFor(b64, vp);
+    if (try PdfPageCache.get(allocator, key, b64.len, list)) |n| {
+        if (n > 0) log.info("  PDF: {d} scanned page(s) attached as images ({d} ms, page cache)\n", .{ n, msSince(t0) });
+        return;
+    }
     const pages = try pdf_mod.scannedPageImages(allocator, b64);
     defer {
         for (pages) |p| allocator.free(p.rgb);
         allocator.free(pages);
     }
+    const first = list.items.len;
+    var complete = true;
     for (pages) |p| {
-        const img = rgbToImageData(allocator, p.rgb, p.width, p.height, vp) orelse continue;
+        const img = rgbToImageData(allocator, p.rgb, p.width, p.height, vp) orelse {
+            complete = false;
+            continue;
+        };
         list.append(allocator, img) catch {
             allocator.free(img.pixels);
+            complete = false;
             continue;
         };
     }
+    // Only a document whose every page made it: a partial set would replay the failure.
+    if (complete) PdfPageCache.put(key, b64.len, list.items[first..]);
+    if (pages.len > 0) log.info("  PDF: {d} scanned page(s) attached as images ({d} ms render + preprocess)\n", .{ pages.len, msSince(t0) });
+}
+
+fn msSince(t0: std.c.timespec) i64 {
     var t1: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t1);
-    const ms = @divTrunc((t1.sec - t0.sec) * 1000 * 1000 * 1000 + (t1.nsec - t0.nsec), 1000 * 1000);
-    if (pages.len > 0) log.info("  PDF: {d} scanned page(s) attached as images ({d} ms render + preprocess)\n", .{ pages.len, ms });
+    return @divTrunc((t1.sec - t0.sec) * 1000 * 1000 * 1000 + (t1.nsec - t0.nsec), 1000 * 1000);
 }
+
+/// A PDF's scanned-page images, rendered and preprocessed: a document in the conversation
+/// history re-attaches its pages every turn, ~30 ms each to render and preprocess (a
+/// 1600 px page is ~23 MB of Qwen pixel_values). A hit is one copy per page. Keyed on the
+/// payload, the preprocessor and the page limit; LRU by bytes under
+/// MLX_SERVE_PDF_PAGE_CACHE_MB (default 512, 0 = off). A text-only PDF caches as zero pages.
+const PdfPageCache = struct {
+    const SLOTS = 8;
+    const DEFAULT_MB = 512;
+    const Entry = struct {
+        key: u64,
+        len: usize,
+        images: []chat_mod.ImageData,
+        bytes: usize,
+        stamp: u64,
+    };
+    var mu: std.c.pthread_mutex_t = .{};
+    var slots: [SLOTS]?Entry = @splat(null);
+    var clock: u64 = 0;
+    var cap_cache: ?usize = null;
+
+    fn capBytes() usize {
+        if (cap_cache) |c| return c;
+        var mb: usize = DEFAULT_MB;
+        if (std.c.getenv("MLX_SERVE_PDF_PAGE_CACHE_MB")) |raw| mb = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch mb;
+        cap_cache = mb * 1024 * 1024;
+        return cap_cache.?;
+    }
+
+    fn keyFor(b64: []const u8, vp: chat_mod.VisionPreproc) u64 {
+        var h = std.hash.Wyhash.init(0x7064_6670);
+        h.update(b64);
+        const mode: u8 = @intFromEnum(vp.mode);
+        h.update(std.mem.asBytes(&mode));
+        inline for (.{ vp.patch, vp.tps, vp.merge, vp.min_pixels, vp.max_pixels, vp.max_tokens, vp.min_tokens }) |v| {
+            const x: u32 = v;
+            h.update(std.mem.asBytes(&x));
+        }
+        const pages: u32 = pdf_mod.maxImagePages();
+        h.update(std.mem.asBytes(&pages));
+        return h.final();
+    }
+
+    fn bytesOf(images: []const chat_mod.ImageData) usize {
+        var n: usize = 0;
+        for (images) |im| n += im.pixels.len;
+        return n;
+    }
+
+    fn freeImages(images: []chat_mod.ImageData) void {
+        for (images) |im| std.heap.c_allocator.free(im.pixels);
+        std.heap.c_allocator.free(images);
+    }
+
+    /// Appends copies of a cached document's pages; null on a miss.
+    fn get(allocator: std.mem.Allocator, key: u64, len: usize, list: *std.ArrayList(chat_mod.ImageData)) !?usize {
+        if (capBytes() == 0) return null;
+        _ = std.c.pthread_mutex_lock(&mu);
+        defer _ = std.c.pthread_mutex_unlock(&mu);
+        for (&slots) |*slot| if (slot.*) |*e| {
+            if (e.key != key or e.len != len) continue;
+            clock += 1;
+            e.stamp = clock;
+            const first = list.items.len;
+            errdefer {
+                for (list.items[first..]) |im| allocator.free(im.pixels);
+                list.shrinkRetainingCapacity(first);
+            }
+            for (e.images) |im| {
+                var copy = im;
+                copy.pixels = try allocator.dupe(u8, im.pixels);
+                list.append(allocator, copy) catch |err| {
+                    allocator.free(copy.pixels);
+                    return err;
+                };
+            }
+            return e.images.len;
+        };
+        return null;
+    }
+
+    fn put(key: u64, len: usize, images: []const chat_mod.ImageData) void {
+        const cap = capBytes();
+        const bytes = bytesOf(images);
+        if (cap == 0 or bytes > cap / 2) return;
+        const owned = std.heap.c_allocator.alloc(chat_mod.ImageData, images.len) catch return;
+        var n: usize = 0;
+        for (images) |im| {
+            var copy = im;
+            copy.pixels = std.heap.c_allocator.dupe(u8, im.pixels) catch {
+                freeImages(owned[0..n]);
+                return;
+            };
+            owned[n] = copy;
+            n += 1;
+        }
+        _ = std.c.pthread_mutex_lock(&mu);
+        defer _ = std.c.pthread_mutex_unlock(&mu);
+        clock += 1;
+        for (&slots) |*slot| if (slot.*) |e| {
+            // A racing request put the same document first.
+            if (e.key == key and e.len == len) {
+                freeImages(owned);
+                return;
+            }
+        };
+        // Evict least-recently-used documents until the new one fits.
+        while (true) {
+            var total: usize = bytes;
+            var free_slot: ?usize = null;
+            var lru: ?usize = null;
+            for (slots, 0..) |slot, i| {
+                if (slot) |e| {
+                    total += e.bytes;
+                    if (lru == null or e.stamp < slots[lru.?].?.stamp) lru = i;
+                } else if (free_slot == null) free_slot = i;
+            }
+            if (free_slot != null and total <= cap) {
+                slots[free_slot.?] = .{ .key = key, .len = len, .images = owned, .bytes = bytes, .stamp = clock };
+                return;
+            }
+            const victim = lru orelse {
+                freeImages(owned);
+                return;
+            };
+            freeImages(slots[victim].?.images);
+            slots[victim] = null;
+        }
+    }
+};
 
 fn isDocumentPart(ptype: []const u8) bool {
     return std.mem.eql(u8, ptype, "document") or std.mem.eql(u8, ptype, "file") or std.mem.eql(u8, ptype, "input_file");
@@ -21481,6 +21627,56 @@ test "insertMultimodalTokens targets the media user before injected context" {
     defer testing.allocator.free(out);
 
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+}
+
+test "PdfPageCache: hits copy the pages, a new preprocessor misses, LRU evicts by bytes" {
+    const C = PdfPageCache;
+    const prev_cap = C.cap_cache;
+    defer {
+        for (&C.slots) |*slot| if (slot.*) |e| {
+            C.freeImages(e.images);
+            slot.* = null;
+        };
+        C.cap_cache = prev_cap;
+    }
+    C.cap_cache = 48;
+    const px_a = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const px_b = [_]u8{ 9, 10, 11, 12 };
+    const pages = [_]chat_mod.ImageData{
+        .{ .pixels = &px_a, .width = 2, .height = 1, .grid_h = 4, .grid_w = 2 },
+        .{ .pixels = &px_b, .width = 1, .height = 1, .grid_h = 2, .grid_w = 2 },
+    };
+    const vp = chat_mod.VisionPreproc{ .mode = .qwen };
+    const key = C.keyFor("JVBERi0x", vp);
+    C.put(key, 8, &pages);
+
+    // The request side's list comes from its owner, which frees the copies.
+    var media = RequestMedia.init(testing.allocator);
+    defer media.deinit();
+    const list = media.images(try media.openImages());
+    try testing.expectEqual(@as(?usize, 2), try C.get(testing.allocator, key, 8, list));
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqualSlices(u8, &px_a, list.items[0].pixels);
+    try testing.expect(list.items[0].pixels.ptr != &px_a); // a copy the request owns
+    try testing.expectEqual(@as(u32, 4), list.items[0].grid_h);
+    try testing.expectEqualSlices(u8, &px_b, list.items[1].pixels);
+
+    // Same payload under another preprocessor, or another length: a miss.
+    try testing.expect(C.keyFor("JVBERi0x", .{ .mode = .qwen, .max_pixels = 1 << 20 }) != key);
+    try testing.expectEqual(@as(?usize, null), try C.get(testing.allocator, key, 9, list));
+
+    // 12 bytes held: the first 24-byte document fits the 48-byte cap, the second only once
+    // the least-recently-used one goes.
+    const big: [24]u8 = @splat(0);
+    const big_pages = [_]chat_mod.ImageData{.{ .pixels = &big, .width = 1, .height = 1 }};
+    C.put(C.keyFor("doc-2", vp), 5, &big_pages);
+    C.put(C.keyFor("doc-3", vp), 5, &big_pages);
+    try testing.expectEqual(@as(?usize, null), try C.get(testing.allocator, key, 8, list));
+    try testing.expectEqual(@as(?usize, 1), try C.get(testing.allocator, C.keyFor("doc-3", vp), 5, list));
+    // Past half the cap: never cached.
+    const huge: [40]u8 = @splat(0);
+    C.put(C.keyFor("doc-4", vp), 5, &[_]chat_mod.ImageData{.{ .pixels = &huge, .width = 1, .height = 1 }});
+    try testing.expectEqual(@as(?usize, null), try C.get(testing.allocator, C.keyFor("doc-4", vp), 5, list));
 }
 
 test "insertMultimodalTokens gives each Qwen image its own vision block and 3-D grid" {
