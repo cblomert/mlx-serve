@@ -14019,6 +14019,11 @@ pub const ForwardCtx = struct {
     /// still set reads zero rows.
     ple_defer: bool = false,
     ple_pending: ?PlePending = null,
+    /// Solo MTP verify (set with `ple_defer` by `Generator.mtpRoundVerify`): hand the GPU the
+    /// graph as it grows instead of all of it after the build. qwen4_exp dispatches the
+    /// embedding + layer 0 before the PLE layer's host gather, gathers eagerly while those run,
+    /// then dispatches every `verifyEarlyDispatchEvery()` layers (see there).
+    verify_dispatch_early: bool = false,
 };
 
 pub const PlePending = struct {
@@ -23823,6 +23828,10 @@ pub const Transformer = struct {
         var prof = try Qwen4FwdProf.init(seq_len, h);
         var pending: ?HcPending = null;
         defer if (pending) |*pd| pd.deinit();
+        // Early dispatch needs the deferred-PLE verify build (a lazy draft chain as input) of one
+        // slot; the profiler's per-phase syncs already dispatch.
+        const early_every: usize = if (ctx.verify_dispatch_early and ctx.ple_defer and ctx.batch_slots == null and !prof.timing) verifyEarlyDispatchEvery() else 0;
+        var early_next: ?usize = null;
 
         for (0..layerCap(cfg.num_hidden_layers)) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
@@ -23831,6 +23840,14 @@ pub const Transformer = struct {
 
             if (lw.ple) |*pw| {
                 try self.hcFlush(&h, batch, seq_len, &pending);
+                // Early dispatch: layer 0 runs while the gather below waits on the ids.
+                const was_defer = ctx.ple_defer;
+                defer ctx.ple_defer = was_defer;
+                if (early_every > 0) {
+                    try asyncEvalFrontier(h, null);
+                    ctx.ple_defer = false;
+                    early_next = layer_idx + early_every;
+                }
                 const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
                 defer _ = mlx.mlx_array_free(add);
                 var h_ple = mlx.mlx_array_new();
@@ -23890,6 +23907,10 @@ pub const Transformer = struct {
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
                 try evalCadencePoint(h, ctx.ssm_entries);
             }
+            if (early_next) |at| if (layer_idx == at and layer_idx + 1 < layerCap(cfg.num_hidden_layers)) {
+                try asyncEvalFrontier(h, pending);
+                early_next = at + early_every;
+            };
             dt.layer(h, layer_idx);
         }
 
@@ -36962,6 +36983,36 @@ pub var hc_ndu3_override: ?bool = null;
 /// 64k 25.40 -> 24.77; S=2 16k 20.95 -> 20.99, and the extra dispatch per site costs graph-build
 /// CPU, so 2 rows stay on ND+U3. Bit-identical outputs.
 const HC_NDU3_MIN_ROWS: c_int = 3;
+
+var verify_early_every_env: ?usize = null;
+pub var verify_early_every_override: ?usize = null;
+
+/// Layers per early dispatch of a solo MTP verify (MLX_SERVE_VERIFY_EARLY_DISPATCH, default 4;
+/// 0 = off: the verify builds whole, the PLE flush fills its leaf, then one dispatch). The
+/// verify input is the draft chain, so nothing else queued overlaps its graph build + PLE
+/// gather: the GPU idles through both once the chain is done. Early dispatch queues layer 0
+/// before the gather, then every K layers as they are built, so the GPU runs while the host
+/// builds (the gather still waits on the last draft).
+fn verifyEarlyDispatchEvery() usize {
+    if (verify_early_every_override) |v| return v;
+    if (verify_early_every_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_VERIFY_EARLY_DISPATCH");
+    const every: usize = if (raw) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 4 else 4;
+    verify_early_every_env = every;
+    return every;
+}
+
+/// Queue everything built so far: the stream plus a deferred hc write's inputs.
+fn asyncEvalFrontier(h: mlx.mlx_array, pending: ?HcPending) !void {
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, h);
+    if (pending) |pd| {
+        _ = mlx.mlx_vector_array_append_value(vec, pd.out);
+        _ = mlx.mlx_vector_array_append_value(vec, pd.inj);
+    }
+    try mlx.check(mlx.mlx_async_eval(vec));
+}
 
 fn hcNdu3Enabled() bool {
     if (hc_ndu3_override) |v| return v;
@@ -57956,12 +58007,17 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
     defer direct.deinit(allocator);
     var deferred = try State.init(allocator, config.num_hidden_layers);
     defer deferred.deinit(allocator);
+    // Third arm: the solo MTP verify's early dispatch (`verify_dispatch_early`). Its prompt
+    // and decode steps run direct; only its verify forwards dispatch early.
+    var early = try State.init(allocator, config.num_hidden_layers);
+    defer early.deinit(allocator);
     var dctx = direct.ctx();
     var lctx = deferred.ctx();
+    var ectx = early.ctx();
 
     const prompt = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
     const pshape = [_]c_int{ 1, prompt.len };
-    for ([_]*ForwardCtx{ &dctx, &lctx }) |c| {
+    for ([_]*ForwardCtx{ &dctx, &lctx, &ectx }) |c| {
         const pids = mlx.mlx_array_new_data(&prompt, &pshape, 2, .int32);
         defer _ = mlx.mlx_array_free(pids);
         const l = try xfm.forwardWith(c, pids);
@@ -57979,6 +58035,8 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
         defer _ = mlx.mlx_array_free(did);
         const dl = try xfm.forwardWith(&dctx, did);
         defer _ = mlx.mlx_array_free(dl);
+        const el = try xfm.forwardWith(&ectx, did);
+        _ = mlx.mlx_array_free(el);
 
         lctx.ple_defer = true;
         const ll = try xfm.forwardWith(&lctx, did);
@@ -58046,8 +58104,39 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
                 }
             }
             try testing.expect(saw_ple);
+
+            // Early dispatch: every layer (1) and the production cadence (4). The gather runs
+            // in place, so no leaf is left for a flush, and logits + capture state match.
+            verify_early_every_override = if (w == 4) 1 else 4;
+            defer verify_early_every_override = null;
+            ectx.capture_ssm_seq = true;
+            ectx.ple_defer = true;
+            ectx.verify_dispatch_early = true;
+            const eel = try xfm.forwardWith(&ectx, vids);
+            defer _ = mlx.mlx_array_free(eel);
+            ectx.verify_dispatch_early = false;
+            ectx.ple_defer = false;
+            ectx.capture_ssm_seq = false;
+            try testing.expect(ectx.ple_pending == null);
+            const c = try qwen4ReadF32(allocator, eel, s);
+            defer allocator.free(c);
+            try testing.expectEqualSlices(f32, a, c);
+            for (direct.entries, early.entries) |*de, *ee| {
+                try testing.expectEqual(de.spec_ple_len, ee.spec_ple_len);
+                try testing.expectEqualSlices(u32, &de.ple_prev, &ee.ple_prev);
+                try testing.expectEqual(de.spec_ple_input.ctx == null, ee.spec_ple_input.ctx == null);
+                if (de.spec_ple_len > 0) try testing.expectEqualSlices(u32, de.spec_ple_tokens[0..de.spec_ple_len], ee.spec_ple_tokens[0..de.spec_ple_len]);
+                if (de.spec_state_seq.ctx != null) {
+                    const x = try qwen4ReadF32(allocator, de.spec_state_seq, s);
+                    defer allocator.free(x);
+                    const y = try qwen4ReadF32(allocator, ee.spec_state_seq, s);
+                    defer allocator.free(y);
+                    try testing.expectEqualSlices(f32, x, y);
+                }
+            }
             for (direct.entries) |*e| ssmFreeSpecCapture(e);
             for (deferred.entries) |*e| ssmFreeSpecCapture(e);
+            for (early.entries) |*e| ssmFreeSpecCapture(e);
         }
     }
 

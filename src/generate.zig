@@ -7247,15 +7247,20 @@ pub const Generator = struct {
         // finishing on the GPU. Defer the leaf so the graph builds while the
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
+        // With `verify_dispatch_early` the qwen4_exp forward instead queues layer 0, gathers the
+        // PLE rows in place (no leaf is left pending) and queues the rest as it builds.
         self.ctx.ple_defer = true;
+        self.ctx.verify_dispatch_early = true;
         const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
+            self.ctx.verify_dispatch_early = false;
             self.ctx.capture_ssm_seq = false;
             xfm.discardDeferredPle(&self.ctx);
             return e;
         };
         errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.ple_defer = false;
+        self.ctx.verify_dispatch_early = false;
         self.ctx.capture_ssm_seq = false;
         xfm.verify_laps.ple_sync_ns = 0;
         if (tracing) {
