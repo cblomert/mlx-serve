@@ -8140,6 +8140,8 @@ fn appendAnthropicAssistant(
 /// A PDF's text-less (scanned) pages as images of the message being built
 /// (src/pdf.zig renders them; the document text names them).
 fn appendPdfPageImages(allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), b64: []const u8, vp: chat_mod.VisionPreproc) !void {
+    var t0: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t0);
     const pages = try pdf_mod.scannedPageImages(allocator, b64);
     defer {
         for (pages) |p| allocator.free(p.rgb);
@@ -8152,7 +8154,10 @@ fn appendPdfPageImages(allocator: std.mem.Allocator, list: *std.ArrayList(chat_m
             continue;
         };
     }
-    if (pages.len > 0) log.info("  PDF: {d} scanned page(s) attached as images\n", .{pages.len});
+    var t1: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t1);
+    const ms = @divTrunc((t1.sec - t0.sec) * 1000 * 1000 * 1000 + (t1.nsec - t0.nsec), 1000 * 1000);
+    if (pages.len > 0) log.info("  PDF: {d} scanned page(s) attached as images ({d} ms render + preprocess)\n", .{ pages.len, ms });
 }
 
 fn isDocumentPart(ptype: []const u8) bool {
@@ -8885,14 +8890,17 @@ fn handleChatCompletions(
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
     defer clearPendingMediaCacheIds();
+    // Every user turn's images are in the prompt (not just the active turn's).
+    var history_media_placed = false;
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config, false) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
+        history_media_placed = hist != null;
         if (hist) |h| {
             local_ve = h.embeddings;
             vis_key = h.key;
@@ -8923,7 +8931,7 @@ fn handleChatCompletions(
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
     // slot at submit (mirrors the vision-embeddings handoff below).
-    var local_mrope = computeQwenMrope(allocator, prompt_ids, if (active_media) |selected| selected.message else null, config) catch MropeData{};
+    var local_mrope = computeQwenMrope(allocator, prompt_ids, messages.items, if (active_media) |selected| selected.message else null, history_media_placed, config) catch MropeData{};
     defer {
         if (local_mrope.pos) |p| allocator.free(p);
     }
@@ -14132,22 +14140,28 @@ pub const MropeData = struct {
 /// Compute the interleaved-M-RoPE table from the FINAL prompt_ids (after image-pad
 /// expansion) + the active media message's image grids. Returns an empty bundle when the
 /// model isn't Qwen-vision or there are no images. Caller owns `pos`.
-fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, media_msg: ?*const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
+/// `history`: the prompt carries every user turn's images (placeHistoryMedia)
+/// plus the active turn's video, so the grids come from all of them in
+/// message order; otherwise only the active message's media is in the prompt.
+fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs: []const chat_mod.Message, media_msg: ?*const chat_mod.Message, history: bool, config: *const model_mod.ModelConfig) !MropeData {
     if (!config.qwen_vision) return .{};
-    const msg = media_msg orelse return .{};
-    // Collect the active message's image AND video grids (full patch grid
-    // per block, in their own modality's document order — getRopeIndex
-    // interleaves the two lists by whichever marker occurs first in tokens).
+    // Collect image AND video grids (full patch grid per block, in their own
+    // modality's document order — getRopeIndex interleaves the two lists by
+    // whichever marker occurs first in tokens).
     var image_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
     defer image_grids.deinit(allocator);
     var video_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
     defer video_grids.deinit(allocator);
-    if (msg.images) |imgs| for (imgs) |im| {
-        if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
-    };
-    if (msg.videos) |vids| for (vids) |vd| {
-        try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
-    };
+    for (msgs) |*m| {
+        const is_active = media_msg != null and media_msg.? == m;
+        if (!is_active and (!history or !std.mem.eql(u8, m.role, "user"))) continue;
+        if (m.images) |imgs| for (imgs) |im| {
+            if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+        };
+        if (is_active) if (m.videos) |vids| for (vids) |vd| {
+            try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
+        };
+    }
     if (image_grids.items.len == 0 and video_grids.items.len == 0) return .{};
 
     var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, image_grids.items, video_grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
@@ -14269,8 +14283,9 @@ fn appendMimoVideoSegments(
     }
 }
 
-/// MiMo keeps the images and audio clips of EARLIER turns in the prompt
-/// instead of dropping them once the conversation moves on. Dropping them
+/// MiMo and the Qwen vision towers keep the images (MiMo: and audio clips) of
+/// EARLIER turns in the prompt instead of dropping them once the conversation
+/// moves on. Dropping them
 /// costs twice: the model can no longer refer back to a screenshot or a clip,
 /// and the prompt changes at the old media's position, so everything after it
 /// misses the prefix cache and is prefilled again. Kept media is re-encoded
@@ -14279,7 +14294,7 @@ fn appendMimoVideoSegments(
 /// video still drops. MLX_SERVE_HISTORY_MEDIA=0 (or the older
 /// MLX_SERVE_HISTORY_IMAGES=0) restores the active-turn-only behavior.
 fn historyMediaEnabled(config: *const model_mod.ModelConfig) bool {
-    if (!config.mimo_vision) return false;
+    if (!config.mimo_vision and !config.qwen_vision) return false;
     if (std.c.getenv("MLX_SERVE_HISTORY_MEDIA")) |v| return v[0] != '0';
     if (std.c.getenv("MLX_SERVE_HISTORY_IMAGES")) |v| return v[0] != '0';
     return true;
@@ -14384,7 +14399,17 @@ fn placeHistoryMedia(
             try seg.appendNTimes(allocator, config.image_token_id, t.n_image);
             try seg.append(allocator, config.vision_end_token_id);
         }
-        if (t.n_video > 0) try appendMimoVideoSegments(allocator, &seg, config, t.info.message, t.n_video);
+        if (t.n_video > 0) {
+            if (config.mimo_vision) {
+                try appendMimoVideoSegments(allocator, &seg, config, t.info.message, t.n_video);
+            } else {
+                // Qwen: one vision_start / video-pad run / vision_end block, as
+                // insertMultimodalTokens places the active turn's video.
+                try seg.append(allocator, config.vision_start_token_id);
+                try seg.appendNTimes(allocator, config.video_token_id, t.n_video);
+                try seg.append(allocator, config.vision_end_token_id);
+            }
+        }
         if (t.n_audio > 0) {
             if (config.boa_token_id > 0) try seg.append(allocator, config.boa_token_id);
             try seg.appendNTimes(allocator, config.audio_token_id, t.n_audio);
@@ -14416,6 +14441,8 @@ fn placeHistoryMedia(
 /// turn's video) at their own turns. Null when there is nothing to place or
 /// the placement cannot be proven consistent; the caller then takes the
 /// active-turn-only path.
+const SCALAR_POSITIONS_SALT: u64 = 0x5ca1_a7b0_5e7d_1e55;
+
 fn encodeHistoryMedia(
     allocator: std.mem.Allocator,
     lm: *LoadedModel,
@@ -14423,6 +14450,11 @@ fn encodeHistoryMedia(
     active: ?ActiveTurnMedia,
     prompt_ids: []const u32,
     config: *const model_mod.ModelConfig,
+    /// The prompt runs on scalar RoPE although the tower expects M-RoPE (Qwen on
+    /// /v1/messages): its media pseudo-ids are salted so the prefix cache never
+    /// hands KV computed under the other position scheme across (the token ids
+    /// are identical, the positions after the first image are not).
+    scalar_positions: bool,
 ) !?HistoryMedia {
     const sch = global_scheduler orelse return null;
     const MediaTurn = struct {
@@ -14541,7 +14573,7 @@ fn encodeHistoryMedia(
             .n_image = n_img,
             .n_video = if (t.full) req.n_video_tokens else 0,
             .n_audio = n_aud,
-            .hash = mediaKey(m.images orelse &.{}, vids_here, m.audio orelse &.{}),
+            .hash = mediaKey(m.images orelse &.{}, vids_here, m.audio orelse &.{}) ^ (if (scalar_positions) SCALAR_POSITIONS_SALT else 0),
         };
         key.update(std.mem.asBytes(&pt.hash));
     }
@@ -16312,7 +16344,7 @@ fn handleAnthropicMessages(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, messages.items, active_media, prompt_ids_raw, config, config.qwen_vision) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
@@ -18237,7 +18269,7 @@ fn handleResponsesInner(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config) catch |err| blk: {
+        const hist: ?HistoryMedia = if (historyMediaEnabled(config)) encodeHistoryMedia(allocator, lm, pi.messages.items, active_media, prompt_ids_raw, config, config.qwen_vision) catch |err| blk: {
             log.warn("History media encoding failed: {} — active turn only\n", .{err});
             break :blk null;
         } else null;
