@@ -386,6 +386,47 @@ pub fn modelText(arena: Allocator, query: []const u8, outcome: Outcome) ![]const
     return w.written();
 }
 
+/// The tool-result text the model read for a `web_search_tool_result` block
+/// that comes back in conversation history (`input_json`: the input of its
+/// `server_tool_use`): `modelText` of the same results, so a later turn
+/// renders exactly what the search loop fed the model. Snippets are recovered
+/// from our `encrypted_content`; another server's opaque payload leaves title
+/// and URL only.
+pub fn historyResultText(arena: Allocator, input_json: []const u8, content: std.json.Value) ![]const u8 {
+    const query = queryOf(arena, input_json) orelse "";
+    const outcome: Outcome = switch (content) {
+        .array => |arr| blk: {
+            var rs = std.ArrayList(Result).empty;
+            for (arr.items) |item| {
+                if (item != .object) continue;
+                const url = strField(item.object, "url") orelse continue;
+                var snippet: []const u8 = "";
+                if (strField(item.object, "encrypted_content")) |enc| {
+                    if (std.mem.startsWith(u8, enc, ENCRYPTED_PREFIX)) snippet = decodeSnippet(arena, enc[ENCRYPTED_PREFIX.len..]);
+                }
+                try rs.append(arena, .{
+                    .title = strField(item.object, "title") orelse url,
+                    .url = url,
+                    .snippet = snippet,
+                    .page_age = strField(item.object, "page_age"),
+                });
+            }
+            break :blk .{ .results = rs.items };
+        },
+        .object => |o| .{ .failed = std.meta.stringToEnum(ErrorCode, strField(o, "error_code") orelse "") orelse .unavailable },
+        else => .{ .failed = .unavailable },
+    };
+    return modelText(arena, query, outcome);
+}
+
+fn decodeSnippet(arena: Allocator, b64: []const u8) []const u8 {
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(b64) catch return "";
+    const buf = arena.alloc(u8, n) catch return "";
+    dec.decode(buf, b64) catch return "";
+    return buf;
+}
+
 /// The `content` of a `web_search_tool_result` block: the result array, or the error object.
 pub fn resultContentJson(arena: Allocator, outcome: Outcome) ![]const u8 {
     var w: std.Io.Writer.Allocating = .init(arena);
@@ -1147,6 +1188,28 @@ test "websearch: innerBody forces streaming, appends rounds, relaxes a forcing t
     try testing.expect(v2.object.get("tool_choice") == null);
     try testing.expectEqual(@as(usize, 3), v2.object.get("messages").?.array.items.len);
     try testing.expectEqualStrings("web_search_20250305", v2.object.get("tools").?.array.items[0].object.get("type").?.string);
+}
+
+test "websearch: historyResultText rebuilds the exact text the loop fed the model" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rs = [_]Result{
+        .{ .title = "Zig 0.15.1 \"notes\"", .url = "https://ziglang.org/", .snippet = "Released — août", .page_age = "2025-08-20" },
+        .{ .title = "B", .url = "https://b.example/", .snippet = "" },
+    };
+    const outcome: Outcome = .{ .results = &rs };
+    const expected = try modelText(arena, "zig 0.15", outcome);
+    const block = try resultBlockJson(arena, "srvtoolu_1", try resultContentJson(arena, outcome));
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, block, .{});
+    const got = try historyResultText(arena, "{\"query\":\" zig 0.15 \"}", v.object.get("content").?);
+    try testing.expectEqualStrings(expected, got);
+    // Errors keep their code; an unknown code reads as unavailable.
+    const err_v = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"type\":\"web_search_tool_result_error\",\"error_code\":\"max_uses_exceeded\"}", .{});
+    try testing.expectEqualStrings(try modelText(arena, "q", .{ .failed = .max_uses_exceeded }), try historyResultText(arena, "{\"query\":\"q\"}", err_v));
+    // Another server's opaque encrypted_content: title and URL only.
+    const foreign = try std.json.parseFromSliceLeaky(std.json.Value, arena, "[{\"type\":\"web_search_result\",\"title\":\"T\",\"url\":\"https://t.example/\",\"encrypted_content\":\"EqAbCd\"}]", .{});
+    try testing.expect(std.mem.indexOf(u8, try historyResultText(arena, "{}", foreign), "[1] T\nURL: https://t.example/\n") != null);
 }
 
 test "websearch: rewriteIndex and serverToolId" {

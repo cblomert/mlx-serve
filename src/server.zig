@@ -8105,6 +8105,38 @@ fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) 
     return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
 }
 
+/// One Anthropic assistant message from the blocks gathered so far (text,
+/// thinking → reasoning_content, tool calls), which are then cleared.
+fn appendAnthropicAssistant(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(chat_mod.Message),
+    text_content: *std.ArrayList(u8),
+    think_content: *std.ArrayList(u8),
+    tcs: *std.ArrayList(chat_mod.ToolCall),
+    tool_call_lists: *std.ArrayList([]const chat_mod.ToolCall),
+    content_allocs: *std.ArrayList([]const u8),
+) !void {
+    var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
+    if (tcs.items.len > 0) {
+        const owned = try tcs.toOwnedSlice(allocator);
+        try tool_call_lists.append(allocator, owned);
+        msg_tool_calls = owned;
+    }
+    const content: []const u8 = if (text_content.items.len > 0) blk: {
+        const duped = try allocator.dupe(u8, text_content.items);
+        try content_allocs.append(allocator, duped);
+        break :blk duped;
+    } else "";
+    const msg_reasoning: ?[]const u8 = if (think_content.items.len > 0) blk: {
+        const duped = try allocator.dupe(u8, think_content.items);
+        try content_allocs.append(allocator, duped);
+        break :blk duped;
+    } else null;
+    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null, .reasoning_content = msg_reasoning });
+    text_content.clearRetainingCapacity();
+    think_content.clearRetainingCapacity();
+}
+
 /// A PDF's text-less (scanned) pages as images of the message being built
 /// (src/pdf.zig renders them; the document text names them).
 fn appendPdfPageImages(allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), b64: []const u8, vp: chat_mod.VisionPreproc) !void {
@@ -15767,6 +15799,11 @@ fn handleAnthropicMessages(
         content_allocs.deinit(allocator);
     }
 
+    // Tool-message text rebuilt from web_search_tool_result history blocks;
+    // messages borrow it until the request ends.
+    var hist_arena = std.heap.ArenaAllocator.init(allocator);
+    defer hist_arena.deinit();
+
     // System prompt (Anthropic puts it at top level). Array form JOINS every
     // text block — Claude Code sends 2+ (identity + the instructions block),
     // and first-wins dropped everything after the first.
@@ -15919,6 +15956,8 @@ fn handleAnthropicMessages(
                     var think_content = std.ArrayList(u8).empty;
                     defer think_content.deinit(allocator);
                     var tcs = std.ArrayList(chat_mod.ToolCall).empty;
+                    defer tcs.deinit(allocator);
+                    var split = false;
 
                     for (arr.items) |block| {
                         if (block != .object) continue;
@@ -15927,7 +15966,23 @@ fn handleAnthropicMessages(
                         if (std.mem.eql(u8, btype, "text")) {
                             const text = if (block.object.get("text")) |t| (if (t == .string) t.string else "") else "";
                             try text_content.appendSlice(allocator, text);
-                        } else if (std.mem.eql(u8, btype, "tool_use")) {
+                        } else if (std.mem.eql(u8, btype, "web_search_tool_result")) {
+                            // A server-side search inside this turn
+                            // (handleAnthropicWebSearch): the turn so far
+                            // becomes an assistant message with the call, the
+                            // results the model read its tool message, and the
+                            // turn goes on in a new assistant message — the
+                            // shape the search loop generated it in.
+                            const tu_id = if (block.object.get("tool_use_id")) |v| (if (v == .string) v.string else "") else "";
+                            var input: []const u8 = "{}";
+                            for (tcs.items) |tc| {
+                                if (std.mem.eql(u8, tc.id, tu_id)) input = tc.arguments;
+                            }
+                            const result_text = try websearch_mod.historyResultText(hist_arena.allocator(), input, block.object.get("content") orelse .null);
+                            try appendAnthropicAssistant(allocator, &messages, &text_content, &think_content, &tcs, &tool_call_lists, &content_allocs);
+                            try messages.append(allocator, .{ .role = "tool", .content = result_text, .tool_calls = null, .tool_call_id = tu_id });
+                            split = true;
+                        } else if (std.mem.eql(u8, btype, "tool_use") or std.mem.eql(u8, btype, "server_tool_use")) {
                             const tc_id = if (block.object.get("id")) |v| (if (v == .string) v.string else "") else "";
                             const tc_name = if (block.object.get("name")) |v| (if (v == .string) v.string else "") else "";
                             // Serialize input object to JSON string
@@ -15954,26 +16009,10 @@ fn handleAnthropicMessages(
                         }
                     }
 
-                    var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
-                    if (tcs.items.len > 0) {
-                        const owned = try tcs.toOwnedSlice(allocator);
-                        try tool_call_lists.append(allocator, owned);
-                        msg_tool_calls = owned;
-                    } else {
-                        tcs.deinit(allocator);
+                    // After a search split, a turn that ended on its results adds no empty message.
+                    if (!split or text_content.items.len > 0 or think_content.items.len > 0 or tcs.items.len > 0) {
+                        try appendAnthropicAssistant(allocator, &messages, &text_content, &think_content, &tcs, &tool_call_lists, &content_allocs);
                     }
-
-                    const content: []const u8 = if (text_content.items.len > 0) blk: {
-                        const duped = try allocator.dupe(u8, text_content.items);
-                        try content_allocs.append(allocator, duped);
-                        break :blk duped;
-                    } else "";
-                    const msg_reasoning: ?[]const u8 = if (think_content.items.len > 0) blk: {
-                        const duped = try allocator.dupe(u8, think_content.items);
-                        try content_allocs.append(allocator, duped);
-                        break :blk duped;
-                    } else null;
-                    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null, .reasoning_content = msg_reasoning });
                 },
                 else => {},
             };
