@@ -23299,6 +23299,8 @@ pub const Transformer = struct {
         if (live.seq_offset.* == 0) live.pos_base.* = pos_offset;
         if (pos_offset != live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))) return error.MtpPositionGap;
 
+        const mprof = Qwen4MtpProf.on() and batch == 1;
+        if (mprof) try Qwen4MtpProf.begin(seq_len, &.{ stream_prev, token_ids_in }, self.s);
         var token_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(token_ids);
         try mlx.check(mlx.mlx_reshape(&token_ids, token_ids_in, &[_]c_int{ batch, seq_len }, 2, self.s));
@@ -23325,6 +23327,7 @@ pub const Transformer = struct {
         var h = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(h);
         try mlx.check(mlx.mlx_reshape(&h, x4, &[_]c_int{ batch, seq_len, hc * hidden }, 3, self.s));
+        if (mprof) try Qwen4MtpProf.lap(h, .embed_fc);
 
         var ctx: ForwardCtx = .{ .cache = live.cache, .moe_seq_offset = live.seq_offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
         if (mrope_ctx) |mc| {
@@ -23338,20 +23341,26 @@ pub const Transformer = struct {
         const lw = &m.layer;
         var pre = try self.hcRead(h, &lw.hc_attn.?, batch, seq_len);
         defer pre.deinit();
+        if (mprof) try Qwen4MtpProf.lap(pre.mixed, .hc_read_attn);
         const attn_out = switch (lw.attn) {
             .full => |fa| try self.qwen4AttnWith(&ctx, pre.mixed, &fa, live.entry, li, @intCast(live.seq_offset.*), live.pos_base.*, batch, seq_len, is_prefill),
             .linear => return error.MtpLayerNotAttention,
         };
         defer _ = mlx.mlx_array_free(attn_out);
+        if (mprof) try Qwen4MtpProf.lap(attn_out, .attn);
         h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len);
+        if (mprof) try Qwen4MtpProf.lap(h, .hc_write_attn);
         var pre2 = try self.hcRead(h, &lw.hc_mlp.?, batch, seq_len);
         defer pre2.deinit();
+        if (mprof) try Qwen4MtpProf.lap(pre2.mixed, .hc_read_mlp);
         const mlp_out = switch (lw.mlp) {
             .moe => |*mw| try self.moeMLP(pre2.mixed, mw),
             .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
         };
         defer _ = mlx.mlx_array_free(mlp_out);
+        if (mprof) try Qwen4MtpProf.lap(mlp_out, .mlp);
         h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
+        if (mprof) try Qwen4MtpProf.lap(h, .hc_write_mlp);
         qwen4MtpAdvance(live.cache, live.seq_offset, seq_len);
 
         // History append wants the stream and nothing else: the mixer read and
@@ -23382,6 +23391,7 @@ pub const Transformer = struct {
 
         const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
+        if (mprof) try Qwen4MtpProf.lap(mix.mixed, .mixer);
         // Rerank draft: the mixer output IS the answer. Skipping
         // `lmHeadProject` here is the whole point — the 248320-wide 8-bit
         // projection is 675 MB, more than every other read in a draft step put
@@ -23439,8 +23449,9 @@ pub const Transformer = struct {
     /// what this path replaced.
     pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-        if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
-        return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
+        const tok = (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) orelse try mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
+        if (Qwen4MtpProf.on()) try Qwen4MtpProf.lap(tok, .readout);
+        return tok;
     }
 
     /// The exact re-scored top-32 shortlist for a SAMPLED draft. Null = the
@@ -33808,6 +33819,80 @@ const Qwen4FwdProf = struct {
             ms(self.ns[4]), self.ns[4] / 1000,
             ms(self.ns[5]), self.ns[5] / 1000,
         });
+    }
+};
+
+/// DIAGNOSTIC (QWEN4_PROFILE_MTP=1): GPU time per block of a qwen4_exp MTP head step, split
+/// into draft steps (S=1) and merged history+draft steps (S>1). Every block is evaluated and
+/// synced, so it kills the pipeline: the numbers are per-block costs plus a ~160 us sync floor
+/// each, not round costs. `queue` is work still in flight, `inputs` whatever the step's inputs
+/// still owed. Logs medians every 128 head steps. Qwen3.8 at 16k, S=1 medians (us): embed_fc 250
+/// hc_read_attn 228 attn 370 hc_write_attn 187 hc_read_mlp 224 mlp 330 hc_write_mlp 146 mixer
+/// 225 readout 679 -> ~1.2 ms net, the readout (3-bit coarse qmv ~0.4 ms at ~700 GB/s + top-32
+/// + exact rescore) the largest block.
+const Qwen4MtpProf = struct {
+    const Block = enum(u8) { queue, inputs, inputs_ids, embed_fc, hc_read_attn, attn, hc_write_attn, hc_read_mlp, mlp, hc_write_mlp, mixer, readout };
+    const N = @backingInt(Block.readout) + 1;
+    const RING = 256;
+    var env: ?bool = null;
+    var ring: [2][N][RING]u32 = undefined;
+    var steps: [2]u64 = @splat(0);
+    var kind: usize = 0;
+    var clock: ProfClock = undefined;
+    var live: bool = false;
+
+    fn on() bool {
+        return diagEnvOnCached(&env, "QWEN4_PROFILE_MTP");
+    }
+
+    fn put(block: Block, v: u64) void {
+        ring[kind][@backingInt(block)][(steps[kind] - 1) % RING] = @intCast(@min(v / 1000, std.math.maxInt(u32)));
+    }
+
+    fn begin(seq_len: c_int, inputs: []const mlx.mlx_array, s: mlx.mlx_stream) !void {
+        kind = if (seq_len > 1) 1 else 0;
+        steps[kind] += 1;
+        for (0..N) |b| ring[kind][b][(steps[kind] - 1) % RING] = 0;
+        clock = ProfClock.init();
+        try mlx.check(mlx.mlx_synchronize(s));
+        put(.queue, clock.lap());
+        for (inputs, 0..) |a, i| {
+            try mlx.check(mlx.mlx_array_eval(a));
+            put(if (i == 0) .inputs else .inputs_ids, clock.lap());
+        }
+        live = true;
+    }
+
+    fn lap(arr: mlx.mlx_array, block: Block) !void {
+        if (!live) return;
+        try mlx.check(mlx.mlx_array_eval(arr));
+        put(block, clock.lap());
+        if (block == .readout) {
+            live = false;
+            if ((steps[0] + steps[1]) % 128 == 0) report();
+        }
+    }
+
+    /// Medians over the last `RING` steps of each kind (a request's first head step drains
+    /// the trunk prefill's captured stream, which swamps any mean).
+    fn report() void {
+        for (0..2) |k| {
+            const n: usize = @intCast(@min(steps[k], RING));
+            if (n == 0) continue;
+            var line: [512]u8 = undefined;
+            var w: usize = 0;
+            var total: u64 = 0;
+            for (0..N) |b| {
+                var tmp: [RING]u32 = undefined;
+                @memcpy(tmp[0..n], ring[k][b][0..n]);
+                std.mem.sort(u32, tmp[0..n], {}, std.sort.asc(u32));
+                const med = tmp[n / 2];
+                total += med;
+                const s = std.fmt.bufPrint(line[w..], " {s} {d}", .{ @tagName(@as(Block, @fromBackingInt(@intCast(b)))), med }) catch break;
+                w += s.len;
+            }
+            log.info("[qwen4-mtp-prof] {s} steps {d}: median us{s} | sum {d}\n", .{ if (k == 0) "draft S=1" else "merged S>1", steps[k], line[0..w], total });
+        }
     }
 };
 
