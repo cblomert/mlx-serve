@@ -8105,6 +8105,24 @@ fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) 
     return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
 }
 
+/// A PDF's text-less (scanned) pages as images of the message being built
+/// (src/pdf.zig renders them; the document text names them).
+fn appendPdfPageImages(allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), b64: []const u8, vp: chat_mod.VisionPreproc) !void {
+    const pages = try pdf_mod.scannedPageImages(allocator, b64);
+    defer {
+        for (pages) |p| allocator.free(p.rgb);
+        allocator.free(pages);
+    }
+    for (pages) |p| {
+        const img = rgbToImageData(allocator, p.rgb, p.width, p.height, vp) orelse continue;
+        list.append(allocator, img) catch {
+            allocator.free(img.pixels);
+            continue;
+        };
+    }
+    if (pages.len > 0) log.info("  PDF: {d} scanned page(s) attached as images\n", .{pages.len});
+}
+
 fn isDocumentPart(ptype: []const u8) bool {
     return std.mem.eql(u8, ptype, "document") or std.mem.eql(u8, ptype, "file") or std.mem.eql(u8, ptype, "input_file");
 }
@@ -8113,7 +8131,7 @@ fn isDocumentPart(ptype: []const u8) bool {
 /// (src/pdf.zig): Anthropic `document` blocks (Claude Code's Read of a whole
 /// PDF arrives inside a tool_result) and OpenAI `file` / `input_file` parts.
 /// Content without documents joins exactly as before.
-fn joinedContentParts(allocator: std.mem.Allocator, parts: []const std.json.Value) !JoinedText {
+fn joinedContentParts(allocator: std.mem.Allocator, parts: []const std.json.Value, page_images: bool) !JoinedText {
     const has_doc = for (parts) |part| {
         if (part != .object) continue;
         const pt = part.object.get("type") orelse continue;
@@ -8132,12 +8150,12 @@ fn joinedContentParts(allocator: std.mem.Allocator, parts: []const std.json.Valu
             if (buf.items.len > 0) try buf.append(allocator, '\n');
             try buf.appendSlice(allocator, tv.string);
         } else if (std.mem.eql(u8, pt.string, "document")) {
-            const doc = try pdf_mod.renderDocument(allocator, part.object);
+            const doc = try pdf_mod.renderDocument(allocator, part.object, page_images);
             defer allocator.free(doc);
             if (buf.items.len > 0) try buf.append(allocator, '\n');
             try buf.appendSlice(allocator, doc);
         } else if (isDocumentPart(pt.string)) {
-            const doc = (try pdf_mod.renderOpenAIFilePart(allocator, part.object)) orelse continue;
+            const doc = (try pdf_mod.renderOpenAIFilePart(allocator, part.object, page_images)) orelse continue;
             defer allocator.free(doc);
             if (buf.items.len > 0) try buf.append(allocator, '\n');
             try buf.appendSlice(allocator, doc);
@@ -8324,6 +8342,10 @@ fn handleChatCompletions(
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
                         if (!appendImageUrlContent(allocator, media.images(img_slot), url_val.string, visionPreprocFromConfig(config))) image_decode_failed = true;
+                    } else if (std.mem.eql(u8, ptype.string, "file")) {
+                        // The text renders in joinedContentParts; scanned pages join as images.
+                        if (lm.vision_encoder == null or (!decode_this_message and !keep_history_media)) continue;
+                        if (pdf_mod.pdfBase64OfFilePart(part.object)) |b64| try appendPdfPageImages(allocator, media.images(img_slot), b64, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
                         if (!decode_this_message) continue;
                         // A video is, on the wire, an ordered array of already-
@@ -8365,7 +8387,7 @@ fn handleChatCompletions(
                 msg_images = media.imagesSlice(img_slot);
                 msg_videos = media.videosSlice(vid_slot);
                 msg_audio = media.audioSlice(aud_slot);
-                const joined = try joinedContentParts(allocator, arr.items);
+                const joined = try joinedContentParts(allocator, arr.items, lm.vision_encoder != null);
                 if (joined.owned) try content_allocs.append(allocator, joined.text);
                 break :blk joined.text;
             },
@@ -13317,6 +13339,7 @@ fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresen
         if (style == .anthropic) {
             if (std.mem.eql(u8, tv.string, "image")) out.images = true;
             if (isAnthropicAudioType(tv.string)) out.audio = true;
+            if (std.mem.eql(u8, tv.string, "document") and documentHasPageImages(part.object)) out.images = true;
             if (std.mem.eql(u8, tv.string, "tool_result")) {
                 const rc = part.object.get("content") orelse continue;
                 if (rc != .array) continue;
@@ -13326,10 +13349,15 @@ fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresen
                     if (it != .string) continue;
                     if (std.mem.eql(u8, it.string, "image")) out.images = true;
                     if (isAnthropicAudioType(it.string)) out.audio = true;
+                    if (std.mem.eql(u8, it.string, "document") and documentHasPageImages(inner.object)) out.images = true;
                 }
             }
         } else if (std.mem.eql(u8, tv.string, "image_url")) {
             out.images = true;
+        } else if (std.mem.eql(u8, tv.string, "file")) {
+            if (pdf_mod.pdfBase64OfFilePart(part.object)) |b64| if (pdf_mod.needsPageImages(b64)) {
+                out.images = true;
+            };
         } else if (std.mem.eql(u8, tv.string, "video_url")) {
             out.videos = true;
         } else if (std.mem.eql(u8, tv.string, "input_audio")) {
@@ -13337,6 +13365,13 @@ fn wireMediaPresence(msg: std.json.Value, style: WireMediaStyle) WireMediaPresen
         }
     }
     return out;
+}
+
+/// A document block whose PDF has scanned pages: it contributes page images,
+/// so its message counts as carrying media (text-only PDFs do not).
+fn documentHasPageImages(block: std.json.ObjectMap) bool {
+    const b64 = pdf_mod.pdfBase64OfBlock(block) orelse return false;
+    return pdf_mod.needsPageImages(b64);
 }
 
 fn wireMessageHasToolResult(msg: std.json.Value, style: WireMediaStyle) bool {
@@ -15140,13 +15175,17 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
 }
 
 fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
-    const target: u32 = 768; // Gemma 4 default for square images
-
     const src = decodeRgbOwned(allocator, encoded) orelse return null;
     defer src.deinit(allocator);
-    const px = src.rgb.ptr;
-    const src_w: u32 = src.w;
-    const src_h: u32 = src.h;
+    return rgbToImageData(allocator, src.rgb, src.w, src.h, vp);
+}
+
+/// Top-down RGB8 pixels (`src_w` x `src_h`) → the tower's input, as for a
+/// decoded image. PDF page renders (src/pdf.zig) enter here directly.
+fn rgbToImageData(allocator: std.mem.Allocator, rgb: []const u8, src_w: u32, src_h: u32, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+    const target: u32 = 768; // Gemma 4 default for square images
+    if (src_w == 0 or src_h == 0 or rgb.len < @as(usize, src_w) * src_h * 3) return null;
+    const px = rgb.ptr;
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
@@ -15783,7 +15822,7 @@ fn handleAnthropicMessages(
                         if (block.object.get("content")) |rc| switch (rc) {
                             .string => |s| result_text = s,
                             .array => |result_arr| {
-                                const joined = try joinedContentParts(allocator, result_arr.items);
+                                const joined = try joinedContentParts(allocator, result_arr.items, lm.vision_encoder != null);
                                 if (joined.owned) try content_allocs.append(allocator, joined.text);
                                 result_text = joined.text;
                             },
@@ -15808,11 +15847,15 @@ fn handleAnthropicMessages(
                                 try msg_text.appendSlice(allocator, text);
                             }
                         } else if (std.mem.eql(u8, btype, "document")) {
-                            // PDFs (text layer) and text documents, as text (src/pdf.zig).
-                            const doc_text = try pdf_mod.renderDocument(allocator, block.object);
+                            // PDFs (text layer) and text documents, as text; a
+                            // PDF's scanned pages as images (src/pdf.zig).
+                            const doc_text = try pdf_mod.renderDocument(allocator, block.object, lm.vision_encoder != null);
                             defer allocator.free(doc_text);
                             if (msg_text.items.len > 0) try msg_text.append(allocator, '\n');
                             try msg_text.appendSlice(allocator, doc_text);
+                            if (lm.vision_encoder != null and (decode_this_message or keep_history_media)) {
+                                if (pdf_mod.pdfBase64OfBlock(block.object)) |b64| try appendPdfPageImages(allocator, media.images(img_slot), b64, visionPreprocFromConfig(config));
+                            }
                         } else if (std.mem.eql(u8, btype, "image")) {
                             if (!decode_this_message and !keep_history_media) continue;
                             if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocFromConfig(config))) image_decode_failed = true;
@@ -15833,6 +15876,9 @@ fn handleAnthropicMessages(
                                 const itype = if (inner.object.get("type")) |t| (if (t == .string) t.string else "") else "";
                                 if (std.mem.eql(u8, itype, "image")) {
                                     if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), inner, visionPreprocFromConfig(config))) image_decode_failed = true;
+                                } else if (std.mem.eql(u8, itype, "document")) {
+                                    if (lm.vision_encoder == null) continue;
+                                    if (pdf_mod.pdfBase64OfBlock(inner.object)) |b64| try appendPdfPageImages(allocator, media.images(img_slot), b64, visionPreprocFromConfig(config));
                                 } else if (isAnthropicAudioType(itype)) {
                                     if (!try appendAnthropicAudioBlock(allocator, media.audio(aud_slot), inner)) audio_decode_failed = true;
                                 }

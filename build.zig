@@ -718,6 +718,7 @@ fn addPdfSources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/pdftext/pdftext.m"), .flags = objc_flags });
     module.linkFramework("PDFKit", .{});
+    module.linkFramework("CoreGraphics", .{});
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

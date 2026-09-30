@@ -466,8 +466,9 @@ fn appendMessageItem(
                         try text_parts.appendSlice(allocator, tx.string);
                     }
                 } else if (std.mem.eql(u8, pt, "input_file")) {
-                    // PDFs / text files inline as <document> text (src/pdf.zig).
-                    const doc = (try pdf_mod.renderOpenAIFilePart(allocator, part.object)) orelse continue;
+                    // PDFs / text files inline as <document> text (src/pdf.zig);
+                    // scanned pages are not attached on this surface.
+                    const doc = (try pdf_mod.renderOpenAIFilePart(allocator, part.object, false)) orelse continue;
                     defer allocator.free(doc);
                     if (text_parts.items.len > 0) try text_parts.append(allocator, '\n');
                     try text_parts.appendSlice(allocator, doc);
