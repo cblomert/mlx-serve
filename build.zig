@@ -183,6 +183,7 @@ pub fn build(b: *std.Build) void {
     // returns unavailable on machines/OSes without it) + the per-layer MLP
     // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
     addAneSources(b, mod);
+    addPdfSources(b, mod);
 
     // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
@@ -252,6 +253,7 @@ pub fn build(b: *std.Build) void {
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
     addAneSources(b, test_mod);
+    addPdfSources(b, test_mod);
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
@@ -703,6 +705,19 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_bridge.m"), .flags = objc_flags });
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
     module.addIncludePath(b.path("lib/ane"));
+}
+
+/// PDF text extraction for Anthropic `document` blocks (lib/pdftext, src/pdf.zig):
+/// a PDFKit shim, ARC objc. macOS graphs only — the Linux and iOS builds take
+/// src/pdf.zig's no-PDFKit branch (build_options.macos_engines = false).
+fn addPdfSources(b: *std.Build, module: *std.Build.Module) void {
+    const objc_flags = &[_][]const u8{
+        "-O2",
+        "-fobjc-arc",
+        "-Wno-deprecated-declarations",
+    };
+    module.addCSourceFile(.{ .file = b.path("lib/pdftext/pdftext.m"), .flags = objc_flags });
+    module.linkFramework("PDFKit", .{});
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

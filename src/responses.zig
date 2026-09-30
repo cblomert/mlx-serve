@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const chat_mod = @import("chat.zig");
+const pdf_mod = @import("pdf.zig");
 
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
@@ -464,6 +465,12 @@ fn appendMessageItem(
                         if (text_parts.items.len > 0) try text_parts.append(allocator, '\n');
                         try text_parts.appendSlice(allocator, tx.string);
                     }
+                } else if (std.mem.eql(u8, pt, "input_file")) {
+                    // PDFs / text files inline as <document> text (src/pdf.zig).
+                    const doc = (try pdf_mod.renderOpenAIFilePart(allocator, part.object)) orelse continue;
+                    defer allocator.free(doc);
+                    if (text_parts.items.len > 0) try text_parts.append(allocator, '\n');
+                    try text_parts.appendSlice(allocator, doc);
                 } else if (std.mem.eql(u8, pt, "input_image")) {
                     const url_val = part.object.get("image_url") orelse continue;
                     const url = switch (url_val) {

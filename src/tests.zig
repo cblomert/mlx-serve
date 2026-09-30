@@ -98,6 +98,7 @@ test {
     _ = @import("launch.zig");
     _ = @import("lan.zig");
     _ = @import("websearch.zig");
+    _ = @import("pdf.zig");
     _ = @import("providers.zig");
     _ = @import("mlx.zig");
 }

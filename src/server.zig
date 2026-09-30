@@ -191,6 +191,7 @@ const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const websearch_mod = @import("websearch.zig");
+const pdf_mod = @import("pdf.zig");
 const cli_mod = @import("cli.zig");
 const build_options = @import("build_options");
 const nowSecs = io_util.nowSecs;
@@ -8104,6 +8105,47 @@ fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) 
     return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
 }
 
+fn isDocumentPart(ptype: []const u8) bool {
+    return std.mem.eql(u8, ptype, "document") or std.mem.eql(u8, ptype, "file") or std.mem.eql(u8, ptype, "input_file");
+}
+
+/// `joinedTextParts` with document parts rendered in place as text
+/// (src/pdf.zig): Anthropic `document` blocks (Claude Code's Read of a whole
+/// PDF arrives inside a tool_result) and OpenAI `file` / `input_file` parts.
+/// Content without documents joins exactly as before.
+fn joinedContentParts(allocator: std.mem.Allocator, parts: []const std.json.Value) !JoinedText {
+    const has_doc = for (parts) |part| {
+        if (part != .object) continue;
+        const pt = part.object.get("type") orelse continue;
+        if (pt == .string and isDocumentPart(pt.string)) break true;
+    } else false;
+    if (!has_doc) return joinedTextParts(allocator, parts);
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    for (parts) |part| {
+        if (part != .object) continue;
+        const pt = part.object.get("type") orelse continue;
+        if (pt != .string) continue;
+        if (std.mem.eql(u8, pt.string, "text")) {
+            const tv = part.object.get("text") orelse continue;
+            if (tv != .string or tv.string.len == 0) continue;
+            if (buf.items.len > 0) try buf.append(allocator, '\n');
+            try buf.appendSlice(allocator, tv.string);
+        } else if (std.mem.eql(u8, pt.string, "document")) {
+            const doc = try pdf_mod.renderDocument(allocator, part.object);
+            defer allocator.free(doc);
+            if (buf.items.len > 0) try buf.append(allocator, '\n');
+            try buf.appendSlice(allocator, doc);
+        } else if (isDocumentPart(pt.string)) {
+            const doc = (try pdf_mod.renderOpenAIFilePart(allocator, part.object)) orelse continue;
+            defer allocator.free(doc);
+            if (buf.items.len > 0) try buf.append(allocator, '\n');
+            try buf.appendSlice(allocator, doc);
+        }
+    }
+    return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
+}
+
 /// Workload key for hot-cache eviction (#378): `prompt_cache_key` (OpenAI's own
 /// routing field) > `metadata.user_id` (Anthropic; Claude Code sends its session
 /// id) > the system prompt (OpenAI `messages[0]`, Anthropic `system`, Responses
@@ -8323,7 +8365,7 @@ fn handleChatCompletions(
                 msg_images = media.imagesSlice(img_slot);
                 msg_videos = media.videosSlice(vid_slot);
                 msg_audio = media.audioSlice(aud_slot);
-                const joined = try joinedTextParts(allocator, arr.items);
+                const joined = try joinedContentParts(allocator, arr.items);
                 if (joined.owned) try content_allocs.append(allocator, joined.text);
                 break :blk joined.text;
             },
@@ -15741,7 +15783,7 @@ fn handleAnthropicMessages(
                         if (block.object.get("content")) |rc| switch (rc) {
                             .string => |s| result_text = s,
                             .array => |result_arr| {
-                                const joined = try joinedTextParts(allocator, result_arr.items);
+                                const joined = try joinedContentParts(allocator, result_arr.items);
                                 if (joined.owned) try content_allocs.append(allocator, joined.text);
                                 result_text = joined.text;
                             },
@@ -15765,6 +15807,12 @@ fn handleAnthropicMessages(
                                 if (msg_text.items.len > 0) try msg_text.append(allocator, '\n');
                                 try msg_text.appendSlice(allocator, text);
                             }
+                        } else if (std.mem.eql(u8, btype, "document")) {
+                            // PDFs (text layer) and text documents, as text (src/pdf.zig).
+                            const doc_text = try pdf_mod.renderDocument(allocator, block.object);
+                            defer allocator.free(doc_text);
+                            if (msg_text.items.len > 0) try msg_text.append(allocator, '\n');
+                            try msg_text.appendSlice(allocator, doc_text);
                         } else if (std.mem.eql(u8, btype, "image")) {
                             if (!decode_this_message and !keep_history_media) continue;
                             if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocFromConfig(config))) image_decode_failed = true;
