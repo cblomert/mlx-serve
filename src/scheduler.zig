@@ -4857,7 +4857,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 // no chunk-boundary yield, so without this every slot's first
                 // token waits for the LAST slot's prefill (the TTFT
                 // staircase collapse).
-                if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
+                if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch, null);
                 if (slot.cancelled.load(.acquire)) {
                     // finishSlot (not raw markFinished) so the metrics sink
                     // counts the cancellation; safe pre-prefill — commit
@@ -6320,8 +6320,15 @@ pub fn prefillInterleaveEnabled() bool {
 
 const InterleaveCtx = struct {
     sch: *Scheduler,
+    arm: InterleaveArm = INTERLEAVE_DEFAULT,
+    arm_b: bool = false,
     decode_ns: u64 = 0,
     ticks: u32 = 0,
+    /// Chunk boundaries that ran ticks, tokens the decoding streams emitted in them, and
+    /// the most streams one tick carried: the `[interleave]` A/B line.
+    boundaries: u32 = 0,
+    tokens: u64 = 0,
+    max_decoders: u32 = 0,
     /// Wall clock since the previous boundary's ticks ended: the chunk just forwarded.
     chunk_sw: io_util.Stopwatch,
 };
@@ -6358,11 +6365,102 @@ pub fn companyPrefillChunk(chunk: u32, decoding: usize) u32 {
 
 const INTERLEAVE_MAX_TICKS: u32 = 8;
 
-/// Decode ticks owed at a chunk boundary: enough to keep the decoding streams at a quarter
-/// of wall time (chunk / 3), at least one, capped so a slow chunk cannot stall its own TTFT.
-pub fn interleaveTicksFor(chunk_ns: u64, tick_ns: u64) u32 {
+/// Decode's share of wall time across another request's prefill, in percent of each chunk
+/// plus the ticks after it, and the per-boundary tick cap.
+pub const InterleaveArm = struct { share_pct: u32, max_ticks: u32 };
+
+/// The original policy: a quarter of wall time (chunk / 3), capped at 8 ticks. At long
+/// context a 2048-token company chunk runs ~2.5 s against a ~25 ms MTP round, so the cap
+/// binds and decode keeps ~8%, not a quarter.
+pub const INTERLEAVE_DEFAULT: InterleaveArm = .{ .share_pct = 25, .max_ticks = INTERLEAVE_MAX_TICKS };
+
+/// Live policy, read atomically once per prefill. With `g_interleave_b_share_pct` non-zero
+/// every company prefill draws arm A or B and logs what the decoders got
+/// (`[interleave] arm=`): a randomized A/B under live traffic. Set from
+/// `MLX_SERVE_INTERLEAVE=share:cap[,share:cap]` at startup and by `/admin/interleave`.
+pub var g_interleave_share_pct: u32 = INTERLEAVE_DEFAULT.share_pct;
+pub var g_interleave_max_ticks: u32 = INTERLEAVE_DEFAULT.max_ticks;
+pub var g_interleave_b_share_pct: u32 = 0;
+pub var g_interleave_b_max_ticks: u32 = 0;
+
+pub const INTERLEAVE_SHARE_MAX: u32 = 90;
+pub const INTERLEAVE_TICKS_MAX: u32 = 1024;
+
+pub const InterleaveSpec = struct { a: InterleaveArm, b: ?InterleaveArm };
+
+/// `share:cap` or `share:cap,share:cap` (A, then the B arm); share 1..90 %, cap 1..1024.
+pub fn parseInterleaveSpec(spec: []const u8) error{InvalidInterleaveSpec}!InterleaveSpec {
+    var out: InterleaveSpec = .{ .a = INTERLEAVE_DEFAULT, .b = null };
+    var arms = std.mem.splitScalar(u8, std.mem.trim(u8, spec, " "), ',');
+    var n: usize = 0;
+    while (arms.next()) |raw| : (n += 1) {
+        if (n >= 2) return error.InvalidInterleaveSpec;
+        const arm_txt = std.mem.trim(u8, raw, " ");
+        const colon = std.mem.indexOfScalar(u8, arm_txt, ':') orelse return error.InvalidInterleaveSpec;
+        const share = std.fmt.parseInt(u32, arm_txt[0..colon], 10) catch return error.InvalidInterleaveSpec;
+        const cap = std.fmt.parseInt(u32, arm_txt[colon + 1 ..], 10) catch return error.InvalidInterleaveSpec;
+        if (share < 1 or share > INTERLEAVE_SHARE_MAX or cap < 1 or cap > INTERLEAVE_TICKS_MAX) return error.InvalidInterleaveSpec;
+        const arm: InterleaveArm = .{ .share_pct = share, .max_ticks = cap };
+        if (n == 0) out.a = arm else out.b = arm;
+    }
+    return out;
+}
+
+/// Startup: apply `MLX_SERVE_INTERLEAVE` (called from main after the flags).
+pub fn initInterleaveFromEnv() void {
+    const raw = std.c.getenv("MLX_SERVE_INTERLEAVE") orelse return;
+    const spec = parseInterleaveSpec(std.mem.span(raw)) catch {
+        log.warn("[interleave] MLX_SERVE_INTERLEAVE=\"{s}\" ignored: want share:cap[,share:cap], share 1..90, cap 1..1024\n", .{std.mem.span(raw)});
+        return;
+    };
+    g_interleave_share_pct = spec.a.share_pct;
+    g_interleave_max_ticks = spec.a.max_ticks;
+    if (spec.b) |b| {
+        g_interleave_b_share_pct = b.share_pct;
+        g_interleave_b_max_ticks = b.max_ticks;
+    }
+    logInterleavePolicy("startup");
+}
+
+pub fn logInterleavePolicy(why: []const u8) void {
+    const a_share = @atomicLoad(u32, &g_interleave_share_pct, .monotonic);
+    const a_cap = @atomicLoad(u32, &g_interleave_max_ticks, .monotonic);
+    const b_share = @atomicLoad(u32, &g_interleave_b_share_pct, .monotonic);
+    if (b_share == 0) {
+        log.info("[interleave] {s}: decode keeps {d}% of a company prefill, at most {d} ticks per chunk\n", .{ why, a_share, a_cap });
+    } else {
+        log.info("[interleave] {s}: A/B per company prefill, A = {d}% / {d} ticks, B = {d}% / {d} ticks\n", .{ why, a_share, a_cap, b_share, @max(1, @atomicLoad(u32, &g_interleave_b_max_ticks, .monotonic)) });
+    }
+}
+
+var interleave_draws: u64 = 0;
+
+/// The arm one prefill runs under (inference thread only). The coin is a hash of a draw
+/// counter: Claude Code sends side calls in pairs, so plain alternation could correlate.
+fn drawInterleaveArm() struct { arm: InterleaveArm, b: bool } {
+    const a: InterleaveArm = .{
+        .share_pct = @atomicLoad(u32, &g_interleave_share_pct, .monotonic),
+        .max_ticks = @atomicLoad(u32, &g_interleave_max_ticks, .monotonic),
+    };
+    const b_share = @atomicLoad(u32, &g_interleave_b_share_pct, .monotonic);
+    if (b_share == 0) return .{ .arm = a, .b = false };
+    interleave_draws +%= 1;
+    if (std.hash.Wyhash.hash(0x1ea7e, std.mem.asBytes(&interleave_draws)) & 1 == 0) return .{ .arm = a, .b = false };
+    return .{ .arm = .{ .share_pct = b_share, .max_ticks = @max(1, @atomicLoad(u32, &g_interleave_b_max_ticks, .monotonic)) }, .b = true };
+}
+
+/// Decode ticks owed at a chunk boundary: enough to keep the decoding streams at `share_pct`
+/// of wall time (chunk * share / (100 - share)), at least one, capped so a slow chunk cannot
+/// stall its own TTFT.
+pub fn interleaveTicksForArm(chunk_ns: u64, tick_ns: u64, arm: InterleaveArm) u32 {
     if (tick_ns == 0) return 1;
-    return @intCast(std.math.clamp(chunk_ns / 3 / tick_ns, 1, INTERLEAVE_MAX_TICKS));
+    const share: u64 = @min(arm.share_pct, INTERLEAVE_SHARE_MAX);
+    const owed = chunk_ns / (100 - share) * share / tick_ns;
+    return @intCast(std.math.clamp(owed, 1, @max(1, arm.max_ticks)));
+}
+
+pub fn interleaveTicksFor(chunk_ns: u64, tick_ns: u64) u32 {
+    return interleaveTicksForArm(chunk_ns, tick_ns, INTERLEAVE_DEFAULT);
 }
 
 /// SSD-first write-through: persist each completed prefill chunk as the prefill produces it,
@@ -6496,12 +6594,13 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
     const chunk_ns = ic.chunk_sw.read();
-    const first_ns = interleaveDecodeTick(ic.sch);
+    const first_ns = interleaveDecodeTick(ic.sch, ic);
     ic.ticks += 1;
     ic.decode_ns +|= first_ns;
-    var left = if (first_ns == 0) 0 else interleaveTicksFor(chunk_ns, first_ns) - 1;
+    if (first_ns != 0) ic.boundaries += 1;
+    var left = if (first_ns == 0) 0 else interleaveTicksForArm(chunk_ns, first_ns, ic.arm) - 1;
     while (left > 0) : (left -= 1) {
-        const ns = interleaveDecodeTick(ic.sch);
+        const ns = interleaveDecodeTick(ic.sch, ic);
         if (ns == 0) break;
         ic.ticks += 1;
         ic.decode_ns +|= ns;
@@ -6514,7 +6613,7 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
 /// Returns the tick's wall-clock ns (0 when no stream is active). The
 /// prefilling slot is not in `decoding` yet, so the tick only advances OTHER
 /// requests' Generators — same-thread MLX, no reentrancy into this prefill.
-fn interleaveDecodeTick(sch: *Scheduler) u64 {
+fn interleaveDecodeTick(sch: *Scheduler, stats: ?*InterleaveCtx) u64 {
     var buf: [32]*Slot = undefined;
     var n: usize = 0;
     sch.queue_mu.lockUncancelable(sch.io);
@@ -6538,6 +6637,8 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
             g.invalidateRoundClock();
         }
     }
+    var before: u64 = 0;
+    for (buf[0..n]) |s| before += s.completion_tokens;
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
         log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
@@ -6545,7 +6646,33 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     };
     const tick_ns = sw.read();
     for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+    if (stats) |ic| {
+        var after: u64 = 0;
+        for (buf[0..n]) |s| after += s.completion_tokens;
+        ic.tokens += after -| before;
+        ic.max_decoders = @max(ic.max_decoders, @as(u32, @intCast(n)));
+    }
     return tick_ns;
+}
+
+/// One line per prefill that hosted decode ticks: what the decoding streams got and what the
+/// prefill paid, per arm (the live A/B's raw data).
+fn logInterleavedPrefill(ic: *const InterleaveCtx, prefill_tokens: usize, wall_ns: u64) void {
+    const wall_s = @as(f64, @floatFromInt(@max(wall_ns, 1))) / 1e9;
+    log.info("[interleave] arm={s} share={d}% cap={d}: prefill {d} tok in {d} ms ({d:.1} tok/s), decode {d} ms in {d} ticks over {d} chunks, {d} decoders +{d} tok ({d:.1} tok/s)\n", .{
+        if (ic.arm_b) "B" else "A",
+        ic.arm.share_pct,
+        ic.arm.max_ticks,
+        prefill_tokens,
+        wall_ns / std.time.ns_per_ms,
+        @as(f64, @floatFromInt(prefill_tokens)) / wall_s,
+        ic.decode_ns / std.time.ns_per_ms,
+        ic.ticks,
+        ic.boundaries,
+        ic.max_decoders,
+        ic.tokens,
+        @as(f64, @floatFromInt(ic.tokens)) / wall_s,
+    });
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -6848,7 +6975,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
-    var interleave_ctx = InterleaveCtx{ .sch = sch, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+    const drawn = drawInterleaveArm();
+    var interleave_ctx = InterleaveCtx{ .sch = sch, .chunk_sw = io_util.Stopwatch.init(sch.io), .arm = drawn.arm, .arm_b = drawn.b };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
@@ -6871,6 +6999,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+    const prefill_wall = io_util.Stopwatch.init(sch.io);
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -6954,6 +7083,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         },
     );
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
+    if (interleave_ctx.boundaries > 0) logInterleavedPrefill(&interleave_ctx, prefill_tokens.len, prefill_wall.read());
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
 
@@ -10708,6 +10838,31 @@ test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
     try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+}
+
+test "interleaveTicksForArm: the share sets ticks per chunk, the cap bounds them" {
+    const ms = std.time.ns_per_ms;
+    // 50%: decode gets as long as the chunk ran.
+    try testing.expectEqual(@as(u32, 10), interleaveTicksForArm(1000 * ms, 100 * ms, .{ .share_pct = 50, .max_ticks = 64 }));
+    try testing.expectEqual(@as(u32, 64), interleaveTicksForArm(2500 * ms, 25 * ms, .{ .share_pct = 50, .max_ticks = 64 }));
+    // 75%: three chunk-lengths of decode.
+    try testing.expectEqual(@as(u32, 30), interleaveTicksForArm(1000 * ms, 100 * ms, .{ .share_pct = 75, .max_ticks = 64 }));
+    // The default arm is the old chunk / 3 rule.
+    try testing.expectEqual(interleaveTicksFor(2500 * ms, 25 * ms), interleaveTicksForArm(2500 * ms, 25 * ms, INTERLEAVE_DEFAULT));
+    try testing.expectEqual(@as(u32, 1), interleaveTicksForArm(10 * ms, 100 * ms, .{ .share_pct = 50, .max_ticks = 64 }));
+}
+
+test "parseInterleaveSpec: one or two share:cap arms, bounded" {
+    const one = try parseInterleaveSpec("50:64");
+    try testing.expectEqual(@as(u32, 50), one.a.share_pct);
+    try testing.expectEqual(@as(u32, 64), one.a.max_ticks);
+    try testing.expect(one.b == null);
+    const two = try parseInterleaveSpec(" 25:8 , 50:64 ");
+    try testing.expectEqual(@as(u32, 25), two.a.share_pct);
+    try testing.expectEqual(@as(u32, 64), two.b.?.max_ticks);
+    for ([_][]const u8{ "", "50", "0:8", "91:8", "50:0", "50:2000", "a:b", "25:8,50:64,75:64" }) |bad| {
+        try testing.expectError(error.InvalidInterleaveSpec, parseInterleaveSpec(bad));
+    }
 }
 
 test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chunk, capped" {

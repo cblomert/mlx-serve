@@ -766,6 +766,7 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
 const ROUTE_PATHS = [_][]const u8{
     "/",
     "/admin/admission",
+    "/admin/interleave",
     "/api/chat",
     "/api/embed",
     "/api/embeddings",
@@ -2225,6 +2226,11 @@ fn handleConnection(
     // Parallel-agent caps at runtime (scheduler.g_max_active*); this machine only.
     if (std.mem.eql(u8, path, "/admin/admission") and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST"))) {
         try handleAdmissionAdmin(allocator, stream, method, request_body);
+        return;
+    }
+    // Decode share across company prefills (scheduler.g_interleave_*), A/B arm; this machine only.
+    if (std.mem.eql(u8, path, "/admin/interleave") and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST"))) {
+        try handleInterleaveAdmin(allocator, stream, method, request_body);
         return;
     }
     // Usage dashboard and its two feeds (src/usage.zig). Same API-key gate.
@@ -7063,6 +7069,75 @@ fn handleAdmissionAdmin(allocator: std.mem.Allocator, stream: *Conn, method: []c
         @atomicLoad(u32, &scheduler_mod.g_max_active, .monotonic), @atomicLoad(u32, &scheduler_mod.g_max_active_per_user, .monotonic),
     }) catch unreachable;
     try sendResponse(stream, "200 OK", "application/json", out);
+}
+
+pub const InterleaveSet = struct { share_pct: ?u32 = null, max_ticks: ?u32 = null, b_share_pct: ?u32 = null, b_max_ticks: ?u32 = null };
+
+/// `{"share_pct":S,"max_ticks":M,"b_share_pct":S2,"b_max_ticks":M2}`, every key optional:
+/// shares 1..90 (b_share_pct 0 ends the A/B), caps 1..1024. Unknown keys are ignored.
+pub fn parseInterleaveSet(obj: std.json.ObjectMap) error{InvalidValue}!InterleaveSet {
+    var set: InterleaveSet = .{};
+    inline for (.{ "share_pct", "max_ticks", "b_share_pct", "b_max_ticks" }) |key| {
+        if (obj.get(key)) |v| {
+            const lo: i64 = if (comptime std.mem.eql(u8, key, "b_share_pct")) 0 else 1;
+            const hi: i64 = if (comptime std.mem.endsWith(u8, key, "share_pct")) scheduler_mod.INTERLEAVE_SHARE_MAX else scheduler_mod.INTERLEAVE_TICKS_MAX;
+            if (v != .integer or v.integer < lo or v.integer > hi) return error.InvalidValue;
+            @field(set, key) = @intCast(v.integer);
+        }
+    }
+    return set;
+}
+
+/// `GET|POST /admin/interleave`: read or change how much of another request's prefill the
+/// decoding streams keep (`[interleave]` policy), and the optional B arm of the live A/B.
+/// Loopback only, like `/admin/admission`; read once per prefill; a restart goes back to
+/// MLX_SERVE_INTERLEAVE.
+fn handleInterleaveAdmin(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, body: []const u8) !void {
+    if (!peerIsLoopback(stream)) {
+        try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "the interleave policy can only be read or changed from the server machine", 403);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST")) {
+        const usage = "set share_pct (1..90), max_ticks (1..1024), b_share_pct (0..90, 0 = no A/B) and/or b_max_ticks (1..1024)";
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", usage, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const set = if (parsed.value == .object) parseInterleaveSet(parsed.value.object) catch null else null;
+        if (set == null or (set.?.share_pct == null and set.?.max_ticks == null and set.?.b_share_pct == null and set.?.b_max_ticks == null)) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", usage, 400);
+            return;
+        }
+        if (set.?.share_pct) |v| @atomicStore(u32, &scheduler_mod.g_interleave_share_pct, v, .monotonic);
+        if (set.?.max_ticks) |v| @atomicStore(u32, &scheduler_mod.g_interleave_max_ticks, v, .monotonic);
+        if (set.?.b_max_ticks) |v| @atomicStore(u32, &scheduler_mod.g_interleave_b_max_ticks, v, .monotonic);
+        if (set.?.b_share_pct) |v| @atomicStore(u32, &scheduler_mod.g_interleave_b_share_pct, v, .monotonic);
+        scheduler_mod.logInterleavePolicy("changed at runtime");
+    }
+    var buf: [128]u8 = undefined;
+    const out = std.fmt.bufPrint(&buf, "{{\"share_pct\":{d},\"max_ticks\":{d},\"b_share_pct\":{d},\"b_max_ticks\":{d}}}", .{
+        @atomicLoad(u32, &scheduler_mod.g_interleave_share_pct, .monotonic),
+        @atomicLoad(u32, &scheduler_mod.g_interleave_max_ticks, .monotonic),
+        @atomicLoad(u32, &scheduler_mod.g_interleave_b_share_pct, .monotonic),
+        @atomicLoad(u32, &scheduler_mod.g_interleave_b_max_ticks, .monotonic),
+    }) catch unreachable;
+    try sendResponse(stream, "200 OK", "application/json", out);
+}
+
+test "parseInterleaveSet: shares 1..90 (B may be 0), caps 1..1024" {
+    const a = std.testing.allocator;
+    const ok = try std.json.parseFromSlice(std.json.Value, a, "{\"b_share_pct\":0,\"max_ticks\":64,\"x\":1}", .{});
+    defer ok.deinit();
+    const set = try parseInterleaveSet(ok.value.object);
+    try std.testing.expectEqual(@as(?u32, 0), set.b_share_pct);
+    try std.testing.expectEqual(@as(?u32, 64), set.max_ticks);
+    try std.testing.expectEqual(@as(?u32, null), set.share_pct);
+    for ([_][]const u8{ "{\"share_pct\":0}", "{\"share_pct\":91}", "{\"b_share_pct\":91}", "{\"max_ticks\":0}", "{\"b_max_ticks\":1025}", "{\"share_pct\":\"50\"}" }) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidValue, parseInterleaveSet(parsed.value.object));
+    }
 }
 
 test "parseAdmissionCaps: either cap, 0..4096, anything else refused" {

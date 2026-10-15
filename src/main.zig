@@ -454,6 +454,7 @@ pub fn main(init: std.process.Init) !void {
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();
     raiseOpenFileLimit();
+    scheduler_mod.initInterleaveFromEnv();
 
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
