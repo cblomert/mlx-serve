@@ -416,6 +416,26 @@ fn printUsage(io: std.Io) void {
     stdout_w.interface.flush() catch {};
 }
 
+/// launchd starts agents at a soft open-file limit of 256. The SSD prefix tier keeps one
+/// file open per 1024-token chunk until a restore evaluates (lazy safetensors loads), so a
+/// ~240k-token session ran out of descriptors mid-restore and the request failed
+/// (live 2026-10-15: "load_safetensors: Failed to open file .../c000237.safetensors").
+/// Raise the soft limit to the hard one, capped at kern.maxfilesperproc (macOS rejects more).
+fn raiseOpenFileLimit() void {
+    const lim = std.posix.getrlimit(.NOFILE) catch return;
+    var want: u64 = lim.max;
+    var per_proc: c_int = 0;
+    var len: usize = @sizeOf(c_int);
+    if (std.c.sysctlbyname("kern.maxfilesperproc", &per_proc, &len, null, 0) == 0 and per_proc > 0)
+        want = @min(want, @as(u64, @intCast(per_proc)));
+    if (want <= lim.cur) return;
+    std.posix.setrlimit(.NOFILE, .{ .cur = want, .max = lim.max }) catch |err| {
+        log.warn("[fd] could not raise the open-file limit from {d}: {s}\n", .{ lim.cur, @errorName(err) });
+        return;
+    };
+    log.info("[fd] open-file limit {d} -> {d}\n", .{ lim.cur, want });
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -433,6 +453,7 @@ pub fn main(init: std.process.Init) !void {
 
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();
+    raiseOpenFileLimit();
 
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);

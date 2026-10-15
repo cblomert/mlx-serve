@@ -725,6 +725,11 @@ pub const DiskTier = struct {
     /// diverged-prefix "hit" that would otherwise read every stored chunk to
     /// serve a few hundred tokens — slower than a cold prefill).
     pub fn restorePrefixInto(self: *DiskTier, cache: *KVCache, idx: usize, limit: u32, s: mlx.mlx_stream) !void {
+        // The caller falls back to cold prefill on our error, so a load we failed (a missing
+        // or unopenable chunk) must not leave its latch behind: the fallback's first checkpoint
+        // would raise it as MlxFailure and fail the request anyway (live 2026-10-15).
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         // This entry's staged chunks must be on disk before the readback.
         self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
@@ -749,6 +754,10 @@ pub const DiskTier = struct {
         cp_pos: u32,
         s: mlx.mlx_stream,
     ) !u32 {
+        // Same contract as `restorePrefixInto`: the caller's cold fallback must not inherit
+        // the latch of a load that failed here.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
         if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
@@ -1716,6 +1725,10 @@ pub const DiskTier = struct {
         /// clamps as it does today (a mid-block warm clamp declines, head starts blind).
         head_marks: transformer_mod.QsaHeadMarkSet = .{},
     } {
+        // Best-effort: every failure below returns null and the caller starts blind, so
+        // whatever latch this call raised is already handled — drop it.
+        const had_error = mlx.errorPending();
+        defer mlx.dropLatchedErrorUnless(had_error);
         const e = &self.entries.items[idx];
         const meta = (switch (which) {
             .dflash => e.spec_dflash,
@@ -7261,6 +7274,54 @@ test "DiskTier: entryWholeOnDisk stats what the index NAMES (a truncated chunk f
     try tmp.dir.deleteFile(io, "fp-stat/e1/c000002.safetensors");
     try testing.expect(!tier.entryWholeOnDisk(id));
     try testing.expect(!tier.entryWholeOnDisk(id + 999));
+}
+
+test "DiskTier: a restore that cannot open a chunk drops the latch it raised and keeps a foreign one" {
+    // Bar: the caller falls back to cold prefill on a failed restore; a latch left behind made
+    // that fallback's first checkpoint raise MlxFailure (live 2026-10-15, chunk past the
+    // open-file limit), so the request failed anyway. A real mlx-c raise needs the
+    // server's latching handler; mlx-c's default exits the process.
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-gone", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    try testing.expect(tier.entryWholeOnDisk(tier.entries.items[0].id));
+    try tmp.dir.deleteFile(io, "fp-gone/e1/c000000.safetensors");
+
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    try testing.expect(!mlx.errorPending());
+    try testing.expectError(error.MlxError, tier.restoreInto(&cache2, 0, s));
+    try testing.expect(!mlx.errorPending());
+
+    var dst = buildHybridEntries(s, 0.0, 0.0);
+    defer freeHybridEntries(&dst);
+    try testing.expectError(error.MlxError, tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expect(!mlx.errorPending());
+
+    // A latch that predates the call belongs to someone else and survives it.
+    mlx.latchErrorForTest("foreign pre-existing error");
+    try testing.expectError(error.MlxError, tier.restoreInto(&cache2, 0, s));
+    var msg: [512]u8 = undefined;
+    try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
 }
 
 test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable checkpoint" {
