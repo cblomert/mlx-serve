@@ -16155,14 +16155,19 @@ fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), val
 }
 
 /// Convert Anthropic tools format to OpenAI tools format for chat template compatibility.
-fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
+/// `skip_deferred` leaves out tools marked `defer_loading` (tool search): the prompt
+/// lists only the rest, while the tool-call parser still gets every tool.
+fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array, skip_deferred: bool) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '[');
-    for (tools_array.items, 0..) |tool_val, i| {
-        if (i > 0) try buf.append(allocator, ',');
+    var emitted: usize = 0;
+    for (tools_array.items) |tool_val| {
         if (tool_val != .object) continue;
         const tool = tool_val.object;
+        if (skip_deferred and isDeferredTool(tool)) continue;
+        if (emitted > 0) try buf.append(allocator, ',');
+        emitted += 1;
         // Anthropic's `web_search_*` server tool has no schema: the model sees
         // a plain web_search(query) function, answered by handleAnthropicWebSearch.
         const web_search = websearch_mod.isServerTool(tool);
@@ -16193,13 +16198,114 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
     return try buf.toOwnedSlice(allocator);
 }
 
+fn isDeferredTool(tool: std.json.ObjectMap) bool {
+    const d = tool.get("defer_loading") orelse return false;
+    return d == .bool and d.bool;
+}
+
+fn anyDeferredTool(tools_array: std.json.Array) bool {
+    for (tools_array.items) |t| {
+        if (t == .object and isDeferredTool(t.object)) return true;
+    }
+    return false;
+}
+
+/// Claude Code's tool search (`ENABLE_TOOL_SEARCH`): MCP tools ride in `tools`
+/// with `defer_loading` and stay out of the prompt; the model loads them with
+/// the ToolSearch tool, whose result is `tool_reference` blocks. Anthropic's API
+/// expands each reference into the tool's definition at that point of the
+/// conversation. This does the same, as the `<functions>` block of
+/// `<function>{"description","name","parameters"}</function>` lines that the
+/// ToolSearch description promises the model. Null when `parts` has no reference.
+/// In-history and deterministic, so the prefix cache keeps matching.
+fn expandToolReferences(allocator: std.mem.Allocator, parts: []const std.json.Value, tools: ?std.json.Value) !?[]u8 {
+    const any = for (parts) |p| {
+        if (p != .object) continue;
+        const t = p.object.get("type") orelse continue;
+        if (t == .string and std.mem.eql(u8, t.string, "tool_reference")) break true;
+    } else false;
+    if (!any) return null;
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "<functions>\n");
+    for (parts) |p| {
+        if (p != .object) continue;
+        const t = p.object.get("type") orelse continue;
+        if (t != .string or !std.mem.eql(u8, t.string, "tool_reference")) continue;
+        const name = if (p.object.get("tool_name")) |v| (if (v == .string) v.string else "") else "";
+        const def: ?std.json.ObjectMap = if (tools) |tv| (if (tv == .array) blk: {
+            for (tv.array.items) |tool| {
+                if (tool != .object) continue;
+                const n = tool.object.get("name") orelse continue;
+                if (n == .string and std.mem.eql(u8, n.string, name)) break :blk tool.object;
+            }
+            break :blk null;
+        } else null) else null;
+        try buf.appendSlice(allocator, "<function>{\"description\": ");
+        const desc = if (def) |d| (if (d.get("description")) |v| (if (v == .string) v.string else "") else "") else "";
+        const esc_d = try jsonEscape(allocator, desc);
+        defer allocator.free(esc_d);
+        try buf.appendSlice(allocator, esc_d);
+        try buf.appendSlice(allocator, ", \"name\": ");
+        const esc_n = try jsonEscape(allocator, name);
+        defer allocator.free(esc_n);
+        try buf.appendSlice(allocator, esc_n);
+        try buf.appendSlice(allocator, ", \"parameters\": ");
+        if (def) |d| {
+            if (d.get("input_schema")) |schema| try serializeJsonValue(allocator, &buf, schema) else try buf.appendSlice(allocator, "{}");
+        } else try buf.appendSlice(allocator, "{}");
+        try buf.appendSlice(allocator, "}</function>\n");
+    }
+    try buf.appendSlice(allocator, "</functions>");
+    return try buf.toOwnedSlice(allocator);
+}
+
+test "tool search: deferred tools stay out of the prompt list, references expand to their definitions" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"name":"Read","description":"r","input_schema":{"type":"object"}},
+        \\ {"name":"DeferredToolPlaceholder","description":"never","input_schema":{"type":"object","properties":{}},"defer_loading":true},
+        \\ {"name":"mcp__x__probe","description":"Probe a host","input_schema":{"type":"object","properties":{"host":{"type":"string"}},"required":["host"]},"defer_loading":true}]
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expect(anyDeferredTool(parsed.value.array));
+    const all = try buildOpenAIToolsJson(a, parsed.value.array, false);
+    defer a.free(all);
+    const prompt = try buildOpenAIToolsJson(a, parsed.value.array, true);
+    defer a.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, all, "mcp__x__probe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "mcp__x__probe") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "DeferredToolPlaceholder") == null);
+    // Still valid JSON with one tool (no stray comma from the skipped ones).
+    const pv = try std.json.parseFromSlice(std.json.Value, a, prompt, .{});
+    defer pv.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pv.value.array.items.len);
+
+    const result = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"tool_reference","tool_name":"mcp__x__probe"},{"type":"tool_reference","tool_name":"Gone"}]
+    , .{});
+    defer result.deinit();
+    const text = (try expandToolReferences(a, result.value.array.items, parsed.value)).?;
+    defer a.free(text);
+    try std.testing.expectEqualStrings(
+        "<functions>\n" ++
+            "<function>{\"description\": \"Probe a host\", \"name\": \"mcp__x__probe\", \"parameters\": {\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\"}},\"required\":[\"host\"]}}</function>\n" ++
+            "<function>{\"description\": \"\", \"name\": \"Gone\", \"parameters\": {}}</function>\n" ++
+            "</functions>",
+        text,
+    );
+    const plain = try std.json.parseFromSlice(std.json.Value, a, "[{\"type\":\"text\",\"text\":\"x\"}]", .{});
+    defer plain.deinit();
+    try std.testing.expect((try expandToolReferences(a, plain.value.array.items, parsed.value)) == null);
+}
+
 test "buildOpenAIToolsJson: a web_search server tool renders as web_search(query); count_tokens is a route" {
     const a = std.testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, a,
         \\[{"type":"web_search_20250305","name":"web_search","max_uses":8},{"name":"Read","description":"r","input_schema":{"type":"object"}}]
     , .{});
     defer parsed.deinit();
-    const out = try buildOpenAIToolsJson(a, parsed.value.array);
+    const out = try buildOpenAIToolsJson(a, parsed.value.array, false);
     defer a.free(out);
     const v = try std.json.parseFromSlice(std.json.Value, a, out, .{});
     defer v.deinit();
@@ -16371,6 +16477,15 @@ fn handleAnthropicMessages(
                                 const joined = try joinedContentParts(allocator, result_arr.items, lm.vision_encoder != null);
                                 if (joined.owned) try content_allocs.append(allocator, joined.text);
                                 result_text = joined.text;
+                                // A ToolSearch result: the loaded tools' definitions.
+                                if (try expandToolReferences(allocator, result_arr.items, root.get("tools"))) |refs| {
+                                    try content_allocs.append(allocator, refs);
+                                    if (result_text.len > 0) {
+                                        const both = try std.mem.concat(allocator, u8, &.{ refs, "\n", result_text });
+                                        try content_allocs.append(allocator, both);
+                                        result_text = both;
+                                    } else result_text = refs;
+                                }
                             },
                             else => {},
                         };
@@ -16573,6 +16688,9 @@ fn handleAnthropicMessages(
     var tools_json: ?[]const u8 = null;
     var tools_json_allocated = false;
     defer if (tools_json_allocated) allocator.free(tools_json.?);
+    // The template's tool list when some tools are deferred (tool search); else tools_json.
+    var prompt_tools_json: ?[]const u8 = null;
+    defer if (prompt_tools_json) |p| allocator.free(p);
     var has_tools = false;
     var allow_parallel_tools = true;
     var tool_choice_instruction: ?[]const u8 = null;
@@ -16585,8 +16703,9 @@ fn handleAnthropicMessages(
         if (tools_val == .array and tools_val.array.items.len > 0) {
             has_tools = true;
             // Convert Anthropic tools to OpenAI format for chat template
-            tools_json = try buildOpenAIToolsJson(allocator, tools_val.array);
+            tools_json = try buildOpenAIToolsJson(allocator, tools_val.array, false);
             tools_json_allocated = true;
+            if (anyDeferredTool(tools_val.array)) prompt_tools_json = try buildOpenAIToolsJson(allocator, tools_val.array, true);
 
             // Parse tool_choice
             if (root.get("tool_choice")) |tc| {
@@ -16738,7 +16857,7 @@ fn handleAnthropicMessages(
     // Format chat template. Iteration 1 timing + Iteration 2 cache. The
     // `effective_tools_json` swap (`null` when has_tools is false) keeps
     // the cache key consistent with what the encoder actually sees.
-    const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
+    const effective_tools_json: ?[]const u8 = if (has_tools) (prompt_tools_json orelse tools_json) else null;
     // Anthropic's own contract: a conversation ending in an assistant message
     // means "continue this", with no flag. Implicit here and explicit on the
     // OpenAI surface is not an inconsistency — it is each surface's documented
