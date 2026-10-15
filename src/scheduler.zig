@@ -2699,7 +2699,8 @@ pub const AdmitCand = struct { model: usize, exclusive: bool, user: u64 = 0 };
 /// pending drain admits at once, overall and per `admit_user`. 0 = no cap.
 /// A held request stays in `pending` (its stream keeps getting keepalives and
 /// a client that leaves cancels it there); helper calls (`admit_user == 0`)
-/// neither count nor wait.
+/// neither count nor wait. Changeable at runtime (`POST /admin/admission`):
+/// read and written atomically.
 pub var g_max_active: u32 = 0;
 pub var g_max_active_per_user: u32 = 0;
 
@@ -4820,7 +4821,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s), .user = s.admit_user };
             }
             var admit_idx: [to_prefill.len]usize = undefined;
-            const limits: AdmitLimits = .{ .total = g_max_active, .per_user = g_max_active_per_user };
+            // Atomic: POST /admin/admission changes the caps while this loop runs.
+            const limits: AdmitLimits = .{
+                .total = @atomicLoad(u32, &g_max_active, .monotonic),
+                .per_user = @atomicLoad(u32, &g_max_active_per_user, .monotonic),
+            };
             const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], limits, &admit_idx);
             for (admit_idx[0..n_admit]) |idx| {
                 to_prefill[n_prefill] = sch.pending.items[idx];

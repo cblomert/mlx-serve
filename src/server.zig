@@ -765,6 +765,7 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
 /// The drift guard is a test that reads the dispatch chain out of this file.
 const ROUTE_PATHS = [_][]const u8{
     "/",
+    "/admin/admission",
     "/api/chat",
     "/api/embed",
     "/api/embeddings",
@@ -2219,6 +2220,11 @@ fn handleConnection(
         } else {
             try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics\"}");
         }
+        return;
+    }
+    // Parallel-agent caps at runtime (scheduler.g_max_active*); this machine only.
+    if (std.mem.eql(u8, path, "/admin/admission") and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST"))) {
+        try handleAdmissionAdmin(allocator, stream, method, request_body);
         return;
     }
     // Usage dashboard and its two feeds (src/usage.zig). Same API-key gate.
@@ -7007,6 +7013,80 @@ fn startUsage(io: std.Io) ?*usage_mod.Store {
     };
     log.info("Usage log: {s} ({d} requests from the last {d} days) - dashboard at /usage\n", .{ dir, store.count(), @max(days, 1) });
     return store;
+}
+
+pub const AdmissionCaps = struct { max_active: ?u32 = null, max_active_per_user: ?u32 = null };
+
+/// `{"max_active":N,"max_active_per_user":M}`, either key optional, each 0..4096
+/// (0 = no cap). Unknown keys are ignored.
+pub fn parseAdmissionCaps(obj: std.json.ObjectMap) error{InvalidCap}!AdmissionCaps {
+    var caps: AdmissionCaps = .{};
+    inline for (.{ "max_active", "max_active_per_user" }) |key| {
+        if (obj.get(key)) |v| {
+            if (v != .integer or v.integer < 0 or v.integer > 4096) return error.InvalidCap;
+            @field(caps, key) = @intCast(v.integer);
+        }
+    }
+    return caps;
+}
+
+/// `GET|POST /admin/admission`: read or change `--max-active` /
+/// `--max-active-per-user` while the server runs. Loopback only (it changes
+/// who may run, so a tailnet peer must not), whatever the API-key setting.
+/// The inference loop reads the caps every tick: a raised cap admits held
+/// requests on the next one, a lowered cap lets live ones finish. A restart
+/// goes back to the launch flags.
+fn handleAdmissionAdmin(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, body: []const u8) !void {
+    if (!peerIsLoopback(stream)) {
+        try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "the admission caps can only be read or changed from the server machine", 403);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST")) {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "body must be JSON like {\"max_active\":6,\"max_active_per_user\":3}", 400);
+            return;
+        };
+        defer parsed.deinit();
+        const caps = if (parsed.value == .object) parseAdmissionCaps(parsed.value.object) catch null else null;
+        if (caps == null or (caps.?.max_active == null and caps.?.max_active_per_user == null)) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "set max_active and/or max_active_per_user to an integer 0..4096 (0 = no cap)", 400);
+            return;
+        }
+        if (caps.?.max_active) |v| @atomicStore(u32, &scheduler_mod.g_max_active, v, .monotonic);
+        if (caps.?.max_active_per_user) |v| @atomicStore(u32, &scheduler_mod.g_max_active_per_user, v, .monotonic);
+        log.info("[admission] caps changed at runtime: at most {d} generations live, {d} per user (0 = no cap)\n", .{
+            @atomicLoad(u32, &scheduler_mod.g_max_active, .monotonic), @atomicLoad(u32, &scheduler_mod.g_max_active_per_user, .monotonic),
+        });
+    }
+    var buf: [96]u8 = undefined;
+    const out = std.fmt.bufPrint(&buf, "{{\"max_active\":{d},\"max_active_per_user\":{d}}}", .{
+        @atomicLoad(u32, &scheduler_mod.g_max_active, .monotonic), @atomicLoad(u32, &scheduler_mod.g_max_active_per_user, .monotonic),
+    }) catch unreachable;
+    try sendResponse(stream, "200 OK", "application/json", out);
+}
+
+test "parseAdmissionCaps: either cap, 0..4096, anything else refused" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, total: ?u32, per_user: ?u32, ok: bool }{
+        .{ .body = "{\"max_active_per_user\":3}", .total = null, .per_user = 3, .ok = true },
+        .{ .body = "{\"max_active\":6,\"max_active_per_user\":0}", .total = 6, .per_user = 0, .ok = true },
+        .{ .body = "{\"other\":1}", .total = null, .per_user = null, .ok = true },
+        .{ .body = "{\"max_active\":-1}", .total = null, .per_user = null, .ok = false },
+        .{ .body = "{\"max_active\":\"6\"}", .total = null, .per_user = null, .ok = false },
+        .{ .body = "{\"max_active_per_user\":5000}", .total = null, .per_user = null, .ok = false },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        defer parsed.deinit();
+        const got = parseAdmissionCaps(parsed.value.object);
+        if (!c.ok) {
+            try std.testing.expectError(error.InvalidCap, got);
+            continue;
+        }
+        const caps = try got;
+        try std.testing.expectEqual(c.total, caps.max_active);
+        try std.testing.expectEqual(c.per_user, caps.max_active_per_user);
+    }
 }
 
 /// `GET /usage.json?from=&to=&bucket=&tz=` (unix ms, bucket ms, tz = the viewer's
