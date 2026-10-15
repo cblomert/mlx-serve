@@ -1322,8 +1322,21 @@ pub const DiskTier = struct {
         // kv_len past it.
         const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
+        // The entry's own history (not a donor's link): an extend that brings no bank keeps it.
+        const own_qsa: QsaHistoryResult = if (extend_idx) |i| blk: {
+            const e = &self.entries.items[i];
+            break :blk if (e.inherited_qsa) .{} else .{ .rows = e.qsa_history_rows, .bytes = e.qsa_history_bytes };
+        } else .{};
+        // Coverage is planned against the target length (kv_len is only known after the chunk
+        // writes below); the history write itself uses the real prefix.
+        const cover_prefix: u32 = if (donor) |d|
+            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_target)))
+        else
+            kv_target;
+        const cover_plan = planQsaHistory(ssm_checkpoints, inherited_qsa, if (inherited_qsa) @min(inherited_qsa_rows, cover_prefix) else inherited_qsa_rows, cover_prefix, own_qsa);
+        const qsa_cover = qsaCoverOf(cover_plan, ssm_checkpoints, own_qsa, inherited_qsa);
         var written_bytes: u64 = 0;
-        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
+        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2, qsa_cover) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
             // would double-free (the fault-injection test segfaulted on exactly this).
             return err;
@@ -1358,7 +1371,7 @@ pub const DiskTier = struct {
         else
             kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
-        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, prefix_rows, s);
+        const qsa_res = try self.persistQsaHistory(dir_rel, planQsaHistory(ssm_checkpoints, inherited_qsa, inherited_qsa_rows, prefix_rows, own_qsa), inherited_qsa, s);
         const complete = chunk_complete and ssm_res.complete;
 
         // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
@@ -1530,9 +1543,11 @@ pub const DiskTier = struct {
         // Write-ahead bound: the token record, not the flushed kv_len — a
         // checkpoint beyond the current chunks is position-keyed and becomes
         // restorable when a later extend raises kv_len past it.
-        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
+        const own_qsa: QsaHistoryResult = if (e.inherited_qsa) .{} else .{ .rows = e.qsa_history_rows, .bytes = e.qsa_history_bytes };
+        const plan = planQsaHistory(ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.kv_len, own_qsa);
+        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes, qsaCoverOf(plan, ssm_checkpoints, own_qsa, e.inherited_qsa));
         errdefer ssm_res.deinit(self.allocator);
-        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.kv_len, s);
+        const qsa_res = try self.persistQsaHistory(dir_rel, plan, e.inherited_qsa, s);
 
         // Captured before the sidecar write overwrites it: this path bills a delta.
         const old_spec_bytes: u64 = e.spec_bytes;
@@ -2162,6 +2177,11 @@ pub const DiskTier = struct {
         written_bytes: *u64,
         s: mlx.mlx_stream,
         max_spend: u64,
+        /// Highest position the entry's indexer history covers after this commit (null: not a
+        /// QSA entry). A new checkpoint past it cannot seed the QSA layers — a restore there is
+        /// a DiskCacheQsaHistoryGap — so it is not written; a later commit whose bank covers it
+        /// writes it then (the RAM entry still holds it).
+        qsa_cover: ?u32,
     ) !SsmPersistResult {
         const cps: []const transformer_mod.SSMCheckpoint = cps_opt orelse &[_]transformer_mod.SSMCheckpoint{};
         if (cps.len == 0 and old_positions.len == 0) {
@@ -2192,10 +2212,18 @@ pub const DiskTier = struct {
         }
         // Write new target positions, highest-first.
         var ti = target.len;
+        var uncovered: u32 = 0;
+        defer if (uncovered > 0) log.info("  [disk-cache] e{d}: {d} checkpoint(s) past the indexer history ({d} rows) not persisted\n", .{ id, uncovered, qsa_cover.? });
         while (ti > 0) : (ti -= 1) {
             const p = target[ti - 1];
             if (std.mem.indexOfScalar(u32, old_positions, p) != null) continue; // already on disk
             const cp = findCp(cps, p) orelse continue;
+            if (qsa_cover) |cover| {
+                if (p > cover) {
+                    uncovered += 1;
+                    continue;
+                }
+            }
             // Under SSD-first a checkpoint is written beside its chunk, outside the byte budget;
             // elsewhere its share of the flush budget is bounded by `max_spend` (half the cap —
             // chunk-first budgeting starved them to zero, live 2026-09-07).
@@ -2505,32 +2533,68 @@ pub const DiskTier = struct {
         return cp;
     }
 
-    fn persistQsaHistory(
-        self: *DiskTier,
-        dir_rel: []const u8,
+    /// What a commit does to an entry's indexer history: keep what the entry records, or write
+    /// `src`'s history as the entry's own file. Planned before the checkpoints are written so
+    /// they can be held to the coverage the commit leaves behind (`qsaCoverOf`).
+    const QsaPlan = union(enum) {
+        keep: QsaHistoryResult,
+        write: struct { src: *const transformer_mod.SSMCheckpoint, rows: u32 },
+
+        fn rows(self: QsaPlan) u32 {
+            return switch (self) {
+                .keep => |k| k.rows,
+                .write => |w| w.rows,
+            };
+        }
+    };
+
+    /// `existing` is the entry's OWN history (an extend of a non-inherited entry), `.{}` otherwise.
+    /// A commit whose checkpoints carry no bank used to return `.{}` here and wipe it: the
+    /// mid-prefill write-through (bank-less by construction) rewrote meta without the history
+    /// while qsa.safetensors stayed on disk, so no heir could link it and every restore of the
+    /// entry needed a covering bank it no longer recorded (live 2026-10-15, e542).
+    fn planQsaHistory(
         cps_opt: ?[]const transformer_mod.SSMCheckpoint,
         inherited: bool,
         inherited_rows: u32,
         prefix_rows: u32,
-        s: mlx.mlx_stream,
-    ) !QsaHistoryResult {
-        const cps = cps_opt orelse return .{ .inherited = inherited, .rows = inherited_rows, .bytes = 0 };
-        const src = DiskTier.newestQsaCheckpoint(cps) orelse {
-            if (inherited) return .{ .inherited = true, .rows = inherited_rows, .bytes = 0 };
-            return .{};
-        };
+        existing: QsaHistoryResult,
+    ) QsaPlan {
+        const kept: QsaHistoryResult = if (inherited) .{ .inherited = true, .rows = inherited_rows, .bytes = 0 } else existing;
+        const cps = cps_opt orelse return .{ .keep = kept };
+        const src = DiskTier.newestQsaCheckpoint(cps) orelse return .{ .keep = kept };
         const rows: u32 = @intCast(DiskTier.qsaHistoryRowsOf(src));
         if (inherited and rows > 0 and rows <= inherited_rows and rows <= prefix_rows) {
-            return .{ .inherited = true, .rows = @min(inherited_rows, prefix_rows), .bytes = 0 };
+            return .{ .keep = .{ .inherited = true, .rows = @min(inherited_rows, prefix_rows), .bytes = 0 } };
         }
+        // An older bank than the file already holds: never shrink the entry's own history.
+        if (!inherited and existing.bytes > 0 and existing.rows >= rows) return .{ .keep = existing };
+        return .{ .write = .{ .src = src, .rows = rows } };
+    }
+
+    /// The highest checkpoint position the entry's history covers after `plan`, or null when the
+    /// entry carries no indexer history at all (not a QSA arch: every checkpoint restores).
+    fn qsaCoverOf(plan: QsaPlan, cps_opt: ?[]const transformer_mod.SSMCheckpoint, existing: QsaHistoryResult, inherited: bool) ?u32 {
+        var qsa_entry = inherited or existing.rows > 0 or plan == .write;
+        if (cps_opt) |cps| {
+            for (cps) |*cp| qsa_entry = qsa_entry or transformer_mod.checkpointHasQsaHistory(cp);
+        }
+        return if (qsa_entry) plan.rows() else null;
+    }
+
+    fn persistQsaHistory(self: *DiskTier, dir_rel: []const u8, plan: QsaPlan, inherited: bool, s: mlx.mlx_stream) !QsaHistoryResult {
+        const w = switch (plan) {
+            .keep => |k| return k,
+            .write => |wr| wr,
+        };
         if (inherited) {
             const qpath = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
             defer self.allocator.free(qpath);
-            if (self.writer) |w| w.fence(qpath);
+            if (self.writer) |wt| wt.fence(qpath);
             std.Io.Dir.deleteFileAbsolute(self.io, qpath) catch {};
         }
-        const bytes = try self.writeQsaHistoryFile(dir_rel, src, s);
-        return .{ .bytes = bytes, .rows = rows, .inherited = false };
+        const bytes = try self.writeQsaHistoryFile(dir_rel, w.src, s);
+        return .{ .bytes = bytes, .rows = w.rows, .inherited = false };
     }
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
@@ -4237,6 +4301,83 @@ test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
     try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
     try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
     try testing.expectEqual(@as(c_int, 32), mlx.getShape(dst[2].qsa_pooled)[1]);
+}
+
+test "DiskTier: a bank-less extend keeps the entry's own QSA history and persists no checkpoint past it" {
+    // Live 2026-10-15: the mid-prefill write-through (bank-less checkpoints) rewrote an entry's
+    // meta without its history (e542: v6 meta beside a 57 MB qsa.safetensors) and persisted
+    // checkpoints past it (e473: 57344 over 55510 rows) — both restore as DiskCacheQsaHistoryGap.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 600, 8 };
+    const pooled_shape = [_]c_int{ 1, 150, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+
+    // Turn 1: 512 tokens (MIN_PERSIST_TOKENS), bank on the 256 checkpoint -> the entry's own history, 256 rows.
+    var cps1 = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps1) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps1, &src, s);
+    _ = try tier.appendCommit(cache.entries, 512, cache.config, tokens[0..512], false, &cps1, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 256), tier.entries.items[0].qsa_history_rows);
+    try testing.expect(!tier.entries.items[0].inherited_qsa);
+    const own_bytes = tier.entries.items[0].qsa_history_bytes;
+    try testing.expect(own_bytes > 0);
+
+    // Turn 2 extends to 600 with a bank-less checkpoint at 384 (the bank rides 512, not passed).
+    var cps2 = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 384, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    };
+    defer for (&cps2) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps2, &src, s);
+    try testing.expect(!transformer_mod.checkpointHasQsaPooled(&cps2[0]));
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &tokens, false, cps2[0..1], s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(u32, 600), e.kv_len);
+    try testing.expectEqual(@as(u32, 256), e.qsa_history_rows);
+    try testing.expectEqual(own_bytes, e.qsa_history_bytes);
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 256 }, e.ssm_positions);
+
+    // The meta on disk agrees (a restart reads it back) and 256 restores with its history.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(u32, 256), tier2.entries.items[0].qsa_history_rows);
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 256), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 256, s));
+
+    // Turn 3: a bank covering 512 lands both checkpoints and the longer history.
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &tokens, false, &cps2, s);
+    try testing.expectEqual(@as(u32, 512), tier.entries.items[0].qsa_history_rows);
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 256, 384, 512 }, tier.entries.items[0].ssm_positions);
 }
 
 test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its own leftover" {
