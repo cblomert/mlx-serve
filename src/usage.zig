@@ -277,6 +277,30 @@ pub fn identify(arena: Allocator, root: std.json.ObjectMap, title_buf: []u8, tit
     return id;
 }
 
+/// The admission group `--max-active-per-user` counts a request under
+/// (`scheduler.SubmitParams.admit_user`): Claude Code's device id, else the
+/// client's address. 0 for a Claude Code helper call (no tools, not streamed:
+/// the auto-mode classifier, titles), which must never queue behind agents:
+/// the classifier gives up after about a minute and auto mode stalls.
+pub fn admitKey(root: std.json.ObjectMap, peer: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0x61646d69);
+    if (root.get("metadata")) |md| if (md == .object) if (md.object.get("user_id")) |u| if (u == .string) {
+        var buf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        if (claudeUser(fba.allocator(), u.string)) |cu| {
+            const streamed = if (root.get("stream")) |v| v == .bool and v.bool else false;
+            const tools = if (root.get("tools")) |v| v == .array and v.array.items.len > 0 else false;
+            if (!streamed and !tools) return 0;
+            h.update("dev:");
+            h.update(if (cu.device.len > 0) cu.device else cu.session);
+            return h.final() | 1;
+        }
+    };
+    h.update("peer:");
+    h.update(peer);
+    return h.final() | 1;
+}
+
 // ── JSON lines ───────────────────────────────────────────────────────────────
 
 pub fn writeStr(w: *std.Io.Writer, s: []const u8) !void {
@@ -952,6 +976,26 @@ test "usage: identify tells main, subagent and side calls of one Claude Code ses
     try testing.expectEqualStrings("bob", c.session);
     try testing.expectEqual(@as(u32, 1), c.images);
     try testing.expectEqualStrings("hi", c.title);
+}
+
+test "usage: admitKey groups a Claude Code device, falls back to the peer, exempts helper calls" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const uid1 = "\"{\\\"device_id\\\":\\\"devA\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"s1\\\"}\"";
+    const uid2 = "\"{\\\"device_id\\\":\\\"devA\\\",\\\"account_uuid\\\":\\\"\\\",\\\"session_id\\\":\\\"s2\\\"}\"";
+    const agent1 = try parseRoot(a, "{\"stream\":true,\"tools\":[{}],\"metadata\":{\"user_id\":" ++ uid1 ++ "}}");
+    const agent2 = try parseRoot(a, "{\"stream\":true,\"tools\":[{}],\"metadata\":{\"user_id\":" ++ uid2 ++ "}}");
+    // Two sessions of one device are one user, wherever they connect from.
+    try testing.expectEqual(admitKey(agent1, "100.1.1.1"), admitKey(agent2, "100.2.2.2"));
+    try testing.expect(admitKey(agent1, "x") != 0);
+    // The classifier / title call of that session is exempt.
+    try testing.expectEqual(@as(u64, 0), admitKey(try parseRoot(a, "{\"metadata\":{\"user_id\":" ++ uid1 ++ "}}"), "100.1.1.1"));
+    // Other clients: one user per address; a no-tools non-stream call still counts.
+    const plain = try parseRoot(a, "{\"messages\":[]}");
+    try testing.expectEqual(admitKey(plain, "100.1.1.1"), admitKey(plain, "100.1.1.1"));
+    try testing.expect(admitKey(plain, "100.1.1.1") != admitKey(plain, "100.2.2.2"));
+    try testing.expect(admitKey(plain, "100.1.1.1") != 0);
 }
 
 test "usage: a record survives the JSON line round trip" {

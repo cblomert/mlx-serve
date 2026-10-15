@@ -366,7 +366,15 @@ fn printUsage(io: std.Io) void {
         \\                        idle for this many seconds. Default: off.
         \\  --metrics           Enable Prometheus metrics at GET /metrics and a
         \\                        live metrics panel on the index page (opt-in;
-        \\                        zero cost when off). Also GET /metrics.json.
+        \\                        zero cost when off). Also GET /metrics.json,
+        \\                        and the usage log + dashboard at GET /usage.
+        \\  --max-active <n>    Generations running at once (default 0 = no
+        \\                        cap); the rest wait queued, streams keep
+        \\                        their keepalives. Claude Code helper calls
+        \\                        (classifier, titles) are exempt.
+        \\  --max-active-per-user <n>
+        \\                      Per-user cap inside --max-active: Claude
+        \\                        Code's device id, else the client address.
         \\  --no-tool-autocorrect
         \\                      Disable tool-call ARGUMENT auto-correct — the
         \\                        coercion of parsed args to the tool schema's
@@ -891,6 +899,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
+        } else if (std.mem.eql(u8, args[i], "--max-active") and i + 1 < args.len) {
+            i += 1;
+            scheduler_mod.g_max_active = std.fmt.parseInt(u32, args[i], 10) catch 0;
+        } else if (std.mem.eql(u8, args[i], "--max-active-per-user") and i + 1 < args.len) {
+            i += 1;
+            scheduler_mod.g_max_active_per_user = std.fmt.parseInt(u32, args[i], 10) catch 0;
         } else if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
             // REPEATABLE. A user's library can live in more than one place (the
             // app's download folder, an external drive, an LM Studio tree), and

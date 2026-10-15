@@ -1762,6 +1762,9 @@ pub fn serve(
     // `--max-concurrent` sizes the submit queue; requests decode together at
     // any value. Whether they share ONE forward is the model's answer, printed
     // at every value so a default-1 boot does not read as "one at a time".
+    if (scheduler_mod.g_max_active > 0 or scheduler_mod.g_max_active_per_user > 0) {
+        log.info("Admission: at most {d} generations live, {d} per user (0 = no cap); Claude Code helper calls exempt\n", .{ scheduler_mod.g_max_active, scheduler_mod.g_max_active_per_user });
+    }
     if (scheduler_mod.configBatchesDecode(config)) {
         log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
         if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
@@ -2517,6 +2520,7 @@ fn handleConnection(
     }
 
     captureRequestBody(method, path, request[0..header_end_pos], request[header_end_pos..total_read]);
+    req_admit_user = 0;
     var usage_slot: UsageCtx = undefined;
     const usage_on = usageBegin(&usage_slot, stream, method, path, request[0..header_end_pos]);
     defer if (usage_on) usageEnd(&usage_slot, stream.io);
@@ -7072,6 +7076,18 @@ const UsageCtx = struct {
 };
 threadlocal var usage_ctx: ?*UsageCtx = null;
 
+/// This request's `SubmitParams.admit_user` (`usage.admitKey`), set where each
+/// generation handler parses its body; the dispatcher clears it per request.
+threadlocal var req_admit_user: u64 = 0;
+
+/// The peer address as text (formatted into a per-thread buffer).
+fn peerText(conn: *const Conn) []const u8 {
+    const S = struct {
+        threadlocal var buf: [64]u8 = undefined;
+    };
+    return formatPeer(&S.buf, conn.stream.socket.address);
+}
+
 fn usageRouteName(method: []const u8, path: []const u8) ?[]const u8 {
     if (!std.mem.eql(u8, method, "POST")) return null;
     const routes = [_]struct { []const u8, []const u8 }{
@@ -8685,6 +8701,7 @@ fn handleChatCompletions(
     }
     const root = parsed.value.object;
     usageNoteRequest(root);
+    req_admit_user = usage_mod.admitKey(root, peerText(stream));
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
@@ -9489,6 +9506,7 @@ fn handleCompletions(
     }
     const root = parsed.value.object;
     usageNoteRequest(root);
+    req_admit_user = usage_mod.admitKey(root, peerText(stream));
     const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
@@ -9808,6 +9826,8 @@ fn handleStreamingCompletion(
 
     const sch = global_scheduler.?;
     slot_handle = try sch.submit(.{
+
+        .admit_user = req_admit_user,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -9872,12 +9892,14 @@ fn handleStreamingCompletion(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
                 }
                 sendStreamKeepalive(stream) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
@@ -10059,6 +10081,8 @@ fn nonStreamingViaScheduler(
     conn: ?*Conn,
 ) !generate_mod.GenerationResult {
     var slot = try sch.submit(.{
+
+        .admit_user = req_admit_user,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,
@@ -10105,6 +10129,7 @@ fn nonStreamingViaScheduler(
             if (conn) |c| {
                 if (c.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot.cancel();
                     client_gone = true;
                     break :wait;
@@ -11041,6 +11066,8 @@ fn handleStreamingGeneration(
     ve_local = null;
     const sch = global_scheduler.?;
     slot_handle = try sch.submit(.{
+
+        .admit_user = req_admit_user,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -11180,12 +11207,14 @@ fn handleStreamingGeneration(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
                 }
                 sendStreamKeepalive(stream) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
@@ -11669,6 +11698,7 @@ fn handleStreamingGeneration(
         // stream mid-generation.
         beatStreamKeepalive(stream, .sse_comment) catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+            usageNoteError(499, "client_disconnect");
             slot_handle.?.cancel();
             client_gone = true;
             break;
@@ -16213,6 +16243,7 @@ fn handleAnthropicMessages(
     }
     const root = parsed.value.object;
     usageNoteRequest(root);
+    req_admit_user = usage_mod.admitKey(root, peerText(stream));
 
     // A `web_search_*` server tool turns the request into the server-side
     // search loop, which runs this handler again per round (with the Conn
@@ -17420,6 +17451,8 @@ fn handleAnthropicStreaming(
     ve_local = null;
     const sch = global_scheduler.?;
     slot_handle = try sch.submit(.{
+
+        .admit_user = req_admit_user,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -17546,12 +17579,14 @@ fn handleAnthropicStreaming(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
                 }
                 sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}") catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    usageNoteError(499, "client_disconnect");
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
@@ -17985,6 +18020,7 @@ fn handleAnthropicStreaming(
         // silence, not off token arrival.
         beatStreamKeepalive(stream, .anthropic_ping) catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+            usageNoteError(499, "client_disconnect");
             slot_handle.?.cancel();
             client_gone = true;
             break;
@@ -18449,6 +18485,7 @@ fn handleResponsesInner(
     }
     const root = parsed.value.object;
     usageNoteRequest(root);
+    req_admit_user = usage_mod.admitKey(root, peerText(stream));
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {
@@ -19001,6 +19038,8 @@ fn handleResponsesInner(
         local_mrope = .{};
         const sch = global_scheduler.?;
         slot_handle = try sch.submit(.{
+
+            .admit_user = req_admit_user,
             .model = lm,
             .prompt_ids = prompt_ids,
             .full_prompt = prompt_ids,
@@ -19074,12 +19113,14 @@ fn handleResponsesInner(
                     // keepalive stops clients timing out on stream silence.
                     if (stream.peerClosed()) {
                         log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                        usageNoteError(499, "client_disconnect");
                         slot_handle.?.cancel();
                         client_gone = true;
                         break;
                     }
                     sendStreamKeepalive(stream) catch {
                         log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                        usageNoteError(499, "client_disconnect");
                         slot_handle.?.cancel();
                         client_gone = true;
                         break;
@@ -19141,6 +19182,7 @@ fn handleResponsesInner(
             // from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                usageNoteError(499, "client_disconnect");
                 slot_handle.?.cancel();
                 client_gone = true;
                 break;

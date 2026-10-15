@@ -291,6 +291,9 @@ pub const SubmitParams = struct {
     media_cache_ids: ?[]const u32 = null,
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
+    /// Admission group for `g_max_active_per_user` (`usage.admitKey`: the client's
+    /// device, else its address). 0 = a helper call, exempt from both active caps.
+    admit_user: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -517,6 +520,7 @@ pub const Slot = struct {
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64 = 0,
+    admit_user: u64 = 0,
     skip_prefix_cache: bool = false,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
@@ -764,6 +768,7 @@ pub const Slot = struct {
             .vision_embeddings = params.vision_embeddings,
             .vision_key = if (cache_ids_owned != null) 0 else params.vision_key,
             .cache_key = params.cache_key,
+            .admit_user = params.admit_user,
             .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
@@ -2686,20 +2691,37 @@ test "a prefill that does not fit waits only while another request is live" {
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
-/// admission needs: an opaque model identity + the exclusive-decode bit.
-pub const AdmitCand = struct { model: usize, exclusive: bool };
+/// admission needs: an opaque model identity, the exclusive-decode bit and
+/// the slot's admission group (`SubmitParams.admit_user`, 0 = exempt).
+pub const AdmitCand = struct { model: usize, exclusive: bool, user: u64 = 0 };
+
+/// `--max-active` / `--max-active-per-user` (main.zig): live generations the
+/// pending drain admits at once, overall and per `admit_user`. 0 = no cap.
+/// A held request stays in `pending` (its stream keeps getting keepalives and
+/// a client that leaves cancels it there); helper calls (`admit_user == 0`)
+/// neither count nor wait.
+pub var g_max_active: u32 = 0;
+pub var g_max_active_per_user: u32 = 0;
+
+pub const AdmitLimits = struct { total: u32 = 0, per_user: u32 = 0 };
 
 /// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
 /// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
 /// admitted exclusive candidate claimed it this tick
 /// (a same-tick sibling is not in `decoding` yet — the claim covers the
 /// window). Non-exclusive candidates always admit — no head-of-line
-/// blocking behind a held exclusive request. Writes admitted candidate
-/// indices to `out` (queue order preserved), returns the count. Held
-/// candidates stay where they are and retry next tick; no release
+/// blocking behind a held exclusive request. `limits` then caps the counted
+/// (`user != 0`) slots live at once, overall and per user; a candidate over
+/// its user's cap is skipped without blocking other users behind it. Writes
+/// admitted candidate indices to `out` (queue order preserved), returns the
+/// count. Held candidates stay where they are and retry next tick; no release
 /// bookkeeping exists — the busy signal IS presence in `decoding`.
-pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize) usize {
+pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, limits: AdmitLimits, out: []usize) usize {
     var n: usize = 0;
+    var counted: usize = 0;
+    for (active) |a| {
+        if (a.user != 0) counted += 1;
+    }
     outer: for (cands, 0..) |c, i| {
         if (n >= out.len) break;
         if (c.exclusive) {
@@ -2707,6 +2729,20 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
             for (out[0..n]) |j| {
                 if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
             }
+        }
+        if (c.user != 0) {
+            if (limits.total > 0 and counted >= limits.total) continue;
+            if (limits.per_user > 0) {
+                var mine: usize = 0;
+                for (active) |a| {
+                    if (a.user == c.user) mine += 1;
+                }
+                for (out[0..n]) |j| {
+                    if (cands[j].user == c.user) mine += 1;
+                }
+                if (mine >= limits.per_user) continue;
+            }
+            counted += 1;
         }
         out[n] = i;
         n += 1;
@@ -4768,22 +4804,24 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // condition above never blocks while `pending` is non-empty,
             // so a held slot admits on the first tick after the active one
             // is culled (step 5, same mutex).
-            var live_buf: [32]AdmitCand = undefined;
+            // Every live slot goes in: exclusivity reads the bit, the
+            // --max-active caps count the admission groups.
+            var live_buf: [64]AdmitCand = undefined;
             var n_live: usize = 0;
             for (sch.decoding.items) |s| {
                 if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-                if (!slotExclusiveDecode(s)) continue;
                 if (n_live >= live_buf.len) break;
-                live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
+                live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s), .user = s.admit_user };
                 n_live += 1;
             }
             var cand_buf: [32]AdmitCand = undefined;
             const n_cands = @min(sch.pending.items.len, cand_buf.len);
             for (sch.pending.items[0..n_cands], 0..) |s, i| {
-                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
+                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s), .user = s.admit_user };
             }
             var admit_idx: [to_prefill.len]usize = undefined;
-            const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
+            const limits: AdmitLimits = .{ .total = g_max_active, .per_user = g_max_active_per_user };
+            const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], limits, &admit_idx);
             for (admit_idx[0..n_admit]) |idx| {
                 to_prefill[n_prefill] = sch.pending.items[idx];
                 _ = to_prefill[n_prefill].in_pass.fetchAdd(1, .acq_rel);
@@ -9667,19 +9705,19 @@ test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its ow
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = false }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, .{}, &out));
     }
     // An MTP candidate beside a live MTP slot holds.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, .{}, &out));
     }
     // A plain candidate beside a live MTP slot admits.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = false }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, .{}, &out));
     }
 }
 
@@ -9694,12 +9732,12 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, .{}, &out));
     }
     // Admits once no live slot holds the model.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, .{}, &out));
         try testing.expectEqual(@as(usize, 0), out[0]);
     }
     // Two exclusive candidates on the SAME model in one tick: only the
@@ -9709,7 +9747,7 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
             .{ .model = A, .exclusive = true },
             .{ .model = A, .exclusive = true },
         };
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, .{}, &out));
         try testing.expectEqual(@as(usize, 0), out[0]);
     }
     // Distinct exclusive models admit independently.
@@ -9718,7 +9756,7 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
             .{ .model = A, .exclusive = true },
             .{ .model = B, .exclusive = true },
         };
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, .{}, &out));
         try testing.expectEqual(@as(usize, 0), out[0]);
         try testing.expectEqual(@as(usize, 1), out[1]);
     }
@@ -9737,7 +9775,7 @@ test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
             .{ .model = L, .exclusive = false },
         };
         const active = [_]AdmitCand{.{ .model = L, .exclusive = false }};
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, .{}, &out));
     }
     // A held exclusive candidate must not head-of-line-block a later
     // candidate on another model (requests for OTHER models keep flowing).
@@ -9747,7 +9785,7 @@ test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
             .{ .model = L, .exclusive = false },
         };
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, .{}, &out));
         try testing.expectEqual(@as(usize, 1), out[0]);
     }
     // `out` caps the admitted count (mirrors to_prefill's 16), in order.
@@ -9758,9 +9796,60 @@ test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
             .{ .model = L, .exclusive = false },
         };
         var small: [2]usize = undefined;
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &small));
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, .{}, &small));
         try testing.expectEqual(@as(usize, 0), small[0]);
         try testing.expectEqual(@as(usize, 1), small[1]);
+    }
+}
+
+test "admitPendingTick: --max-active caps live generations overall and per user; helpers never wait" {
+    const M: usize = 0x10;
+    const U1: u64 = 0x111;
+    const U2: u64 = 0x222;
+    var out: [16]usize = undefined;
+    const lim: AdmitLimits = .{ .total = 6, .per_user = 2 };
+    // A user with two live agents holds a third; another user behind it still admits.
+    {
+        const active = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U1 } };
+        const cands = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U2 } };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, lim, &out));
+        try testing.expectEqual(@as(usize, 1), out[0]);
+    }
+    // Same-tick candidates count against the user's cap.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U1 },
+        };
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, lim, &out));
+        try testing.expectEqual(@as(usize, 1), out[1]);
+    }
+    // The overall cap: five live + two new from distinct users -> one admits.
+    {
+        var active: [5]AdmitCand = undefined;
+        for (&active, 0..) |*a, i| a.* = .{ .model = M, .exclusive = false, .user = 0x900 + i };
+        const cands = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U2 } };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, lim, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+    }
+    // Helper calls (user 0) neither wait nor count: at the cap they still admit,
+    // and live helpers leave room for counted ones.
+    {
+        var active: [6]AdmitCand = undefined;
+        for (&active, 0..) |*a, i| a.* = .{ .model = M, .exclusive = false, .user = 0x900 + i };
+        const cands = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = 0 }, .{ .model = M, .exclusive = false, .user = U1 } };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, lim, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+        const helpers = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = 0 }, .{ .model = M, .exclusive = false, .user = 0 } };
+        const one = [_]AdmitCand{.{ .model = M, .exclusive = false, .user = U1 }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&one, &helpers, .{ .total = 1 }, &out));
+    }
+    // No limits: everything admits.
+    {
+        const active = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U1 } };
+        const cands = [_]AdmitCand{.{ .model = M, .exclusive = false, .user = U1 }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, .{}, &out));
     }
 }
 
@@ -9769,7 +9858,7 @@ test "inferenceLoop pending drain routes through admitPendingTick" {
     // hardcoded use_drafter=false class). Needles are ++-split so this
     // test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
-    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
+    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], limits, &admit_idx)";
     try testing.expect(std.mem.indexOf(u8, src, call) != null);
     // The candidates' exclusive bit must come from the per-slot predicate
     // (model bit OR a module-owned MTP head on this slot).
