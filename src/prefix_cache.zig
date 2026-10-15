@@ -516,6 +516,21 @@ pub const HotPrefixCache = struct {
     /// tier (`restoreSpecSnap`). The trunk restore already forwarded nothing,
     /// so without this a disk hit drafted blind — the 92.6% → 66.5%
     /// acceptance class the RAM tier already fixed.
+    /// Hybrid SSD restores retry a QSA history gap at the entry's next lower checkpoint at
+    /// most this many times. A checkpoint persisted after the entry's indexer history
+    /// (qsa.safetensors) cannot seed the QSA layers, but the ones below it can; going cold
+    /// instead re-prefilled whole sessions (live 2026-10-15: 38 gaps, ~3.2M prompt tokens).
+    /// A refused attempt fails before the KV chunks load: one checkpoint read each.
+    const MAX_QSA_GAP_RETRIES: u32 = 3;
+
+    /// The next checkpoint below `cp` worth a retry after a QSA history gap, or null.
+    fn lowerHybridCheckpoint(d: *const kv_disk_cache.DiskTier, idx: usize, cp: u32, ram_eff: usize, retries: u32) ?u32 {
+        if (retries >= MAX_QSA_GAP_RETRIES or cp <= 1) return null;
+        const lower = d.highestSsmPosAtOrBelow(idx, cp - 1) orelse return null;
+        if (@as(usize, lower) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;
+        return lower;
+    }
+
     fn diskRestoreSpec(
         d: *kv_disk_cache.DiskTier,
         idx: usize,
@@ -1149,17 +1164,30 @@ pub const HotPrefixCache = struct {
                     break :blk cp.pos;
                 } else 0;
                 const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, disk_limit) orelse break :disk;
-                const disk_cp = hm.cp;
+                var disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
-                const restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
-                    log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    // A failed restore can leave the cache AND ssm entries
-                    // half-rebuilt; reset both before the fall-through.
-                    target_cache.truncate(0, s) catch {};
-                    resetSsmEntries(ssm_entries);
-                    break :disk;
-                };
+                var gap_retries: u32 = 0;
+                var restored: u32 = 0;
+                while (true) {
+                    restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
+                        // A failed restore can leave the cache AND ssm entries
+                        // half-rebuilt; reset both before a retry or the fall-through.
+                        target_cache.truncate(0, s) catch {};
+                        resetSsmEntries(ssm_entries);
+                        if (err == error.DiskCacheQsaHistoryGap) {
+                            if (lowerHybridCheckpoint(d, hm.idx, disk_cp, ram_eff, gap_retries)) |lower| {
+                                log.info("  [disk-cache] e{d} checkpoint {d} is past its indexer history — retrying at checkpoint {d}\n", .{ d.entries.items[hm.idx].id, disk_cp, lower });
+                                disk_cp = lower;
+                                gap_retries += 1;
+                                continue;
+                            }
+                        }
+                        log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                        break :disk;
+                    };
+                    break;
+                }
                 if (self.qsa_history_required and !(entriesHaveQsaHistory(ssm_entries) and qsaRestoreSatisfiesForward(ssm_entries, restored))) {
                     log.warn("  [disk-cache] hybrid restore carries no QSA history — falling back to RAM/cold path\n", .{});
                     target_cache.truncate(0, s) catch {};
@@ -4245,6 +4273,64 @@ test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" 
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
     }
+}
+
+test "HotPrefixCache: a hybrid SSD restore retries a QSA history gap at the next lower checkpoint" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-gap", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+        var src256 = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src256);
+        var src512 = pcBuildHybrid(s, 300.0, 700.0);
+        defer pcFreeHybrid(&src512);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+        _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-gap", 0, 128);
+    defer hc2.deinit();
+    // The top checkpoint (512) reports a gap; 256 must restore instead of a cold miss.
+    kv_disk_cache.test_qsa_gap_above = 300;
+    defer kv_disk_cache.test_qsa_gap_above = 0;
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 256), res.matched);
+    try testing.expectEqual(@as(usize, 256), cache2.step);
+    try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm2[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 500.0), pcSsmVal(ssm2[0].ssm_state, 0, s));
+
+    // Every checkpoint gapped: bounded retries, then the cold path (no restore).
+    kv_disk_cache.test_qsa_gap_above = 1;
+    var cache3 = try KVCache.init(testing.allocator, 3);
+    defer cache3.deinit();
+    var ssm3 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm3);
+    var moe_off3: usize = 0;
+    const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), res3.matched);
+    try testing.expectEqual(@as(usize, 0), cache3.step);
 }
 
 test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint, not raw length" {

@@ -164,6 +164,8 @@ pub const SpaceProbeFn = *const fn (path: []const u8) ?VolumeSpace;
 /// Test hook, armed through `DiskTier.armTestSpace`.
 var test_space: ?VolumeSpace = null;
 var test_qsa_overlay_mismatch = false;
+/// Test hook: hybrid restores at a checkpoint past this position report a QSA history gap (0 = off).
+pub var test_qsa_gap_above: u32 = 0;
 var test_ssm_write_qsa_aux = false;
 
 fn testSpaceProbe(path: []const u8) ?VolumeSpace {
@@ -762,6 +764,7 @@ pub const DiskTier = struct {
         const e = &self.entries.items[idx];
         if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
         if (std.mem.indexOfScalar(u32, e.ssm_positions, cp_pos) == null) return error.DiskCacheNoCheckpoint;
+        if (builtin.is_test and test_qsa_gap_above > 0 and cp_pos > test_qsa_gap_above) return error.DiskCacheQsaHistoryGap;
         // Load the checkpoint FIRST (transient, no side effects on the live
         // state) so a corrupt/missing file fails before the cache is touched.
         var cp = try self.loadSsmFile(e.id, cp_pos, ssm_entries.len);
