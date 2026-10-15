@@ -47,6 +47,7 @@ test {
     _ = @import("prefix_cache.zig");
     _ = @import("restore_dump.zig");
     _ = @import("metrics.zig");
+    _ = @import("usage.zig");
     _ = @import("status.zig");
     _ = @import("sleep_inhibit.zig");
     _ = @import("kv_disk_cache.zig");

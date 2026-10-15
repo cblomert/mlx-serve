@@ -22,6 +22,7 @@
 <button class="nav-item" data-tab="chat" id=nav-new><span class="ic ic-new"></span>New chat</button>
 <button class="nav-item" data-tab="monitor"><span class="ic ic-monitor"></span>Monitor</button>
 <button class="nav-item" data-tab="api"><span class="ic ic-api"></span>API</button>
+<a class="nav-item" href=/usage><span class="ic ic-usage"></span>Usage</a>
 </nav>
 
 <div class=recents>
@@ -150,6 +151,9 @@
 <div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
 <div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics>/metrics</a></div><div class=d>Prometheus metrics, text exposition format (enable with <code>--metrics</code>)</div></div></div>
 <div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics.json>/metrics.json</a></div><div class=d>Metrics as JSON — drives the Monitor panel (enable with <code>--metrics</code>)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/usage>/usage</a></div><div class=d>Usage dashboard: requests, tokens and tool calls per client session, with a timeline of each session's agents (on with <code>--metrics</code>; <code>MLX_SERVE_USAGE=0</code> turns it off)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/usage.json>/usage.json</a></div><div class=d>Usage summary as JSON: totals, activity buckets, sessions, breakdowns (<code>?from=&amp;to=</code> unix ms, <code>&amp;bucket=</code> ms, <code>&amp;tz=</code> minutes east of UTC)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p>/usage/session.json</div><div class=d>One session's threads and requests (<code>?id=</code> a session id from /usage.json)</div></div></div>
 </div>
 
 <h2>Quick start</h2>

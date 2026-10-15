@@ -151,6 +151,14 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 }
 .ic-api::before { left: 1px; top: 2px; box-shadow: 8px 0 0 -1.6px currentColor inset }
 .ic-api::after { left: 1px; bottom: 2px; width: 12px }
+.ic-usage::before {
+  content: ""; position: absolute; inset: 2px 1px;
+  background:
+    linear-gradient(currentColor, currentColor) 0 100% / 3px 6px no-repeat,
+    linear-gradient(currentColor, currentColor) 5px 100% / 3px 12px no-repeat,
+    linear-gradient(currentColor, currentColor) 10px 100% / 3px 9px no-repeat;
+}
+a.nav-item { text-decoration: none }
 
 .recents { flex: 1; overflow-y: auto; margin-top: 18px; min-height: 0 }
 .recents-h {

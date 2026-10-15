@@ -9,6 +9,7 @@ const mtp_mod = @import("mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
+const usage_mod = @import("usage.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
@@ -54,6 +55,11 @@ var active_conn_threads = std.atomic.Value(u32).init(0);
 /// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
 /// routes. When null, `/metrics*` return 503 and the index page shows no panel.
 pub var g_metrics: ?*instr.Metrics = null;
+/// The usage log behind `GET /usage` (src/usage.zig): on with --metrics unless
+/// MLX_SERVE_USAGE=0, forced on by =1. Started in `serve()`; null = off.
+pub var g_usage: ?*usage_mod.Store = null;
+/// MLX_SERVE_USAGE_TITLES=0 keeps the first-turn titles out of the log.
+var g_usage_titles: bool = true;
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
 /// CORS preflight requires the key — the OpenAI/Anthropic/Ollama APIs AND the
@@ -774,6 +780,9 @@ const ROUTE_PATHS = [_][]const u8{
     "/metrics.json",
     "/props",
     "/tokenize",
+    "/usage",
+    "/usage.json",
+    "/usage/session.json",
     "/v1/3d/generations",
     "/v1/audio/music-generations",
     "/v1/audio/speech",
@@ -1822,6 +1831,12 @@ pub fn serve(
         g_providers = null;
         p.shutdown();
     };
+    // Same chokepoint for the usage log; freed after the conn-thread drain (LIFO).
+    g_usage = startUsage(io);
+    defer if (g_usage) |u| {
+        g_usage = null;
+        u.deinit();
+    };
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
@@ -2203,6 +2218,20 @@ fn handleConnection(
         }
         return;
     }
+    // Usage dashboard and its two feeds (src/usage.zig). Same API-key gate.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/usage")) {
+        log.debug("GET  /usage -> 200\n", .{});
+        try sendResponseQuiet(stream, "200 OK", "text/html; charset=utf-8", @embedFile("html/usage.html"));
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/usage.json")) {
+        try handleUsageJson(allocator, stream, raw_path, .summary);
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/usage/session.json")) {
+        try handleUsageJson(allocator, stream, raw_path, .session);
+        return;
+    }
     if (std.mem.eql(u8, method, "OPTIONS")) {
         log.debug("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
@@ -2488,6 +2517,11 @@ fn handleConnection(
     }
 
     captureRequestBody(method, path, request[0..header_end_pos], request[header_end_pos..total_read]);
+    var usage_slot: UsageCtx = undefined;
+    const usage_on = usageBegin(&usage_slot, stream, method, path, request[0..header_end_pos]);
+    defer if (usage_on) usageEnd(&usage_slot, stream.io);
+    // Runs first (LIFO): a handler error the response never carried still lands in the record.
+    errdefer if (usage_on) usageNoteHandlerError(stream);
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
@@ -5505,6 +5539,10 @@ const ErrorSurface = union(enum) {
 fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
     var msg_buf: [192]u8 = undefined;
     const w = mapGenerationError(err, &msg_buf);
+    // A write that failed because the client left is not a server error.
+    if (usage_ctx != null) {
+        if (stream.peerClosed()) usageNoteError(499, "client_disconnect") else usageNoteError(w.code, w.openai_type);
+    }
 
     if (!stream.sse_headers_sent) {
         return switch (surface) {
@@ -6945,6 +6983,218 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
 /// the documented shorthand this endpoint has always taken.
 var request_capture_seq = std.atomic.Value(u64).init(0);
 var request_capture_logged = false;
+
+/// Open the usage log (see `g_usage`). MLX_SERVE_USAGE_DIR (default
+/// ~/.mlx-serve/usage) holds one JSONL file per month; the last
+/// MLX_SERVE_USAGE_DAYS (default 90) are loaded back for the dashboard.
+fn startUsage(io: std.Io) ?*usage_mod.Store {
+    const want = if (std.c.getenv("MLX_SERVE_USAGE")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else g_metrics != null;
+    if (!want) return null;
+    if (std.c.getenv("MLX_SERVE_USAGE_TITLES")) |t| g_usage_titles = !std.mem.eql(u8, std.mem.span(t), "0");
+    const days: u32 = if (std.c.getenv("MLX_SERVE_USAGE_DAYS")) |d| std.fmt.parseInt(u32, std.mem.span(d), 10) catch 90 else 90;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir: []const u8 = if (std.c.getenv("MLX_SERVE_USAGE_DIR")) |d| std.mem.span(d) else blk: {
+        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        break :blk std.fmt.bufPrint(&dir_buf, "{s}/.mlx-serve/usage", .{home}) catch return null;
+    };
+    const store = usage_mod.Store.init(std.heap.c_allocator, dir, @max(days, 1), nowMs(io)) catch |err| {
+        log.warn("[usage] disabled ({s})\n", .{@errorName(err)});
+        return null;
+    };
+    log.info("Usage log: {s} ({d} requests from the last {d} days) - dashboard at /usage\n", .{ dir, store.count(), @max(days, 1) });
+    return store;
+}
+
+/// `GET /usage.json?from=&to=&bucket=&tz=` (unix ms, bucket ms, tz = the viewer's
+/// minutes east of UTC; default: the last 7 days in hours) and
+/// `GET /usage/session.json?id=` behind the dashboard.
+fn handleUsageJson(allocator: std.mem.Allocator, stream: *Conn, raw_path: []const u8, kind: enum { summary, session }) !void {
+    const store = g_usage orelse {
+        try sendResponseQuiet(stream, "503 Service Unavailable", "application/json", "{\"error\":\"usage log off - start with --metrics or MLX_SERVE_USAGE=1\"}");
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    switch (kind) {
+        .session => {
+            const id = try percentDecode(arena.allocator(), queryParamValue(raw_path, "id") orelse "");
+            try store.sessionJson(arena.allocator(), &out.writer, id);
+        },
+        .summary => {
+            const q = struct {
+                fn int(rp: []const u8, name: []const u8) ?i64 {
+                    return std.fmt.parseInt(i64, queryParamValue(rp, name) orelse return null, 10) catch null;
+                }
+            };
+            const to = q.int(raw_path, "to") orelse nowMs(stream.io);
+            const from = @min(q.int(raw_path, "from") orelse to - 7 * std.time.ms_per_day, to);
+            const bucket = q.int(raw_path, "bucket") orelse std.time.ms_per_hour;
+            const tz = std.math.clamp(q.int(raw_path, "tz") orelse 0, -24 * 60, 24 * 60) * std.time.ms_per_min;
+            try store.summaryJson(arena.allocator(), &out.writer, from, to, bucket, tz);
+        },
+    }
+    try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
+}
+
+/// `%XX` and `+` decoding for a query value (session ids can be a client's User-Agent).
+fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfAny(u8, s, "%+") == null) return s;
+    var out = try arena.alloc(u8, s.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '+') {
+            out[n] = ' ';
+        } else if (s[i] == '%' and i + 2 < s.len) {
+            if (std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16)) |v| {
+                out[n] = v;
+                i += 2;
+            } else |_| out[n] = '%';
+        } else out[n] = s[i];
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// One text-generation request's usage record, filled in by the handler as it
+/// runs (identity at parse, every generation round, tool calls, errors) and
+/// handed to `g_usage` when the dispatcher is done with the request. Lives on
+/// the connection thread's stack: a request runs there from parse to last byte,
+/// Ollama's inner /v1 call and the web-search rounds included.
+const UsageCtx = struct {
+    arena: std.heap.ArenaAllocator,
+    rec: usage_mod.Record = .{},
+    calls: std.ArrayList([]const u8) = .empty,
+    noted: bool = false,
+    title_buf: [usage_mod.TITLE_MAX]u8 = undefined,
+};
+threadlocal var usage_ctx: ?*UsageCtx = null;
+
+fn usageRouteName(method: []const u8, path: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, method, "POST")) return null;
+    const routes = [_]struct { []const u8, []const u8 }{
+        .{ "/v1/messages", "messages" },     .{ "/v1/chat/completions", "chat" }, .{ "/v1/responses", "responses" },
+        .{ "/v1/completions", "completions" }, .{ "/api/chat", "ollama-chat" },   .{ "/api/generate", "ollama-generate" },
+    };
+    for (routes) |r| if (std.mem.eql(u8, path, r[0])) return r[1];
+    return null;
+}
+
+/// The peer's address without the port; IPv4-mapped IPv6 prints as IPv4.
+fn formatPeer(buf: []u8, addr: std.Io.net.IpAddress) []const u8 {
+    switch (addr) {
+        .ip4 => |a| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch "",
+        .ip6 => |a| {
+            const b = a.bytes;
+            const zeros10: [10]u8 = @splat(0);
+            if (std.mem.eql(u8, b[0..10], &zeros10) and b[10] == 0xff and b[11] == 0xff)
+                return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b[12], b[13], b[14], b[15] }) catch "";
+            var w: std.Io.Writer = .fixed(buf);
+            var i: usize = 0;
+            while (i < 16) : (i += 2) {
+                if (i > 0) w.writeByte(':') catch return "";
+                w.print("{x}", .{@as(u16, b[i]) << 8 | b[i + 1]}) catch return "";
+            }
+            return w.buffered();
+        },
+    }
+}
+
+/// Start a usage record when the log is on and this is a text-generation POST.
+fn usageBegin(ctx: *UsageCtx, conn: *const Conn, method: []const u8, path: []const u8, headers: []const u8) bool {
+    if (g_usage == null) return false;
+    const route = usageRouteName(method, path) orelse return false;
+    ctx.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.c_allocator) };
+    const a = ctx.arena.allocator();
+    var peer_buf: [64]u8 = undefined;
+    ctx.rec = .{
+        .ts_ms = nowMs(conn.io),
+        .route = route,
+        .client = a.dupe(u8, findHeaderValueCI(headers, "user-agent") orelse "") catch "",
+        .peer = a.dupe(u8, formatPeer(&peer_buf, conn.stream.socket.address)) catch "",
+    };
+    usage_ctx = ctx;
+    return true;
+}
+
+fn usageEnd(ctx: *UsageCtx, io: std.Io) void {
+    defer {
+        usage_ctx = null;
+        ctx.arena.deinit();
+    }
+    const store = g_usage orelse return;
+    // Nothing parsed, generated or refused: a probe or a dropped connection.
+    if (!ctx.noted and ctx.rec.rounds == 0 and ctx.rec.err.len == 0) return;
+    ctx.rec.dur_ms = @intCast(std.math.clamp(nowMs(io) - ctx.rec.ts_ms, 0, std.math.maxInt(u32)));
+    ctx.rec.tool_calls = ctx.calls.items;
+    store.append(ctx.rec);
+}
+
+/// Who sent the request and what it carries. The first call wins: the web-search
+/// loop re-enters the handler with synthesized bodies.
+fn usageNoteRequest(root: std.json.ObjectMap) void {
+    const ctx = usage_ctx orelse return;
+    if (ctx.noted) return;
+    ctx.noted = true;
+    const a = ctx.arena.allocator();
+    const id = usage_mod.identify(a, root, &ctx.title_buf, g_usage_titles);
+    const r = &ctx.rec;
+    r.session = a.dupe(u8, id.session) catch "";
+    r.device = a.dupe(u8, id.device) catch "";
+    r.model = a.dupe(u8, id.model) catch "";
+    r.title = id.title;
+    r.thread = id.thread;
+    r.role = id.role;
+    r.stream = id.stream;
+    r.msgs = id.msgs;
+    r.tools = id.tools;
+    r.images = id.images;
+    r.docs = id.docs;
+}
+
+/// One finished generation (summed: a web-search request runs several).
+fn usageNoteGeneration(prompt: u32, cached: u32, gen: u32, prefill_ns: u64, decode_ns: u64, stop: []const u8) void {
+    const ctx = usage_ctx orelse return;
+    const r = &ctx.rec;
+    r.rounds += 1;
+    r.prompt +|= prompt;
+    r.cached +|= cached;
+    r.gen +|= gen;
+    r.prefill_ms +|= @intCast(@min(prefill_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
+    r.decode_ms +|= @intCast(@min(decode_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
+    r.stop = ctx.arena.allocator().dupe(u8, stop) catch "";
+}
+
+fn usageNoteToolCalls(calls: []const chat_mod.ParsedToolCall) void {
+    const ctx = usage_ctx orelse return;
+    const a = ctx.arena.allocator();
+    for (calls) |tc| {
+        if (ctx.calls.items.len >= usage_mod.MAX_TOOL_NAMES) return;
+        ctx.calls.append(a, a.dupe(u8, tc.name[0..@min(tc.name.len, 64)]) catch return) catch return;
+    }
+}
+
+fn usageNoteWebSearches(n: u32) void {
+    const ctx = usage_ctx orelse return;
+    ctx.rec.web_searches = n;
+}
+
+/// A handler that failed out: a closed peer is the client leaving (499), anything else a 500.
+fn usageNoteHandlerError(conn: *Conn) void {
+    if (usage_ctx == null) return;
+    const gone = conn.peerClosed();
+    usageNoteError(if (gone) 499 else 500, if (gone) "client_disconnect" else "handler_error");
+}
+
+/// The first error a request answers with (status + the error `type`).
+fn usageNoteError(status: u32, err_type: []const u8) void {
+    const ctx = usage_ctx orelse return;
+    if (ctx.rec.err.len > 0) return;
+    ctx.rec.status = @intCast(@min(status, 999));
+    ctx.rec.err = ctx.arena.allocator().dupe(u8, if (err_type.len > 0) err_type else "error") catch "error";
+}
 
 /// DIAGNOSTIC (MLX_SERVE_REQUEST_LOG_DIR=<dir>): write every text-generation
 /// POST body verbatim to `<dir>/<unix_s>-<seq>-<route>.json`, wrapped with
@@ -8434,6 +8684,7 @@ fn handleChatCompletions(
         return;
     }
     const root = parsed.value.object;
+    usageNoteRequest(root);
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
@@ -9237,6 +9488,7 @@ fn handleCompletions(
         return;
     }
     const root = parsed.value.object;
+    usageNoteRequest(root);
     const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
@@ -9489,6 +9741,7 @@ fn handleNonStreamingCompletion(
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
+    usageNoteGeneration(result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, finish_reason);
 
     const escaped = jsonEscapeOrEmpty(allocator, final_text);
     const escaped_text = escaped.slice;
@@ -9737,6 +9990,7 @@ fn handleStreamingCompletion(
     log.info("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, elapsed_ms, perf, finish_reason,
     });
+    usageNoteGeneration(ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, finish_reason);
 }
 
 /// Where a stop sequence cuts the accumulated text and how many bytes of the arriving token
@@ -10150,6 +10404,7 @@ fn handleNonStreamingGeneration(
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
         const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
+            usageNoteToolCalls(tool_calls);
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -10163,6 +10418,7 @@ fn handleNonStreamingGeneration(
             log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_calls: {d}]\n", .{
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tc_perf, tool_calls.len,
             });
+            usageNoteGeneration(result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, "tool_calls");
 
             // Build tool_calls JSON array
             var tc_buf = std.ArrayList(u8).empty;
@@ -10241,6 +10497,7 @@ fn handleNonStreamingGeneration(
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
+    usageNoteGeneration(result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, finish_reason);
 
     // Split thinking content from response. Always the think-capable split:
     // whatever reasoning was generated ships as reasoning_content, never
@@ -11474,6 +11731,7 @@ fn handleStreamingGeneration(
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
         const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
+            usageNoteToolCalls(tool_calls);
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -11618,6 +11876,7 @@ fn handleStreamingGeneration(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, finish_reason,
     });
+    usageNoteGeneration(ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, finish_reason);
 }
 
 const DeltaFields = struct {
@@ -13005,6 +13264,7 @@ fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u
 }
 
 fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+    usageNoteError(code orelse (std.fmt.parseInt(u32, status[0..@min(status.len, 3)], 10) catch 500), err_type);
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -15704,6 +15964,7 @@ test "RequestMedia frees every decoded buffer it was handed" {
 // ── Anthropic Messages API ──
 
 fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
+    usageNoteError(status_code, err_type);
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
     const body = try std.fmt.allocPrint(allocator,
@@ -15951,6 +16212,7 @@ fn handleAnthropicMessages(
         return;
     }
     const root = parsed.value.object;
+    usageNoteRequest(root);
 
     // A `web_search_*` server tool turns the request into the server-side
     // search loop, which runs this handler again per round (with the Conn
@@ -16823,6 +17085,7 @@ fn handleAnthropicWebSearch(
     }
 
     log.info("[web_search] done: {d} round(s), {d} search(es), stop={s}, in={d} out={d} cached={d}\n", .{ round + 1, usage.searches, stop_reason, usage.input_tokens, usage.output_tokens, usage.cache_read });
+    usageNoteWebSearches(usage.searches);
     if (is_stream) {
         try relay.start(usage.input_tokens);
         try relay.finish(stop_reason, stop_seq, usage);
@@ -16981,6 +17244,7 @@ fn handleAnthropicNonStreaming(
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
         const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
+            usageNoteToolCalls(tool_calls);
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -16994,6 +17258,7 @@ fn handleAnthropicNonStreaming(
             log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
             });
+            usageNoteGeneration(result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, "tool_use");
 
             // The same pre-markup text the stream flushes as a text delta.
             const tu_preamble = visibleToolPreamble(chat_mod.trimLeakedToolMarkup(final_text));
@@ -17060,6 +17325,7 @@ fn handleAnthropicNonStreaming(
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, stop_reason,
     });
+    usageNoteGeneration(result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, stop_reason);
 
     // Anthropic spec doesn't standardize a `timings` field; we attach one as
     // an extension (mirrors what /v1/chat/completions already does) so bench
@@ -17763,6 +18029,7 @@ fn handleAnthropicStreaming(
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
         const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
+            usageNoteToolCalls(tool_calls);
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -17917,6 +18184,7 @@ fn handleAnthropicStreaming(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
+    usageNoteGeneration(ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, stop_reason);
 }
 
 /// Emit a text_delta event for Anthropic streaming.
@@ -18180,6 +18448,7 @@ fn handleResponsesInner(
         return;
     }
     const root = parsed.value.object;
+    usageNoteRequest(root);
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {
@@ -19055,10 +19324,13 @@ fn handleResponsesInner(
             .text = try raw_buf.toOwnedSlice(allocator),
             .token_ids = try token_ids_buf.toOwnedSlice(allocator),
             .prompt_tokens = ts.prompt_tokens,
+            .cached_tokens = ts.cached_tokens,
             .completion_tokens = ts.completion_tokens,
             .finish_reason = if (stopped) "stop" else ts.finish_reason,
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
+            .prefill_ns = ts.prefill_ns,
+            .decode_ns = ts.decode_ns,
             .finish_details = ts.finish_details,
         };
     } else {
@@ -19160,6 +19432,7 @@ fn handleResponsesInner(
     };
 
     if (tool_calls) |tcs| if (tcs.len > 0) {
+        usageNoteToolCalls(tcs);
         for (tcs) |tc| {
             if (!responsesToolExists(root.get("tools"), tc.name)) {
                 log.warn("[responses] dropping undeclared tool call: {s}\n", .{tc.name});
@@ -19242,6 +19515,7 @@ fn handleResponsesInner(
         result.completion_tokens,
     );
     defer allocator.free(envelope);
+    usageNoteGeneration(result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, if (has_tool_calls) "tool_calls" else finish_reason);
 
     // ── store response ──
     if (should_store) {
