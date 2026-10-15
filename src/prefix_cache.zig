@@ -1176,6 +1176,9 @@ pub const HotPrefixCache = struct {
                         target_cache.truncate(0, s) catch {};
                         resetSsmEntries(ssm_entries);
                         if (err == error.DiskCacheQsaHistoryGap) {
+                            if (d.dropUncoveredCheckpoint(hm.idx, disk_cp)) {
+                                log.info("  [disk-cache] e{d}: dropped checkpoint {d} (past its {d}-row indexer history)\n", .{ d.entries.items[hm.idx].id, disk_cp, d.entries.items[hm.idx].qsa_history_rows });
+                            }
                             if (lowerHybridCheckpoint(d, hm.idx, disk_cp, ram_eff, gap_retries)) |lower| {
                                 log.info("  [disk-cache] e{d} checkpoint {d} is past its indexer history — retrying at checkpoint {d}\n", .{ d.entries.items[hm.idx].id, disk_cp, lower });
                                 disk_cp = lower;

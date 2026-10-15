@@ -828,6 +828,36 @@ pub const DiskTier = struct {
     /// Largest persisted SSM checkpoint position ≤ `limit` for entry `idx`;
     /// null when none qualifies (hybrid KV without SSM state is unusable, so
     /// the caller must skip the entry entirely).
+    /// A restore found checkpoint `pos` past the entry's indexer history: drop it from the index
+    /// and disk, so later lookups neither rank the entry by it nor pay a refused attempt each
+    /// time (entries written before the writer held checkpoints to the history kept costing
+    /// one per lookup). Only when the recorded history positively ends below `pos`; a history
+    /// that failed to load, or an entry recording none, is no proof. Returns whether it dropped.
+    pub fn dropUncoveredCheckpoint(self: *DiskTier, idx: usize, pos: u32) bool {
+        const e = &self.entries.items[idx];
+        if (e.qsa_history_rows == 0 or pos <= e.qsa_history_rows) return false;
+        const at = std.mem.indexOfScalar(u32, e.ssm_positions, pos) orelse return false;
+        const positions = self.allocator.alloc(u32, e.ssm_positions.len - 1) catch return false;
+        const sizes = self.allocator.alloc(u64, e.ssm_bytes.len - 1) catch {
+            self.allocator.free(positions);
+            return false;
+        };
+        @memcpy(positions[0..at], e.ssm_positions[0..at]);
+        @memcpy(positions[at..], e.ssm_positions[at + 1 ..]);
+        @memcpy(sizes[0..at], e.ssm_bytes[0..at]);
+        @memcpy(sizes[at..], e.ssm_bytes[at + 1 ..]);
+        const freed = e.ssm_bytes[at];
+        self.allocator.free(e.ssm_positions);
+        self.allocator.free(e.ssm_bytes);
+        e.ssm_positions = positions;
+        e.ssm_bytes = sizes;
+        e.bytes -|= freed;
+        self.total_bytes -|= freed;
+        self.deleteSsmFile(e.id, pos);
+        self.writeMeta(e.*) catch {};
+        return true;
+    }
+
     pub fn highestSsmPosAtOrBelow(self: *const DiskTier, idx: usize, limit: u32) ?u32 {
         var best: ?u32 = null;
         for (self.entries.items[idx].ssm_positions) |p| {
@@ -4378,6 +4408,56 @@ test "DiskTier: a bank-less extend keeps the entry's own QSA history and persist
     _ = try tier.appendCommit(cache.entries, 600, cache.config, &tokens, false, &cps2, s);
     try testing.expectEqual(@as(u32, 512), tier.entries.items[0].qsa_history_rows);
     try testing.expectEqualSlices(u32, &[_]u32{ 128, 256, 384, 512 }, tier.entries.items[0].ssm_positions);
+}
+
+test "DiskTier: dropUncoveredCheckpoint removes only a checkpoint the recorded history ends below" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-drop", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const aux_shape = [_]c_int{ 1, 600, 8 };
+    const pooled_shape = [_]c_int{ 1, 150, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &tokens, false, &cps, s);
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 256 }, tier.entries.items[0].ssm_positions);
+    const bytes_before = tier.entries.items[0].bytes;
+
+    // Covered checkpoints stay; an entry recording no history proves nothing.
+    try testing.expect(!tier.dropUncoveredCheckpoint(0, 256));
+    tier.entries.items[0].qsa_history_rows = 0;
+    try testing.expect(!tier.dropUncoveredCheckpoint(0, 256));
+    // A history that positively ends below 256 (an entry written before the writer fix).
+    tier.entries.items[0].qsa_history_rows = 200;
+    try testing.expect(tier.dropUncoveredCheckpoint(0, 256));
+    try testing.expectEqualSlices(u32, &[_]u32{128}, tier.entries.items[0].ssm_positions);
+    try testing.expect(tier.entries.items[0].bytes < bytes_before);
+    const s256 = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/s0000256.safetensors", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(s256);
+    try testing.expect(fileSize(io, s256) == null);
+    // The meta agrees after a restart.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-drop", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqualSlices(u32, &[_]u32{128}, tier2.entries.items[0].ssm_positions);
 }
 
 test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its own leftover" {
