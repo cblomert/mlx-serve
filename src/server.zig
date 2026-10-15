@@ -7140,6 +7140,20 @@ test "parseInterleaveSet: shares 1..90 (B may be 0), caps 1..1024" {
     }
 }
 
+test "nonStreamProbeDue: idle wakeups and every NONSTREAM_PEER_PROBE_TOKENS tokens" {
+    try std.testing.expect(nonStreamProbeDue(true, 0));
+    try std.testing.expect(!nonStreamProbeDue(false, 0));
+    try std.testing.expect(!nonStreamProbeDue(false, NONSTREAM_PEER_PROBE_TOKENS - 1));
+    try std.testing.expect(nonStreamProbeDue(false, NONSTREAM_PEER_PROBE_TOKENS));
+}
+
+test "the non-streaming wait probes the peer during decode, not only when idle" {
+    // Source scan: the probe must sit OUTSIDE the `orelse` idle arm, gated by the token count.
+    const src = @embedFile("server.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "if (nonStream" ++ "ProbeDue(next == null, since_probe)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const nr = slot.waitNext" ++ "Timeout(Conn.STREAM_KEEPALIVE_MS) orelse {") == null);
+}
+
 test "parseAdmissionCaps: either cap, 0..4096, anything else refused" {
     const a = std.testing.allocator;
     const cases = [_]struct { body: []const u8, total: ?u32, per_user: ?u32, ok: bool }{
@@ -7360,6 +7374,24 @@ fn usageNoteHandlerError(conn: *Conn) void {
 }
 
 /// The first error a request answers with (status + the error `type`).
+/// A non-streaming wait probes the peer on idle wakeups (prefill) and every this many
+/// tokens. Idle-only probing never ran during decode, where tokens keep arriving, so an
+/// abandoned request decoded to max_tokens (live 2026-10-15: Claude Code re-sent a
+/// timed-out subagent turn non-streamed every ~5 min and 32 abandoned copies decoded 631k
+/// tokens in 6 h, 3-4 at a time, slowing every stream). The probe is a zero-timeout poll.
+pub const NONSTREAM_PEER_PROBE_TOKENS: u32 = 32;
+
+pub fn nonStreamProbeDue(idle: bool, tokens_since_probe: u32) bool {
+    return idle or tokens_since_probe >= NONSTREAM_PEER_PROBE_TOKENS;
+}
+
+/// A streaming client that hangs up mid-decode (Claude Code aborts a request at its
+/// 600 s API timeout) used to end the turn silently, logged as a normal end_turn / 200.
+fn noteMidStreamDisconnect() void {
+    log.info("  [cancel] client disconnected mid-stream — cancelling slot\n", .{});
+    usageNoteError(499, "client_disconnect");
+}
+
 fn usageNoteError(status: u32, err_type: []const u8) void {
     const ctx = usage_ctx orelse return;
     if (ctx.rec.err.len > 0) return;
@@ -10063,6 +10095,7 @@ fn handleStreamingCompletion(
             },
         };
         if (stream.peerClosed()) {
+            noteMidStreamDisconnect();
             slot_handle.?.cancel();
             client_gone = true;
             break;
@@ -10276,24 +10309,30 @@ fn nonStreamingViaScheduler(
     defer output_ids.deinit(allocator);
 
     var client_gone = false;
+    var since_probe: u32 = 0;
     wait: while (true) {
-        const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
-            // Idle (long prefill). If the client is gone, cancel and serve
-            // whatever accumulated — the response write will fail upstream,
-            // which is fine; the win is freeing the GPU.
+        const next = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS);
+        // If the client is gone, cancel and serve whatever accumulated — the
+        // response write will fail upstream, which is fine; the win is freeing
+        // the GPU. Probed on idle wakeups (prefill) and every few decoded tokens.
+        if (nonStreamProbeDue(next == null, since_probe)) {
+            since_probe = 0;
             if (conn) |c| {
                 if (c.peerClosed()) {
-                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
+                    log.info("  [cancel] client disconnected while waiting (non-stream, {d} tokens generated) — cancelling slot\n", .{output_ids.items.len});
                     usageNoteError(499, "client_disconnect");
                     slot.cancel();
                     client_gone = true;
                     break :wait;
                 }
             }
-            continue :wait;
-        };
+        }
+        const nr = next orelse continue :wait;
         switch (nr) {
-            .token => |t| try output_ids.append(allocator, t),
+            .token => |t| {
+                try output_ids.append(allocator, t);
+                since_probe += 1;
+            },
             .done => break :wait,
             .err => return slotFailure(slot),
         }
@@ -11378,6 +11417,7 @@ fn handleStreamingGeneration(
             },
         };
         if (stream.peerClosed()) {
+            noteMidStreamDisconnect();
             slot_handle.?.cancel();
             client_gone = true;
             break;
@@ -17869,6 +17909,7 @@ fn handleAnthropicStreaming(
             },
         };
         if (stream.peerClosed()) {
+            noteMidStreamDisconnect();
             slot_handle.?.cancel();
             client_gone = true;
             break;
@@ -19403,6 +19444,7 @@ fn handleResponsesInner(
                 },
             };
             if (stream.peerClosed()) {
+                noteMidStreamDisconnect();
                 slot_handle.?.cancel();
                 client_gone = true;
                 break;
