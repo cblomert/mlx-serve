@@ -11584,8 +11584,10 @@ fn handleStreamingGeneration(
                         }
                     },
                     .flush_text => {
+                        // Freed in one place, after the loop, success or error:
+                        // see `drainTokenTexts`.
+                        defer drainTokenTexts(allocator, &token_texts);
                         for (token_texts.items) |tt| {
-                            defer allocator.free(tt);
                             // Skip bare channel/think tags that leak without a full block
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
@@ -11601,7 +11603,6 @@ fn handleStreamingGeneration(
                             content_started = true;
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
-                        token_texts.clearRetainingCapacity();
                     },
                 }
             }
@@ -16233,6 +16234,68 @@ fn beatStreamKeepalive(stream: *Conn, style: KeepaliveStyle) !void {
     stream.heartbeat.noteWrite(nowMsMonotonic(stream.io));
 }
 
+/// Frees every buffered token text and empties the list. The streaming
+/// handlers' `.flush_text` arms run this as a `defer`, so the texts are freed
+/// exactly once whether the emit loop finishes or a write fails partway.
+/// They used to free each text inside the loop and clear the list after it:
+/// a write error (client gone mid-flush) skipped the clear, and the
+/// handler's own `token_texts` defer freed the already-sent texts a second
+/// time. Production aborted on it (SIGABRT, "pointer being freed was not
+/// allocated", 2026-10-20 13:33, every in-flight request lost).
+fn drainTokenTexts(allocator: std.mem.Allocator, texts: *std.ArrayList([]const u8)) void {
+    for (texts.items) |t| allocator.free(t);
+    texts.clearRetainingCapacity();
+}
+
+test "a token-text flush that fails mid-write frees each text exactly once" {
+    const a = std.testing.allocator;
+    var texts = std.ArrayList([]const u8).empty;
+    // The handlers' function-level defer, verbatim: it must find nothing left.
+    defer {
+        for (texts.items) |t| a.free(t);
+        texts.deinit(a);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma" }) |s| try texts.append(a, try a.dupe(u8, s));
+    const Flush = struct {
+        fn run(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8), fail_at: usize) !usize {
+            defer drainTokenTexts(alloc, list);
+            var sent: usize = 0;
+            for (list.items, 0..) |_, i| {
+                if (i == fail_at) return error.BrokenPipe;
+                sent += 1;
+            }
+            return sent;
+        }
+    };
+    // testing.allocator fails the test on a double free or a leak.
+    try std.testing.expectError(error.BrokenPipe, Flush.run(a, &texts, 1));
+    try std.testing.expectEqual(@as(usize, 0), texts.items.len);
+    // The list stays usable for the next tokens of the same stream.
+    try texts.append(a, try a.dupe(u8, "delta"));
+    try std.testing.expectEqual(@as(usize, 1), try Flush.run(a, &texts, 99));
+    try std.testing.expectEqual(@as(usize, 0), texts.items.len);
+}
+
+test "both streaming flush arms free buffered token texts through drainTokenTexts" {
+    // Class guard for the 2026-10-20 abort: a per-item free inside a flush
+    // loop whose list is cleared only after the loop double-frees on any
+    // write error. Both surfaces (chat completions and Anthropic messages)
+    // carried the same loop.
+    const src = @embedFile("server.zig");
+    const arm = ".flush_text" ++ " => {";
+    const drain = "defer drainTokenTexts" ++ "(allocator, &token_texts);";
+    var arms: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, arm)) |pos| : (at = pos + arm.len) {
+        arms += 1;
+        const body_end = std.mem.indexOfPos(u8, src, pos, "\n                    },") orelse return error.ArmEndMissing;
+        const body = src[pos..body_end];
+        try std.testing.expect(std.mem.indexOf(u8, body, drain) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "defer allocator.free" ++ "(tt)") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), arms);
+}
+
 fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
     if (stream.ws_mode) |bridge| {
         // WS transport: emit only the JSON payload as a text frame; the
@@ -18028,8 +18091,10 @@ fn handleAnthropicStreaming(
                         think_closed = true;
                     },
                     .flush_text => {
+                        // Freed in one place, after the loop, success or error:
+                        // see `drainTokenTexts`.
+                        defer drainTokenTexts(allocator, &token_texts);
                         for (token_texts.items) |tt| {
-                            defer allocator.free(tt);
                             // Skip bare think/channel tags that leak without a block
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
@@ -18047,7 +18112,6 @@ fn handleAnthropicStreaming(
                             }
                             try emitAnthropicTextDelta(allocator, stream, block_index, vis);
                         }
-                        token_texts.clearRetainingCapacity();
                     },
                 }
             }
