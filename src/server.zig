@@ -10,6 +10,7 @@ const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const usage_mod = @import("usage.zig");
+const resume_mod = @import("resume.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
@@ -7249,6 +7250,74 @@ threadlocal var usage_ctx: ?*UsageCtx = null;
 /// generation handler parses its body; the dispatcher clears it per request.
 threadlocal var req_admit_user: u64 = 0;
 
+/// Resume on retry (`resume.zig`): what abandoned generations had produced, process-wide.
+var g_resume: resume_mod.Store = .{ .allocator = std.heap.c_allocator };
+
+/// The resume state of the generation `handleAnthropicMessages` is dispatching (null on
+/// every other path): the key its tokens save under if its client leaves, and the saved
+/// tokens it continues from.
+const ResumeReq = struct {
+    key: u64,
+    /// Tokens replayed before decoding continues (`g_resume.allocator`); empty = fresh start.
+    prefix: []u32 = &.{},
+    /// prompt ++ prefix, what the slot prefills (request allocator); empty when not resuming.
+    full: []u32 = &.{},
+
+    fn slotPrompt(self: *const ResumeReq, prompt_ids: []const u32) []const u32 {
+        return if (self.prefix.len > 0) self.full else prompt_ids;
+    }
+};
+threadlocal var req_resume: ?*ResumeReq = null;
+
+/// `MLX_SERVE_RESUME_ON_RETRY=0` turns resume on retry off.
+fn resumeEnabled() bool {
+    const v = std.c.getenv("MLX_SERVE_RESUME_ON_RETRY") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The tokens saved under `k`, waiting up to `IN_FLIGHT_WAIT_MS` while an abandoned copy with
+/// the same key is still running (it saves once it notices the hang-up).
+fn resumeTake(io: std.Io, k: u64) ?[]u32 {
+    var waited: u64 = 0;
+    while (true) {
+        if (g_resume.take(io, k, nowMs(io))) |ids| return ids;
+        if (waited >= resume_mod.IN_FLIGHT_WAIT_MS or !g_resume.busy(io, k)) return null;
+        std.Io.sleep(io, .fromMilliseconds(100), .real) catch return null;
+        waited += 100;
+    }
+}
+
+/// A generation under resume key `k` ended without completing: keep what it produced
+/// (saved prefix included) for the client's retry.
+fn resumeSave(io: std.Io, k: u64, ids: []const u32) void {
+    if (g_resume.put(io, k, ids, nowMs(io))) log.info("  [resume] saved {d} generated tokens for a retry\n", .{ids.len});
+}
+
+/// Feed a resumed request's saved tokens to its thinking bound, which counts from the
+/// slot's first generated token: a closed think block stays closed, an open one keeps the
+/// thinking it already spent.
+fn resumeThinkBound(tb: *generate_mod.ThinkBound, prefix: []const u32) void {
+    tb.observe(prefix);
+    tb.cursor = 0;
+}
+
+test "resumeThinkBound: the saved prefix spends the budget or closes the block" {
+    var open: generate_mod.ThinkBound = .{ .budget = 10, .opener_id = 5, .closer_id = 6, .forced = &.{}, .in_think = true };
+    resumeThinkBound(&open, &[_]u32{ 1, 2, 3, 4, 7, 8, 9, 10, 11, 12 });
+    try std.testing.expect(open.due());
+    try std.testing.expectEqual(@as(usize, 0), open.cursor);
+    var closed: generate_mod.ThinkBound = .{ .budget = 10, .opener_id = 5, .closer_id = 6, .forced = &.{}, .in_think = true };
+    resumeThinkBound(&closed, &[_]u32{ 1, 2, 6, 3 });
+    try std.testing.expect(!closed.due());
+    closed.observe(&[_]u32{ 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 });
+    try std.testing.expect(!closed.due());
+    var partial: generate_mod.ThinkBound = .{ .budget = 10, .opener_id = 5, .closer_id = 6, .forced = &.{}, .in_think = true };
+    resumeThinkBound(&partial, &[_]u32{ 1, 2, 3, 4, 7 });
+    try std.testing.expect(!partial.due());
+    partial.observe(&[_]u32{ 1, 2, 3, 4, 7 });
+    try std.testing.expect(partial.due());
+}
+
 /// The peer address as text (formatted into a per-thread buffer).
 fn peerText(conn: *const Conn) []const u8 {
     const S = struct {
@@ -7350,6 +7419,11 @@ fn usageNoteGeneration(prompt: u32, cached: u32, gen: u32, prefill_ns: u64, deco
     r.prefill_ms +|= @intCast(@min(prefill_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
     r.decode_ms +|= @intCast(@min(decode_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
     r.stop = ctx.arena.allocator().dupe(u8, stop) catch "";
+}
+
+fn usageNoteResumed(n: usize) void {
+    const ctx = usage_ctx orelse return;
+    ctx.rec.resumed +|= @intCast(@min(n, std.math.maxInt(u32)));
 }
 
 fn usageNoteToolCalls(calls: []const chat_mod.ParsedToolCall) void {
@@ -10268,19 +10342,29 @@ fn nonStreamingViaScheduler(
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
 ) !generate_mod.GenerationResult {
+    // Resume on retry (set only by handleAnthropicMessages, where prompt_ids == full_prompt):
+    // the slot prefills prompt ++ the saved tokens, which lead `output_ids`; an abandoned
+    // wait leaves all of them for the next retry.
+    const rs = req_resume;
+    const resume_prefix: []const u32 = if (rs) |r| r.prefix else &.{};
+    const slot_prompt: []const u32 = if (rs) |r| r.slotPrompt(prompt_ids) else prompt_ids;
+    const slot_full: []const u32 = if (resume_prefix.len > 0) slot_prompt else full_prompt;
+    if (rs) |r| g_resume.enter(sch.io, r.key);
+    defer if (rs) |r| g_resume.leave(sch.io, r.key);
+
     var slot = try sch.submit(.{
 
         .admit_user = req_admit_user,
         .model = lm,
-        .prompt_ids = prompt_ids,
-        .full_prompt = full_prompt,
-        .media_cache_ids = pendingMediaCacheIds(full_prompt.len),
+        .prompt_ids = slot_prompt,
+        .full_prompt = slot_full,
+        .media_cache_ids = pendingMediaCacheIds(slot_full.len),
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
         .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
-        .max_tokens = max_tokens,
+        .max_tokens = max_tokens - @as(u32, @intCast(resume_prefix.len)),
         .timeout_ns = timeout_ns,
         .enable_pld = enable_pld,
         .enable_drafter = enable_drafter and (lm.drafter != null or lm.dflash != null),
@@ -10293,7 +10377,7 @@ fn nonStreamingViaScheduler(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, slot_prompt.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .vision_key = vision_key,
         .cache_key = cache_key,
@@ -10307,6 +10391,10 @@ fn nonStreamingViaScheduler(
 
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
+    try output_ids.appendSlice(allocator, resume_prefix);
+    if (resume_prefix.len > 0) usageNoteResumed(resume_prefix.len);
+    var completed = false;
+    defer if (rs) |r| if (!completed) resumeSave(sch.io, r.key, output_ids.items);
 
     var client_gone = false;
     var since_probe: u32 = 0;
@@ -10319,7 +10407,7 @@ fn nonStreamingViaScheduler(
             since_probe = 0;
             if (conn) |c| {
                 if (c.peerClosed()) {
-                    log.info("  [cancel] client disconnected while waiting (non-stream, {d} tokens generated) — cancelling slot\n", .{output_ids.items.len});
+                    log.info("  [cancel] client disconnected while waiting (non-stream, {d} tokens generated) — cancelling slot\n", .{output_ids.items.len - resume_prefix.len});
                     usageNoteError(499, "client_disconnect");
                     slot.cancel();
                     client_gone = true;
@@ -10351,8 +10439,11 @@ fn nonStreamingViaScheduler(
     // row, each firing sooner than the last (live 2026-08-05, under pi).
     // Only reachable non-streaming: a delta cannot be retracted, so a
     // streaming client has already received the tail.
-    const emit_ids = loopTrimmedIds(output_ids.items, slot.loop_trim_start);
+    const emit_ids = loopTrimmedIds(output_ids.items, if (slot.loop_trim_start) |t| t + resume_prefix.len else null);
     const text = try decodeTokens(allocator, lm, tok, emit_ids, strip_leading);
+    // Before toOwnedSlice moves the ids out; the defer covers the error returns above.
+    if (rs) |r| if (client_gone) resumeSave(sch.io, r.key, output_ids.items);
+    completed = true;
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
     // Convert the generator's (token index, byte offset) payload boundary
@@ -17324,6 +17415,38 @@ fn handleAnthropicMessages(
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
 
+    // Resume on retry (resume.zig): a text-only, unconstrained generation for a known user is
+    // keyed by its prompt; when its client leaves, what it produced is kept, and a retry of
+    // the same prompt continues from there instead of starting over. Web-search rounds
+    // (captured Conn) and helper calls (user 0) never take part.
+    var resume_req: ResumeReq = undefined;
+    var resume_on = false;
+    defer if (resume_on) {
+        req_resume = null;
+        if (resume_req.prefix.len > 0) g_resume.allocator.free(resume_req.prefix);
+        if (resume_req.full.len > 0) allocator.free(resume_req.full);
+    };
+    if (mode == .generate and stream.capture == null and req_admit_user != 0 and resumeEnabled() and
+        local_ve == null and local_mrope.pos == null and pendingMediaCacheIds(prompt_ids.len) == null and sampling.constraint == null)
+    {
+        resume_req = .{ .key = resume_mod.key(req_admit_user, prompt_ids, has_tools, enable_thinking) };
+        resume_on = true;
+        if (resumeTake(stream.io, resume_req.key)) |saved| {
+            if (!resume_mod.usable(saved.len, effective_max_tokens)) {
+                log.info("  [resume] {d} saved tokens leave no room under max_tokens {d}; starting over\n", .{ saved.len, effective_max_tokens });
+                g_resume.allocator.free(saved);
+            } else if (allocator.alloc(u32, prompt_ids.len + saved.len)) |full| {
+                @memcpy(full[0..prompt_ids.len], prompt_ids);
+                @memcpy(full[prompt_ids.len..], saved);
+                resume_req.prefix = saved;
+                resume_req.full = full;
+                if (think_bound) |*tb| resumeThinkBound(tb, saved);
+                log.info("  [resume] continuing from {d} saved tokens\n", .{saved.len});
+            } else |_| g_resume.allocator.free(saved);
+        }
+        req_resume = &resume_req;
+    }
+
     // Hand vision and M-RoPE ownership to the sub-handler (slot takes them on submit).
     const sub_ve = local_ve;
     local_ve = null;
@@ -17756,8 +17879,9 @@ fn handleAnthropicNonStreaming(
         stop_reason,
         stop_seq_json,
         prompt_token_count,
-        result.completion_tokens,
-        result.cached_tokens,
+        // A resumed request's answer includes the saved tokens it continued from.
+        result.completion_tokens + (if (req_resume) |r| r.prefix.len else 0),
+        @min(result.cached_tokens, prompt_token_count),
         timings_field,
     });
     defer allocator.free(response);
@@ -17823,6 +17947,21 @@ fn handleAnthropicStreaming(
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
 
+    // Resume on retry: the slot prefills prompt ++ the saved tokens, the loop below replays
+    // those through the same per-token path before decoding continues, and every token
+    // (replayed or new) is recorded so an abandoned stream leaves them for the next retry.
+    const rs = req_resume;
+    const resume_prefix: []const u32 = if (rs) |r| r.prefix else &.{};
+    const slot_prompt: []const u32 = if (rs) |r| r.slotPrompt(prompt_ids) else prompt_ids;
+    if (rs) |r| g_resume.enter(stream.io, r.key);
+    defer if (rs) |r| g_resume.leave(stream.io, r.key);
+    var emitted_ids = std.ArrayList(u32).empty;
+    defer emitted_ids.deinit(allocator);
+    var completed = false;
+    // (Before the replay reaches the loop, the saved prefix is still the best answer to keep.)
+    defer if (rs) |r| if (!completed) resumeSave(stream.io, r.key, if (emitted_ids.items.len >= resume_prefix.len) emitted_ids.items else resume_prefix);
+    if (resume_prefix.len > 0) usageNoteResumed(resume_prefix.len);
+
     // Transfer vision ownership into the slot.
     const slot_ve_anth = ve_local;
     ve_local = null;
@@ -17831,15 +17970,15 @@ fn handleAnthropicStreaming(
 
         .admit_user = req_admit_user,
         .model = lm,
-        .prompt_ids = prompt_ids,
-        .full_prompt = prompt_ids,
-        .media_cache_ids = pendingMediaCacheIds(prompt_ids.len),
+        .prompt_ids = slot_prompt,
+        .full_prompt = slot_prompt,
+        .media_cache_ids = pendingMediaCacheIds(slot_prompt.len),
         .cached_tokens = 0,
         .has_tools = has_tools,
         .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
-        .max_tokens = max_tokens,
+        .max_tokens = max_tokens - @as(u32, @intCast(resume_prefix.len)),
         .timeout_ns = getTimeoutNs(),
         .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
@@ -17852,7 +17991,7 @@ fn handleAnthropicStreaming(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, slot_prompt.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .vision_key = vision_key,
@@ -17942,11 +18081,15 @@ fn handleAnthropicStreaming(
     var client_gone = false;
     var utf8_carry: [3]u8 = undefined;
     var utf8_carry_len: u8 = 0;
+    var replayed: usize = 0;
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
         if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        const token_id: u32 = if (replayed < resume_prefix.len) rp: {
+            replayed += 1;
+            break :rp resume_prefix[replayed - 1];
+        } else switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
             .idle => {
@@ -17971,6 +18114,7 @@ fn handleAnthropicStreaming(
                 continue;
             },
         };
+        try emitted_ids.append(allocator, token_id);
         if (stream.peerClosed()) {
             noteMidStreamDisconnect();
             slot_handle.?.cancel();
@@ -18587,7 +18731,7 @@ fn handleAnthropicStreaming(
         {
             const md = try std.fmt.allocPrint(allocator,
                 \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
+            , .{ stop_reason, stop_seq_json, ts.completion_tokens + resume_prefix.len, @min(ts.cached_tokens, prompt_token_count) });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -18596,10 +18740,17 @@ fn handleAnthropicStreaming(
 
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
-    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, perf, stop_reason,
-    });
+    if (resume_prefix.len > 0) {
+        log.info("  <- {d}+{d} tokens streamed [{s}] [{s}] [resumed after {d} saved]\n", .{
+            total_prompt, ts.completion_tokens, perf, stop_reason, resume_prefix.len,
+        });
+    } else {
+        log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+            total_prompt, ts.completion_tokens, perf, stop_reason,
+        });
+    }
     usageNoteGeneration(ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, stop_reason);
+    completed = !client_gone;
 }
 
 /// Emit a text_delta event for Anthropic streaming.

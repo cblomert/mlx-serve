@@ -59,6 +59,8 @@ pub const Record = struct {
     gen: u32 = 0,
     prefill_ms: u32 = 0,
     decode_ms: u32 = 0,
+    /// Tokens a retry continued from instead of regenerating (`resume.zig`); not in `gen`.
+    resumed: u32 = 0,
     stop: []const u8 = "",
     tool_calls: []const []const u8 = &.{},
     web_searches: u32 = 0,
@@ -343,6 +345,7 @@ pub fn writeLine(w: *std.Io.Writer, r: *const Record) !void {
         r.stream, r.msgs, r.tools, r.images, r.docs, r.rounds, r.prompt, r.cached, r.gen, r.prefill_ms, r.decode_ms,
     });
     try writeStr(w, r.stop);
+    if (r.resumed > 0) try w.print(",\"resumed\":{d}", .{r.resumed});
     try w.writeAll(",\"calls\":[");
     for (r.tool_calls, 0..) |name, i| {
         if (i > 0) try w.writeByte(',');
@@ -376,6 +379,7 @@ const Line = struct {
     gen: u32 = 0,
     prefill_ms: u32 = 0,
     decode_ms: u32 = 0,
+    resumed: u32 = 0,
     stop: []const u8 = "",
     calls: []const []const u8 = &.{},
     ws: u32 = 0,
@@ -410,6 +414,7 @@ pub fn parseLine(arena: Allocator, line: []const u8) ?Record {
         .gen = l.gen,
         .prefill_ms = l.prefill_ms,
         .decode_ms = l.decode_ms,
+        .resumed = l.resumed,
         .stop = l.stop,
         .tool_calls = l.calls,
         .web_searches = l.ws,
@@ -1007,7 +1012,7 @@ test "usage: a record survives the JSON line round trip" {
         .client = "claude-cli/2.1 (external, cli)", .peer = "100.1.2.3", .thread = 0xfeedbeef01, .role = .subagent,
         .title = "Fix \"quotes\"\nand \\ slashes", .model = "qwen3.8", .stream = true, .msgs = 7, .tools = 21, .images = 1,
         .docs = 2, .rounds = 1, .prompt = 45866, .cached = 40960, .gen = 521, .prefill_ms = 5400, .decode_ms = 6800,
-        .stop = "tool_use", .tool_calls = &calls, .web_searches = 3, .status = 200, .err = "",
+        .resumed = 300, .stop = "tool_use", .tool_calls = &calls, .web_searches = 3, .status = 200, .err = "",
     };
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -1024,6 +1029,7 @@ test "usage: a record survives the JSON line round trip" {
     try testing.expectEqual(@as(usize, 2), back.tool_calls.len);
     try testing.expectEqualStrings("Bash", back.tool_calls[1]);
     try testing.expectEqual(r.web_searches, back.web_searches);
+    try testing.expectEqual(r.resumed, back.resumed);
     try testing.expect(parseLine(arena.allocator(), "not json") == null);
 }
 
