@@ -1596,8 +1596,7 @@ pub const DiskTier = struct {
         // ssm/spec contributions changed.
         // Delta-based like the extend path; both non-chunk terms are in the delta.
         var delta: i64 = @as(i64, @intCast(e.spec_bytes)) - @as(i64, @intCast(old_spec_bytes));
-        for (ssm_res.bytes) |b| delta += @as(i64, @intCast(b));
-        for (e.ssm_bytes) |b| delta -= @as(i64, @intCast(b));
+        delta += bytesDelta(ssm_res.bytes, e.ssm_bytes);
         const new_qsa_billed: u64 = if (qsa_res.inherited) 0 else qsa_res.bytes;
         delta += @as(i64, @intCast(new_qsa_billed)) - @as(i64, @intCast(old_qsa_billed));
 
@@ -3439,6 +3438,21 @@ fn nonChunkBytes(e: *const IndexEntry) u64 {
     for (e.ssm_bytes) |b| n += b;
     if (!e.inherited_qsa) n += e.qsa_history_bytes;
     return n;
+}
+
+/// `sum(new) - sum(old)`, each side summed on its own. Never fold this into one accumulator
+/// that a loop subtracts from: LLVM 22.1.8 (our toolchain) interleaves a `-=` reduction over a
+/// slice into four partial accumulators and joins them with `sub` instead of `add`, so ReleaseFast
+/// returned about `-sum(old)` for equal lists. That was `appendSsmOnly`'s checkpoint delta: every
+/// idle-spill re-commit billed an entry about its whole checkpoint set short (944 MB at 16
+/// checkpoints), `total_bytes` fell to ~1 GB under 177 GB of files, the byte budget never evicted,
+/// and the volume filled to the reserve (live 2026-10-23). Debug and ReleaseSafe are unaffected.
+fn bytesDelta(new: []const u64, old: []const u64) i64 {
+    var add: u64 = 0;
+    for (new) |b| add += b;
+    var sub: u64 = 0;
+    for (old) |b| sub += b;
+    return @as(i64, @intCast(add)) - @as(i64, @intCast(sub));
 }
 
 fn clampAdd(base: u64, delta: i64) u64 {
@@ -6880,6 +6894,247 @@ test "DiskTier chunk share: total_bytes is bytes on disk whichever holder dies f
         }
         try testing.expectEqual(@as(usize, 0), tier.entryCount());
         try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+    }
+}
+
+/// Bytes the tier's entry directories hold on disk, each inode once (hard-linked chunks and
+/// histories count once), leaving out meta.json, which no bill includes.
+fn diskBytesOnce(io: std.Io, root: []const u8) !u64 {
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    var total: u64 = 0;
+    var rd = try std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true });
+    defer rd.close(io);
+    var it = rd.iterate();
+    while (try it.next(io)) |dent| {
+        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'e') continue;
+        var path_buf: [1024]u8 = undefined;
+        const sub = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ root, dent.name });
+        var sd = try std.Io.Dir.openDirAbsolute(io, sub, .{ .iterate = true });
+        defer sd.close(io);
+        var sit = sd.iterate();
+        while (try sit.next(io)) |f| {
+            if (f.kind != .file or std.mem.eql(u8, f.name, "meta.json")) continue;
+            var fbuf: [1024]u8 = undefined;
+            const fp = try std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ sub, f.name });
+            const st = statFile(io, fp) orelse continue;
+            const gop = try seen.getOrPut(@intCast(st.inode));
+            if (!gop.found_existing) total += st.size;
+        }
+    }
+    return total;
+}
+
+test "bytesDelta: lists read through a struct field difference exactly under ReleaseFast" {
+    // The shape LLVM 22.1.8 miscompiled: one sum over a slice argument, then a subtracting loop
+    // over a slice reached through a pointer field (it returned -9916 for these 16 sizes).
+    const Holder = struct { bytes: []u64 };
+    const Run = struct {
+        noinline fn delta(h: *const Holder, new: []const u64) i64 {
+            return bytesDelta(new, h.bytes);
+        }
+    };
+    var old = [_]u64{ 602, 603, 603, 603, 603, 603, 603, 603, 604, 604, 604, 604, 604, 604, 604, 734 };
+    var grown = old;
+    grown[0] += 5;
+    for (1..old.len + 1) |n| {
+        const h: Holder = .{ .bytes = old[0..n] };
+        try testing.expectEqual(@as(i64, 0), Run.delta(&h, old[0..n]));
+        try testing.expectEqual(@as(i64, 5), Run.delta(&h, grown[0..n]));
+    }
+}
+
+test "DiskTier chunk share: total_bytes tracks the bytes on disk across an heir's write-through and full extends" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-drift", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    const root = tier.root;
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 900, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 900, 8, 9.5, .float32);
+    const toks = chunkShareTokens(520);
+    var long_b: [900]u32 = undefined;
+    @memcpy(long_b[0..600], &toks.b);
+    for (long_b[600..], 600..) |*t, i| t.* = @intCast(20000 + i);
+
+    // Live state whose indexer history spans `rows` positions.
+    const Live = struct {
+        fn make(s_: mlx.mlx_stream, rows: c_int) [3]SSMCacheEntry {
+            var e = buildHybridEntries(s_, 200.0, 600.0);
+            const aux = [_]c_int{ 1, rows, 8 };
+            const pooled = [_]c_int{ 1, @divTrunc(rows, 4), 8 };
+            e[2].aux_state = makeArange(s_, &aux, 700.0);
+            e[2].qsa_pooled = makeArange(s_, &pooled, 800.0);
+            e[2].qsa_ratio = 4;
+            return e;
+        }
+    };
+    const Step = struct {
+        fn check(tier_: *DiskTier, io_: std.Io, root_: []const u8, what: []const u8) !void {
+            const disk = try diskBytesOnce(io_, root_);
+            if (disk != tier_.total_bytes) std.debug.print("\n[drift] {s}: total {d} disk {d}\n", .{ what, tier_.total_bytes, disk });
+            try testing.expectEqual(disk, tier_.total_bytes);
+        }
+    };
+    const mtp_snap = struct {
+        fn at(m: *KVCache, step: usize) SpecCommit {
+            return .{ .entries = m.entries, .step = step, .config = m.config, .base_pos = 0 };
+        }
+    };
+
+    // 1. Donor: an end-of-prompt checkpoint with its indexer history, plus an MTP sidecar.
+    var src_a = Live.make(s, 600);
+    defer freeHybridEntries(&src_a);
+    var cps_a = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_a, 600, s)};
+    defer for (&cps_a) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps_a, &src_a, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, &toks.a, false, &cps_a, null, mtp_snap.at(&mtp, 599), s);
+    try Step.check(&tier, io, root, "donor");
+
+    // 2. Heir: links the donor's leading chunks and (bank inside the common prefix) its history.
+    var src_b = Live.make(s, 256);
+    defer freeHybridEntries(&src_b);
+    var cps_b = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_b, 256, s)};
+    defer for (&cps_b) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps_b, &src_b, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, &toks.b, false, &cps_b, null, mtp_snap.at(&mtp, 599), s);
+    try Step.check(&tier, io, root, "heir");
+
+    // 3. The next turn's mid-prefill write-through: bank-less checkpoint, no spec, one chunk.
+    var src_wt = Live.make(s, 700);
+    defer freeHybridEntries(&src_wt);
+    var cps_wt = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_wt, 700, s)};
+    defer for (&cps_wt) |*cp| cp.deinit(testing.allocator);
+    _ = try tier.appendCommitBounded(cache.entries, 700, cache.config, long_b[0..700], false, &cps_wt, s, 1);
+    try Step.check(&tier, io, root, "write-through");
+
+    // 4. The turn's full commit: a fresh bank past the inherited history, and the sidecar again.
+    var src_full = Live.make(s, 900);
+    defer freeHybridEntries(&src_full);
+    var cps_full = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_full, 900, s)};
+    defer for (&cps_full) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps_full, &src_full, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, 900, cache.config, &long_b, false, &cps_full, null, mtp_snap.at(&mtp, 899), s);
+    try Step.check(&tier, io, root, "full");
+
+    // 5. The donor ages out; then the heir.
+    tier.removeAt(0);
+    try Step.check(&tier, io, root, "donor evicted");
+    tier.removeAt(0);
+    try Step.check(&tier, io, root, "heir evicted");
+}
+
+test "DiskTier chunk share: total_bytes tracks the bytes on disk over multi-turn sessions with retention and idle re-commits" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-drift2", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    const root = tier.root;
+
+    const N: u32 = 3200;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, N, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, N, 8, 9.5, .float32);
+
+    // Two sessions sharing their first 1100 tokens (a system prompt + tools).
+    var sess: [2][N]u32 = undefined;
+    for (&sess[0], 0..) |*t, i| t.* = @intCast(i + 7);
+    for (&sess[1], 0..) |*t, i| t.* = if (i < 1100) @intCast(i + 7) else @intCast(50000 + i);
+
+    const H = struct {
+        /// The RAM entry's checkpoints for a prompt of `end` tokens: one every 64, plus the end;
+        /// `bank` attaches the indexer history (rows = end) to the newest, as a finished turn does.
+        fn cps(s_: mlx.mlx_stream, end: u32, bank: bool) ![]transformer_mod.SSMCheckpoint {
+            var live = buildHybridEntries(s_, 200.0, 600.0);
+            defer freeHybridEntries(&live);
+            const aux = [_]c_int{ 1, @intCast(end), 8 };
+            const pooled = [_]c_int{ 1, @intCast(end / 4), 8 };
+            live[2].aux_state = makeArange(s_, &aux, 700.0);
+            live[2].qsa_pooled = makeArange(s_, &pooled, 800.0);
+            live[2].qsa_ratio = 4;
+            var list = std.ArrayList(transformer_mod.SSMCheckpoint).empty;
+            var p: u32 = 64;
+            while (p < end) : (p += 64) try list.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, p, s_));
+            try list.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, end, s_));
+            if (bank) try transformer_mod.attachQsaHistoryToLatest(list.items, &live, s_);
+            return list.toOwnedSlice(testing.allocator);
+        }
+        fn free(list: []transformer_mod.SSMCheckpoint) void {
+            for (list) |*cp| cp.deinit(testing.allocator);
+            testing.allocator.free(list);
+        }
+        fn check(tier_: *DiskTier, io_: std.Io, root_: []const u8, what: []const u8, turn: usize) !void {
+            const disk = try diskBytesOnce(io_, root_);
+            if (disk != tier_.total_bytes) {
+                std.debug.print("\n[drift] turn {d} {s}: total {d} disk {d} (off by {d})", .{ turn, what, tier_.total_bytes, disk, @as(i64, @intCast(disk)) - @as(i64, @intCast(tier_.total_bytes)) });
+                for (tier_.entries.items) |*e| {
+                    std.debug.print("\n  e{d} bytes={d} inh={d} spec={d} qsa={d} inh_qsa={} ssm:", .{ e.id, e.bytes, e.inherited_chunks, e.spec_bytes, e.qsa_history_bytes, e.inherited_qsa });
+                    for (e.ssm_positions, e.ssm_bytes) |pos, b| {
+                        var pb: [1024]u8 = undefined;
+                        const sp = std.fmt.bufPrint(&pb, "{s}/e{d}/s{d:0>7}.safetensors", .{ root_, e.id, pos }) catch continue;
+                        const sz: u64 = if (statFile(io_, sp)) |st| st.size else 0;
+                        std.debug.print(" {d}:{d}/{d}", .{ pos, b, sz });
+                    }
+                    var own: u64 = 0;
+                    for (e.chunk_bytes[@min(e.inherited_chunks, e.chunk_bytes.len)..]) |b| own += b;
+                    std.debug.print("  nonChunk+own={d}", .{nonChunkBytes(e) + own});
+                }
+                std.debug.print("\n", .{});
+            }
+            try testing.expectEqual(disk, tier_.total_bytes);
+        }
+    };
+
+    var end = [2]u32{ 1200, 1150 };
+    for (0..8) |turn| {
+        for (0..2) |si| {
+            const prev = end[si];
+            const next = prev + 170;
+            // Mid-prefill write-through at a boundary halfway in: bank-less, one chunk per call.
+            const mid = prev + 85;
+            const wt = try H.cps(s, mid, false);
+            defer H.free(wt);
+            _ = try tier.appendCommitBounded(cache.entries, mid, cache.config, sess[si][0..mid], false, wt, s, 1);
+            try H.check(&tier, io, root, "write-through", turn);
+            // The finished turn: the full record, a bank on the newest checkpoint, the MTP sidecar.
+            const full = try H.cps(s, next, true);
+            defer H.free(full);
+            const snap: SpecCommit = .{ .entries = mtp.entries, .step = next - 1, .config = mtp.config, .base_pos = 0 };
+            _ = try tier.appendCommitWithSpec(cache.entries, next, cache.config, sess[si][0..next], false, full, null, snap, s);
+            try H.check(&tier, io, root, "full", turn);
+            // The idle spill re-commits every idle RAM entry with what it holds.
+            _ = try tier.appendCommitWithSpec(cache.entries, next, cache.config, sess[si][0..next], false, full, null, snap, s);
+            try H.check(&tier, io, root, "spill", turn);
+            end[si] = next;
+        }
     }
 }
 
