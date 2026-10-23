@@ -1583,6 +1583,7 @@ fn parseToolCallsForRequest(
     var calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
+    if (req_agent_tools_stripped > 0) calls = (try dropAgentCalls(allocator, calls, agentToolsOff())) orelse return null;
     if (!allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
         for (calls[1..]) |tc| {
@@ -2534,6 +2535,9 @@ fn handleConnection(
 
     captureRequestBody(method, path, request[0..header_end_pos], request[header_end_pos..total_read]);
     req_admit_user = 0;
+    req_allow_agents = if (findHeaderValueCI(request[0..header_end_pos], "x-allow-agents")) |v| std.mem.eql(u8, v, "1") else false;
+    req_agent_tools_stripped = 0;
+    req_agent_calls_dropped = 0;
     var usage_slot: UsageCtx = undefined;
     const usage_on = usageBegin(&usage_slot, stream, method, path, request[0..header_end_pos]);
     defer if (usage_on) usageEnd(&usage_slot, stream.io);
@@ -7268,6 +7272,125 @@ const ResumeReq = struct {
     }
 };
 threadlocal var req_resume: ?*ResumeReq = null;
+
+/// Subagents off server-wide: `MLX_SERVE_AGENT_TOOLS_OFF` (comma-separated tool names, e.g.
+/// "Agent,Workflow,ListAgents") are removed from every /v1/messages request that does not
+/// carry `x-allow-agents: 1`, and any call the model still makes to one is dropped. Claude
+/// Code decides on its own to spawn subagents; on a shared server their parallel turns queue
+/// and slow everyone, so a client opts in explicitly (claude-qwen.sh QWEN_AGENTS=1 sends the
+/// header). Unset = every tool kept.
+fn agentToolsOff() []const u8 {
+    const v = std.c.getenv("MLX_SERVE_AGENT_TOOLS_OFF") orelse return "";
+    return std.mem.span(v);
+}
+
+fn agentToolOff(off: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, off, ',');
+    while (it.next()) |n| {
+        if (std.mem.eql(u8, std.mem.trim(u8, n, " \t"), name)) return true;
+    }
+    return false;
+}
+
+/// Remove the tools `off` names from `tools` in place; returns how many went.
+fn stripAgentTools(tools: *std.json.Array, off: []const u8) usize {
+    var kept: usize = 0;
+    for (tools.items) |t| {
+        const name: []const u8 = if (t == .object) (if (t.object.get("name")) |v| (if (v == .string) v.string else "") else "") else "";
+        if (name.len > 0 and agentToolOff(off, name)) continue;
+        tools.items[kept] = t;
+        kept += 1;
+    }
+    const removed = tools.items.len - kept;
+    tools.shrinkRetainingCapacity(kept);
+    return removed;
+}
+
+/// The request carried `x-allow-agents: 1` (set by the dispatcher).
+threadlocal var req_allow_agents: bool = false;
+/// Subagent tools this request's tool list lost (0 = none were offered, or allowed).
+threadlocal var req_agent_tools_stripped: usize = 0;
+/// Calls to a removed tool the model made anyway, dropped from the response.
+threadlocal var req_agent_calls_dropped: usize = 0;
+
+/// Appended to the system prompt of a request that lost subagent tools: Claude Code's own
+/// prompt still describes them.
+const AGENT_TOOLS_OFF_NOTE = "Subagents are turned off on this server: the Agent, Workflow and ListAgents tools are not available. Do all of the work yourself in this conversation.";
+/// Shown in place of a dropped call when nothing else was called.
+const AGENT_CALL_DROPPED_NOTE = "(Subagents are turned off on this server, so that subagent call was not run.)";
+
+/// Drop the calls naming a removed subagent tool; returns the kept calls (null when none).
+fn dropAgentCalls(allocator: std.mem.Allocator, calls: []chat_mod.ParsedToolCall, off: []const u8) !?[]chat_mod.ParsedToolCall {
+    var kept: usize = 0;
+    for (calls) |tc| {
+        if (agentToolOff(off, tc.name)) {
+            log.info("  [agents] dropped a call to {s} (subagents are off; client did not send x-allow-agents: 1)\n", .{tc.name});
+            req_agent_calls_dropped += 1;
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+            continue;
+        }
+        calls[kept] = tc;
+        kept += 1;
+    }
+    if (kept == calls.len) return calls;
+    if (kept == 0) {
+        allocator.free(calls);
+        return null;
+    }
+    const out = try allocator.alloc(chat_mod.ParsedToolCall, kept);
+    @memcpy(out, calls[0..kept]);
+    allocator.free(calls);
+    return out;
+}
+
+test "stripAgentTools: removes the listed tools, keeps the rest in order" {
+    const body =
+        \\{"tools":[{"name":"Read"},{"name":"Agent"},{"name":"Bash"},{"name":"Workflow"},{"name":"ListAgents"},{"name":"Edit"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const tp = parsed.value.object.getPtr("tools").?;
+    try std.testing.expectEqual(@as(usize, 3), stripAgentTools(&tp.array, "Agent, Workflow,ListAgents"));
+    try std.testing.expectEqual(@as(usize, 3), tp.array.items.len);
+    try std.testing.expectEqualStrings("Read", tp.array.items[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("Bash", tp.array.items[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("Edit", tp.array.items[2].object.get("name").?.string);
+    try std.testing.expectEqual(@as(usize, 0), stripAgentTools(&tp.array, "Agent"));
+    try std.testing.expect(!agentToolOff("Agent,Workflow", "Agents"));
+    try std.testing.expect(!agentToolOff("", "Agent"));
+}
+
+test "dropAgentCalls: drops calls to removed tools, null when nothing is left" {
+    const a = std.testing.allocator;
+    const mk = struct {
+        fn call(al: std.mem.Allocator, name: []const u8) !chat_mod.ParsedToolCall {
+            return .{ .name = try al.dupe(u8, name), .arguments = try al.dupe(u8, "{}") };
+        }
+    };
+    {
+        const calls = try a.alloc(chat_mod.ParsedToolCall, 3);
+        calls[0] = try mk.call(a, "Read");
+        calls[1] = try mk.call(a, "Agent");
+        calls[2] = try mk.call(a, "Bash");
+        const kept = (try dropAgentCalls(a, calls, "Agent,Workflow")).?;
+        defer {
+            for (kept) |tc| {
+                a.free(tc.name);
+                a.free(tc.arguments);
+            }
+            a.free(kept);
+        }
+        try std.testing.expectEqual(@as(usize, 2), kept.len);
+        try std.testing.expectEqualStrings("Read", kept[0].name);
+        try std.testing.expectEqualStrings("Bash", kept[1].name);
+    }
+    {
+        const calls = try a.alloc(chat_mod.ParsedToolCall, 1);
+        calls[0] = try mk.call(a, "Workflow");
+        try std.testing.expect((try dropAgentCalls(a, calls, "Agent,Workflow")) == null);
+    }
+}
 
 /// `MLX_SERVE_RESUME_ON_RETRY=0` turns resume on retry off.
 fn resumeEnabled() bool {
@@ -16700,6 +16823,18 @@ fn handleAnthropicMessages(
     usageNoteRequest(root);
     req_admit_user = usage_mod.admitKey(root, peerText(stream));
 
+    // Subagents off unless the client opted in (`agentToolsOff`). Edits the parsed tool list in
+    // place, so the prompt, count_tokens and the web-search rounds built from `root` agree.
+    if (!req_allow_agents and agentToolsOff().len > 0) {
+        if (root.getPtr("tools")) |tp| if (tp.* == .array) {
+            const n = stripAgentTools(&tp.array, agentToolsOff());
+            if (n > 0) {
+                req_agent_tools_stripped += n;
+                log.debug("  [agents] {d} subagent tool(s) removed from the request\n", .{n});
+            }
+        };
+    }
+
     // A `web_search_*` server tool turns the request into the server-side
     // search loop, which runs this handler again per round (with the Conn
     // captured, so that inner call lands below).
@@ -16783,6 +16918,15 @@ fn handleAnthropicMessages(
         };
         if (sys_text.len > 0) {
             try messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
+        }
+    }
+    if (req_agent_tools_stripped > 0) {
+        if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
+            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, AGENT_TOOLS_OFF_NOTE });
+            try content_allocs.append(allocator, combined);
+            messages.items[0].content = combined;
+        } else {
+            try messages.append(allocator, .{ .role = "system", .content = AGENT_TOOLS_OFF_NOTE, .tool_calls = null, .tool_call_id = null });
         }
     }
 
@@ -17824,7 +17968,14 @@ fn handleAnthropicNonStreaming(
             // No tool calls — emit text block. Nothing parsed, so any tool
             // markup still in here is unparsed wreckage: cut it at emission.
             if (block_count > 0) try content.append(allocator, ',');
-            const esc_text = try jsonEscape(allocator, if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text));
+            const shown = if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text);
+            // Everything the model called was a removed subagent tool: say so.
+            const with_note: ?[]u8 = if (req_agent_calls_dropped > 0)
+                try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ shown, if (shown.len > 0) "\n\n" else "", AGENT_CALL_DROPPED_NOTE })
+            else
+                null;
+            defer if (with_note) |w| allocator.free(w);
+            const esc_text = try jsonEscape(allocator, with_note orelse shown);
             defer allocator.free(esc_text);
             const text_block = try std.fmt.allocPrint(allocator,
                 \\{{"type":"text","text":{s}}}
@@ -18694,6 +18845,19 @@ fn handleAnthropicStreaming(
                         text_block_open = true;
                     }
                     try emitAnthropicTextDelta(allocator, stream, block_index, think_split.content);
+                }
+                // Everything the model called was a removed subagent tool: say so instead of
+                // ending the turn silently.
+                if (req_agent_calls_dropped > 0) {
+                    if (!text_block_open) {
+                        const sd3 = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd3);
+                        try sendAnthropicEvent(stream, "content_block_start", sd3);
+                        text_block_open = true;
+                    }
+                    try emitAnthropicTextDelta(allocator, stream, block_index, if (think_split.content.len > 0) "\n\n" ++ AGENT_CALL_DROPPED_NOTE else AGENT_CALL_DROPPED_NOTE);
                 }
             }
         }
