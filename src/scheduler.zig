@@ -2706,15 +2706,25 @@ pub var g_max_active_per_user: u32 = 0;
 
 pub const AdmitLimits = struct { total: u32 = 0, per_user: u32 = 0 };
 
-/// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
+/// Fair-share admission for one drain tick. An EXCLUSIVE candidate admits only if
 /// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
 /// admitted exclusive candidate claimed it this tick
 /// (a same-tick sibling is not in `decoding` yet — the claim covers the
 /// window). Non-exclusive candidates always admit — no head-of-line
 /// blocking behind a held exclusive request. `limits` then caps the counted
 /// (`user != 0`) slots live at once, overall and per user; a candidate over
-/// its user's cap is skipped without blocking other users behind it. Writes
-/// admitted candidate indices to `out` (queue order preserved), returns the
+/// its user's cap is skipped without blocking other users behind it.
+///
+/// Who gets a free slot: helper calls (`user == 0`) first, then the candidate whose user
+/// has the fewest generations live (counting this tick's admits), the queue order breaking
+/// ties. One user's burst of parallel agents can fill idle slots, but a request from a user
+/// with less running goes ahead of the burst's queued remainder (user: "don't limit the
+/// number of requests per user, but prioritize other users in the queue if there is an
+/// imbalance", 2026-10-23). A live generation is never preempted: the newcomer takes the
+/// next slot that frees (usage log Oct 21-23: median 1.7 s, p90 5.5 s, p99 16 s with all 6
+/// slots busy).
+///
+/// Writes admitted candidate indices to `out` in ascending (queue) order and returns the
 /// count. Held candidates stay where they are and retry next tick; no release
 /// bookkeeping exists — the busy signal IS presence in `decoding`.
 pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, limits: AdmitLimits, out: []usize) usize {
@@ -2723,31 +2733,47 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, lim
     for (active) |a| {
         if (a.user != 0) counted += 1;
     }
-    outer: for (cands, 0..) |c, i| {
-        if (n >= out.len) break;
-        if (c.exclusive) {
-            for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
-            for (out[0..n]) |j| {
-                if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
+    // The caller drains at most 32 candidates a tick; any beyond 64 wait for the next one.
+    var taken: std.bit_set.IntegerBitSet(64) = .empty;
+    const considered = @min(cands.len, 64);
+    while (n < out.len) {
+        var best: ?usize = null;
+        var best_live: usize = 0;
+        cand: for (cands[0..considered], 0..) |c, i| {
+            if (taken.isSet(i)) continue;
+            if (c.exclusive) {
+                for (active) |a| if (a.exclusive and a.model == c.model) continue :cand;
+                for (out[0..n]) |j| {
+                    if (cands[j].exclusive and cands[j].model == c.model) continue :cand;
+                }
             }
-        }
-        if (c.user != 0) {
-            if (limits.total > 0 and counted >= limits.total) continue;
-            if (limits.per_user > 0) {
-                var mine: usize = 0;
+            var live: usize = 0;
+            if (c.user != 0) {
+                if (limits.total > 0 and counted >= limits.total) continue;
                 for (active) |a| {
-                    if (a.user == c.user) mine += 1;
+                    if (a.user == c.user) live += 1;
                 }
                 for (out[0..n]) |j| {
-                    if (cands[j].user == c.user) mine += 1;
+                    if (cands[j].user == c.user) live += 1;
                 }
-                if (mine >= limits.per_user) continue;
+                if (limits.per_user > 0 and live >= limits.per_user) continue;
             }
-            counted += 1;
+            if (c.user == 0) {
+                best = i;
+                break;
+            }
+            if (best == null or live < best_live) {
+                best = i;
+                best_live = live;
+            }
         }
+        const i = best orelse break;
+        taken.set(i);
+        if (cands[i].user != 0) counted += 1;
         out[n] = i;
         n += 1;
     }
+    std.mem.sort(usize, out[0..n], {}, std.sort.asc(usize));
     return n;
 }
 
@@ -9985,6 +10011,66 @@ test "admitPendingTick: --max-active caps live generations overall and per user;
         const active = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U1 } };
         const cands = [_]AdmitCand{.{ .model = M, .exclusive = false, .user = U1 }};
         try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, .{}, &out));
+    }
+}
+
+test "admitPendingTick: fair share — a user with less running goes ahead of another user's burst" {
+    const M: usize = 0x10;
+    const U1: u64 = 0x111;
+    const U2: u64 = 0x222;
+    const U3: u64 = 0x333;
+    var out: [16]usize = undefined;
+    const lim: AdmitLimits = .{ .total = 6 };
+    // U1 holds five slots and queued two more before U2 arrived: the one free slot goes to U2.
+    {
+        var active: [5]AdmitCand = undefined;
+        for (&active) |*a| a.* = .{ .model = M, .exclusive = false, .user = U1 };
+        const cands = [_]AdmitCand{
+            .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U2 },
+        };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, lim, &out));
+        try testing.expectEqual(@as(usize, 2), out[0]);
+    }
+    // Three free slots, U1 (2 live) queued four, U2 (1 live) and U3 (none) one each: U3, U2,
+    // then U1's first; reported in queue order.
+    {
+        const active = [_]AdmitCand{
+            .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U2 },
+        };
+        const cands = [_]AdmitCand{
+            .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U2 },
+            .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U3 },
+        };
+        try testing.expectEqual(@as(usize, 3), admitPendingTick(&cands, &active, lim, &out));
+        try testing.expectEqualSlices(usize, &.{ 0, 3, 5 }, out[0..3]);
+    }
+    // Alone, one user's burst fills every free slot (no per-user cap), in queue order.
+    {
+        var cands: [8]AdmitCand = undefined;
+        for (&cands) |*c| c.* = .{ .model = M, .exclusive = false, .user = U1 };
+        try testing.expectEqual(@as(usize, 6), admitPendingTick(&cands, &.{}, lim, &out));
+        try testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4, 5 }, out[0..6]);
+    }
+    // Two users queued alternately with nothing live: slots alternate between them.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U1 },
+            .{ .model = M, .exclusive = false, .user = U1 }, .{ .model = M, .exclusive = false, .user = U2 },
+        };
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, .{ .total = 2 }, &out));
+        try testing.expectEqualSlices(usize, &.{ 0, 3 }, out[0..2]);
+    }
+    // Helpers still jump everything, even behind a full counted queue.
+    {
+        var active: [6]AdmitCand = undefined;
+        for (&active) |*a| a.* = .{ .model = M, .exclusive = false, .user = U1 };
+        const cands = [_]AdmitCand{ .{ .model = M, .exclusive = false, .user = U2 }, .{ .model = M, .exclusive = false, .user = 0 } };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, lim, &out));
+        try testing.expectEqual(@as(usize, 1), out[0]);
     }
 }
 
